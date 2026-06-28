@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use crate::db::{self, Job, STATUS_CLOUD, STATUS_PENDING, STATUS_READY};
+use crate::meta;
 use crate::thumbs::ThumbQueue;
 
 /// The only formats v1 supports. RAW and video are explicitly out of scope.
@@ -136,16 +137,24 @@ where
             let mut select =
                 tx.prepare("SELECT id, cache_key, thumb_status FROM photos WHERE path = ?1")?;
             let mut insert = tx.prepare(
-                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status, taken_ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             let mut update = tx.prepare(
-                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4 WHERE id = ?5",
+                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4, taken_ts = ?5 WHERE id = ?6",
             )?;
 
             for item in &items {
                 let key = cache_key(&item.path, item.mtime, item.size);
                 // Cloud-only files become placeholders; local files are queued.
                 let fresh_status = if item.cloud { STATUS_CLOUD } else { STATUS_PENDING };
+                // Read the capture date now only for local files — reading a
+                // cloud original's EXIF would force a download. Cloud dates are
+                // filled in later, when the file is downloaded for its thumbnail.
+                let taken: Option<i64> = if item.cloud {
+                    None
+                } else {
+                    meta::read_taken_ts(Path::new(&item.path))
+                };
 
                 let existing = select
                     .query_row([&item.path], |r| {
@@ -163,6 +172,7 @@ where
                             item.size,
                             key,
                             fresh_status,
+                            taken,
                             id
                         ])?;
                         if !item.cloud {
@@ -175,7 +185,8 @@ where
                             item.mtime,
                             item.size,
                             key,
-                            fresh_status
+                            fresh_status,
+                            taken
                         ])?;
                         let id = tx.last_insert_rowid();
                         total += 1;

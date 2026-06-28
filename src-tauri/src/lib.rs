@@ -17,6 +17,7 @@
 //!     forever.
 
 mod db;
+mod meta;
 mod scan;
 mod thumbs;
 
@@ -71,9 +72,10 @@ fn get_photos_range(
     state: tauri::State<'_, AppState>,
     offset: i64,
     limit: i64,
+    by_date: bool,
 ) -> Result<Vec<db::PhotoRow>, String> {
     let conn = state.conn.lock().unwrap();
-    db::photos_range(&conn, offset, limit).map_err(|e| e.to_string())
+    db::photos_range(&conn, offset, limit, by_date).map_err(|e| e.to_string())
 }
 
 /// Progress payload for the streaming scan: how many photos are registered so
@@ -82,6 +84,14 @@ fn get_photos_range(
 struct ScanProgress {
     found: i64,
     done: bool,
+}
+
+/// `thumb-ready` payload: which photo finished, and whether a thumbnail now
+/// exists (success) or the attempt failed/was abandoned.
+#[derive(Clone, serde::Serialize)]
+struct ThumbDone {
+    id: i64,
+    ok: bool,
 }
 
 /// Start scanning a folder. Returns immediately — the walk runs on a background
@@ -260,19 +270,24 @@ pub fn run() {
             let cloud_queue = ThumbQueue::new();
 
             // Workers emit `thumb-ready` so the frontend can refresh one cell.
+            // `ok` says whether a thumbnail actually exists now (success) versus
+            // a failed/abandoned attempt that should stop the spinner only.
             let app_handle = app.handle().clone();
-            let notify = move |id: i64| {
-                let _ = app_handle.emit("thumb-ready", id);
+            let notify = move |id: i64, ok: bool| {
+                let _ = app_handle.emit("thumb-ready", ThumbDone { id, ok });
             };
 
             // Local files that fail to decode are FAILED; cloud files that fail to
             // download fall back to CLOUD so a later visit can retry.
+            // Local files already had their date read at scan time; cloud files
+            // get it here, once downloaded (extract_date = true for the cloud pool).
             thumbs::spawn_workers(
                 local_workers,
                 local_queue.clone(),
                 db_path.clone(),
                 cache_dir.clone(),
                 db::STATUS_FAILED,
+                false,
                 notify.clone(),
             );
             thumbs::spawn_workers(
@@ -281,6 +296,7 @@ pub fn run() {
                 db_path.clone(),
                 cache_dir.clone(),
                 db::STATUS_CLOUD,
+                true,
                 notify,
             );
 

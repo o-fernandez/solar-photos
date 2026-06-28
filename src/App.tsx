@@ -30,7 +30,9 @@ function App() {
   // it never touches the grid's scroll position.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    onThumbReady(() => setReady((r) => r + 1)).then((fn) => {
+    onThumbReady((d) => {
+      if (d.ok) setReady((r) => r + 1);
+    }).then((fn) => {
       unlisten = fn;
     });
     return () => unlisten?.();
@@ -96,8 +98,10 @@ function App() {
       </header>
 
       {total > 0 ? (
-        // Remount on a new folder so the grid's caches reset cleanly.
-        <PhotoGrid key={folder ?? "library"} total={total} />
+        // Remount on a new folder so the grid's caches reset cleanly. While a
+        // scan runs, show discovery order (append-only, no reflow); once it
+        // finishes, snap to the newest-first timeline.
+        <PhotoGrid key={folder ?? "library"} total={total} byDate={!scanning} />
       ) : (
         <div className="empty">
           <p>Pick a folder of photos to begin.</p>

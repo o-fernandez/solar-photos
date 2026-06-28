@@ -104,13 +104,72 @@ body,
 }
 
 /* --- Grid --- */
-.grid-scroll {
+.grid-wrap {
+  position: relative;
   flex: 1;
+  min-height: 0;
+}
+
+.grid-scroll {
+  position: absolute;
+  inset: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 4px;
   /* Smooth, GPU-friendly scrolling for large lists. */
   will-change: transform;
+  /* Hide the native scrollbar — the timeline scrubber is our scroll control. */
+  scrollbar-width: none;
+}
+.grid-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* --- Timeline scrubber: quiet by default, appears while scrolling/dragging --- */
+.scrubber {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 14px;
+  height: 100%;
+  cursor: grab;
+  z-index: 5;
+}
+.scrubber:active {
+  cursor: grabbing;
+}
+.scrubber-thumb {
+  position: absolute;
+  right: 3px;
+  width: 5px;
+  border-radius: 3px;
+  background: #c4c4c4;
+  opacity: 0;
+  transition: opacity 0.2s, background 0.15s;
+}
+.scrubber:hover .scrubber-thumb,
+.scrubber.active .scrubber-thumb {
+  opacity: 1;
+}
+.scrubber:hover .scrubber-thumb {
+  background: #a9a9a9;
+}
+.scrubber-label {
+  position: absolute;
+  right: 18px;
+  transform: translateY(-50%);
+  background: #ffffff;
+  border: 1px solid #d8d8d8;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1a1a1a;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
 }
 
 .grid-row {
@@ -268,5 +327,16 @@ body,
   .spinner {
     border-color: rgba(255, 255, 255, 0.15);
     border-top-color: #f5a623;
+  }
+  .scrubber-thumb {
+    background: #555;
+  }
+  .scrubber:hover .scrubber-thumb {
+    background: #777;
+  }
+  .scrubber-label {
+    background: #2c2c2c;
+    border-color: #444;
+    color: #ededed;
   }
 }

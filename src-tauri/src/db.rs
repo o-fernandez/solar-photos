@@ -46,10 +46,18 @@ pub fn init(conn: &Connection) -> Result<()> {
             mtime        INTEGER NOT NULL,
             size         INTEGER NOT NULL,
             cache_key    TEXT NOT NULL,
-            thumb_status INTEGER NOT NULL DEFAULT 0
+            thumb_status INTEGER NOT NULL DEFAULT 0,
+            taken_ts     INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
          CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(thumb_status);",
+    )?;
+    // Migration for libraries created before taken_ts existed. Ignore the error
+    // if the column is already there.
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN taken_ts INTEGER", []);
+    // The timeline orders on COALESCE(taken_ts, mtime); index it for fast paging.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));",
     )?;
     Ok(())
 }
@@ -90,29 +98,49 @@ pub fn stats(conn: &Connection) -> Result<(i64, i64)> {
     Ok((total, ready))
 }
 
-/// One grid cell's worth of data: a stable id and its thumbnail status.
-///
-/// Ordered by `id` (discovery order) rather than path: during a live scan, newly
-/// found photos only ever append to the end, so the grid never reshuffles under
-/// the user (Principle 2). Sorting by date/path is a deliberate later action.
+/// One grid cell's worth of data: a stable id, its thumbnail status, and the
+/// timestamp it sorts/labels by (capture date if known, else file mtime).
 #[derive(serde::Serialize)]
 pub struct PhotoRow {
     pub id: i64,
     pub status: i64,
+    pub ts: i64,
 }
 
-/// Fetch a contiguous window of the library, in discovery order. The frontend
-/// requests only the ranges its virtualized grid is about to show.
-pub fn photos_range(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<PhotoRow>> {
-    let mut stmt =
-        conn.prepare("SELECT id, thumb_status FROM photos ORDER BY id LIMIT ?1 OFFSET ?2")?;
+/// Fetch a contiguous window of the library.
+///
+/// Two orderings:
+///   * "discovery" (by id) — used *during* a live scan, so newly found photos
+///     only ever append to the end and the view never reshuffles (Principle 2).
+///   * "date" — newest-first by capture date (mtime fallback). Used once the
+///     scan finishes (the "snap to timeline" moment) and on every cold start.
+pub fn photos_range(conn: &Connection, offset: i64, limit: i64, by_date: bool) -> Result<Vec<PhotoRow>> {
+    let sql = if by_date {
+        "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts FROM photos
+         ORDER BY ts DESC, id DESC LIMIT ?1 OFFSET ?2"
+    } else {
+        "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts FROM photos
+         ORDER BY id LIMIT ?1 OFFSET ?2"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([limit, offset], |r| {
         Ok(PhotoRow {
             id: r.get(0)?,
             status: r.get(1)?,
+            ts: r.get(2)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Record a photo's capture date once we've read it from a now-local file.
+/// Only fills it when still empty, so we never clobber a date set at scan time.
+pub fn set_taken_ts_if_empty(conn: &Connection, id: i64, ts: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET taken_ts = ?1 WHERE id = ?2 AND taken_ts IS NULL",
+        rusqlite::params![ts, id],
+    )?;
+    Ok(())
 }
 
 /// Look up status + path for a set of ids. Used by on-demand cloud handling to

@@ -18,6 +18,8 @@ export const STATUS_DOWNLOADING = 4;
 export interface PhotoRow {
   id: number;
   status: number;
+  /** Capture date if known, else file mtime — Unix seconds. Sorts + labels. */
+  ts: number;
 }
 
 export interface LibraryStats {
@@ -30,9 +32,14 @@ export function getLibraryStats(): Promise<LibraryStats> {
   return invoke("get_library_stats");
 }
 
-/** Fetch a contiguous window of photo rows, ordered by path. */
-export function getPhotosRange(offset: number, limit: number): Promise<PhotoRow[]> {
-  return invoke("get_photos_range", { offset, limit });
+/** Fetch a contiguous window of photo rows. `byDate` = newest-first timeline
+ *  order; otherwise discovery order (used while a scan is still running). */
+export function getPhotosRange(
+  offset: number,
+  limit: number,
+  byDate: boolean,
+): Promise<PhotoRow[]> {
+  return invoke("get_photos_range", { offset, limit, byDate });
 }
 
 /** Start indexing a folder. Returns immediately; progress streams via events. */
@@ -60,9 +67,15 @@ export function setVisibleRange(ids: number[]): Promise<void> {
   return invoke("set_visible_range", { ids });
 }
 
-/** Subscribe to "thumbnail ready" events. Payload is the photo id. */
-export function onThumbReady(cb: (id: number) => void): Promise<UnlistenFn> {
-  return listen<number>("thumb-ready", (e) => cb(e.payload));
+export interface ThumbDone {
+  id: number;
+  /** True if a thumbnail now exists; false if the attempt failed/was abandoned. */
+  ok: boolean;
+}
+
+/** Subscribe to "thumbnail finished" events (success or failure). */
+export function onThumbReady(cb: (done: ThumbDone) => void): Promise<UnlistenFn> {
+  return listen<ThumbDone>("thumb-ready", (e) => cb(e.payload));
 }
 
 /** Native folder picker. Returns the chosen path, or null if cancelled. */

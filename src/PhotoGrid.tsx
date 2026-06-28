@@ -38,7 +38,7 @@ const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill
 const CHUNK = 200; // how many rows we fetch from the DB per request
 const OVERSCAN_ROWS = 4; // rows rendered just outside the viewport, for smoothness
 
-export default function PhotoGrid({ total }: { total: number }) {
+export default function PhotoGrid({ total, byDate }: { total: number; byDate: boolean }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // --- Photo data, kept in refs so frequent updates don't re-render on their
@@ -60,7 +60,7 @@ export default function PhotoGrid({ total }: { total: number }) {
     if (existing) return existing.id;
     const c = Math.floor(i / CHUNK);
     try {
-      const rows = await getPhotosRange(c * CHUNK, CHUNK);
+      const rows = await getPhotosRange(c * CHUNK, CHUNK, byDate);
       rows.forEach((row, k) => {
         photosRef.current[c * CHUNK + k] = row;
         if (row.status === STATUS_READY) readyRef.current.add(row.id);
@@ -70,7 +70,7 @@ export default function PhotoGrid({ total }: { total: number }) {
     } catch {
       return null;
     }
-  }, []);
+  }, [byDate]);
 
   const invalidatePending = useRef(false);
   const invalidate = useCallback(() => {
@@ -94,12 +94,72 @@ export default function PhotoGrid({ total }: { total: number }) {
     invalidate();
   }, [total, invalidate]);
 
+  // Snap to the new ordering when the scan finishes (discovery → date). The
+  // index→photo mapping is order-dependent, so drop it and refetch from the top;
+  // readyRef/downloadingRef are id-based and stay valid.
+  const firstOrder = useRef(true);
+  useEffect(() => {
+    if (firstOrder.current) {
+      firstOrder.current = false;
+      return;
+    }
+    photosRef.current = [];
+    loadedChunks.current.clear();
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    invalidate();
+  }, [byDate, invalidate]);
+
+  // --- Timeline scrubber ---
+  const [scrubbing, setScrubbing] = useState(false);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+  const hideTimer = useRef<number | undefined>(undefined);
+
+  const bumpHide = useCallback(() => {
+    if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => setScrubbing(false), 900);
+  }, []);
+
+  const onScroll = useCallback(() => {
+    setScrubbing(true);
+    bumpHide();
+  }, [bumpHide]);
+
+  const scrubTo = useCallback((clientY: number) => {
+    const track = trackRef.current;
+    const el = scrollRef.current;
+    if (!track || !el) return;
+    const rect = track.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+    el.scrollTop = frac * Math.max(1, el.scrollHeight - el.clientHeight);
+  }, []);
+
+  const onScrubPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      draggingRef.current = true;
+      setScrubbing(true);
+      scrubTo(e.clientY);
+      const move = (ev: PointerEvent) => draggingRef.current && scrubTo(ev.clientY);
+      const up = () => {
+        draggingRef.current = false;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        bumpHide();
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [scrubTo, bumpHide],
+  );
+
   // Thumbnail-ready pushes: record the id, drop any downloading marker, repaint.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    onThumbReady((id) => {
-      readyRef.current.add(id);
-      downloadingRef.current.delete(id);
+    onThumbReady((d) => {
+      // Only show an image when one actually exists. A failed/abandoned cloud
+      // download just stops the spinner; the cell falls back to its cloud glyph.
+      if (d.ok) readyRef.current.add(d.id);
+      downloadingRef.current.delete(d.id);
       invalidate();
     }).then((fn) => {
       unlisten = fn;
@@ -172,7 +232,7 @@ export default function PhotoGrid({ total }: { total: number }) {
     for (let c = firstChunk; c <= lastChunk; c++) {
       if (loadedChunks.current.has(c)) continue;
       loadedChunks.current.add(c);
-      getPhotosRange(c * CHUNK, CHUNK)
+      getPhotosRange(c * CHUNK, CHUNK, byDate)
         .then((rows) => {
           rows.forEach((row, i) => {
             photosRef.current[c * CHUNK + i] = row;
@@ -196,11 +256,25 @@ export default function PhotoGrid({ total }: { total: number }) {
       }
       setVisibleRange(ids).catch(() => {});
     }, 80);
-  }, [virtualRows, columns, total, invalidate]);
+  }, [virtualRows, columns, total, byDate, invalidate]);
+
+  // Scrubber geometry, read fresh each render (the virtualizer re-renders on
+  // scroll, so this stays in sync without a separate scroll-position state).
+  const totalSize = rowVirtualizer.getTotalSize();
+  const viewport = scrollRef.current?.clientHeight ?? 0;
+  const scrollTop = scrollRef.current?.scrollTop ?? 0;
+  const maxScroll = Math.max(1, totalSize - viewport);
+  const frac = Math.min(1, Math.max(0, scrollTop / maxScroll));
+  const thumbH = viewport > 0 ? Math.max(36, viewport * (viewport / Math.max(totalSize, viewport))) : 36;
+  const thumbTop = frac * (viewport - thumbH);
+  const topIndex = rowHeight > 0 ? Math.floor(scrollTop / rowHeight) * columns : 0;
+  const topTs = photosRef.current[topIndex]?.ts;
+  const showScrubber = totalSize > viewport + 1 && viewport > 0;
 
   return (
     <>
-    <div ref={scrollRef} className="grid-scroll">
+    <div className="grid-wrap">
+    <div ref={scrollRef} className="grid-scroll" onScroll={onScroll}>
       <div
         style={{
           height: `${rowVirtualizer.getTotalSize()}px`,
@@ -252,6 +326,21 @@ export default function PhotoGrid({ total }: { total: number }) {
         })}
       </div>
     </div>
+    {showScrubber && (
+      <div
+        className={`scrubber${scrubbing ? " active" : ""}`}
+        ref={trackRef}
+        onPointerDown={onScrubPointerDown}
+      >
+        <div className="scrubber-thumb" style={{ height: thumbH, transform: `translateY(${thumbTop}px)` }} />
+        {scrubbing && topTs ? (
+          <div className="scrubber-label" style={{ top: thumbTop + thumbH / 2 }}>
+            {monthYear(topTs)}
+          </div>
+        ) : null}
+      </div>
+    )}
+    </div>
     {viewerIndex !== null && (
       <Lightbox
         index={viewerIndex}
@@ -290,6 +379,10 @@ export default function PhotoGrid({ total }: { total: number }) {
     }
     return null; // local pending — gray box
   }
+}
+
+function monthYear(ts: number): string {
+  return new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", year: "numeric" });
 }
 
 function CloudGlyph() {

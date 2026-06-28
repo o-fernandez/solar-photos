@@ -181,9 +181,10 @@ pub fn spawn_workers<F>(
     db_path: PathBuf,
     cache_dir: PathBuf,
     fail_status: i64,
+    extract_date: bool,
     notify: F,
 ) where
-    F: Fn(i64) + Send + Clone + 'static,
+    F: Fn(i64, bool) + Send + Clone + 'static,
 {
     for _ in 0..count {
         let queue = queue.clone();
@@ -208,9 +209,18 @@ pub fn spawn_workers<F>(
                     }
                 };
                 let _ = db::set_status(&conn, job.id, status);
+                // For cloud files (now downloaded), read the capture date the scan
+                // couldn't reach without forcing a download. Applied on next sort.
+                if extract_date && status == STATUS_READY {
+                    if let Some(ts) = crate::meta::read_taken_ts(Path::new(&job.path)) {
+                        let _ = db::set_taken_ts_if_empty(&conn, job.id, ts);
+                    }
+                }
                 queue.complete(job.id);
-                // Always notify, even on failure, so the cell can stop waiting.
-                notify(job.id);
+                // Notify either way so the cell stops waiting, but say whether a
+                // thumbnail actually exists now: a failed cloud download reverts
+                // to CLOUD and must NOT be shown as a (missing) image.
+                notify(job.id, status == STATUS_READY);
             }
         });
     }
