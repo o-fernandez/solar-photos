@@ -9,18 +9,26 @@
 // How it honors "never reflow / never lose the user's place" (Principle 2):
 //   * Every cell is a fixed-size box. A thumbnail loads *inside* that box, so
 //     swapping a gray placeholder for an image never changes layout.
-//   * Thumbnail-ready events update only the cells they affect; results for
-//     off-screen photos are recorded silently and shown if/when scrolled to.
-//   * We never programmatically scroll. The user's position is theirs alone.
+//   * Photos are kept in discovery order, so a live scan only ever *appends*
+//     cells to the end — what the user is looking at never shifts.
+//   * Thumbnail events update only the cells they affect.
+//
+// Cloud-only photos show a distinct placeholder; when the user scrolls to them
+// the backend fetches them on demand (we report the visible range below), they
+// flip to a spinner, then to the image once cached.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   getPhotosRange,
+  onThumbDownloading,
   onThumbReady,
   setVisibleRange,
   thumbUrl,
   STATUS_READY,
+  STATUS_CLOUD,
+  STATUS_DOWNLOADING,
+  STATUS_FAILED,
   type PhotoRow,
 } from "./api";
 
@@ -37,6 +45,7 @@ export default function PhotoGrid({ total }: { total: number }) {
   // actual re-render so bursts of thumbnail events coalesce into one paint. ---
   const photosRef = useRef<(PhotoRow | undefined)[]>([]);
   const readyRef = useRef<Set<number>>(new Set());
+  const downloadingRef = useRef<Set<number>>(new Set());
   const loadedChunks = useRef<Set<number>>(new Set());
   const [, setTick] = useState(0);
 
@@ -50,20 +59,36 @@ export default function PhotoGrid({ total }: { total: number }) {
     });
   }, []);
 
-  // Reset all caches when the library size changes (new scan / first load).
+  // As the library grows during a live scan, the chunk that held the previous
+  // last photo may have been loaded only partially — evict it so it refetches.
+  // New chunks load on demand as the user scrolls into them.
+  const prevTotal = useRef(0);
   useEffect(() => {
-    photosRef.current = new Array(total);
-    readyRef.current = new Set();
-    loadedChunks.current = new Set();
+    if (total > prevTotal.current && prevTotal.current > 0) {
+      loadedChunks.current.delete(Math.floor((prevTotal.current - 1) / CHUNK));
+    }
+    prevTotal.current = total;
     invalidate();
   }, [total, invalidate]);
 
-  // Listen for "thumbnail ready" pushes from the backend. We only record the id
-  // and schedule a coalesced repaint — no layout work here.
+  // Thumbnail-ready pushes: record the id, drop any downloading marker, repaint.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onThumbReady((id) => {
       readyRef.current.add(id);
+      downloadingRef.current.delete(id);
+      invalidate();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, [invalidate]);
+
+  // "Started downloading these cloud photos" — show a spinner on those cells.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onThumbDownloading((ids) => {
+      ids.forEach((id) => downloadingRef.current.add(id));
       invalidate();
     }).then((fn) => {
       unlisten = fn;
@@ -106,7 +131,8 @@ export default function PhotoGrid({ total }: { total: number }) {
   const virtualRows = rowVirtualizer.getVirtualItems();
 
   // --- Lazily load the photo rows we're about to render, and tell the backend
-  // which photos are visible so their thumbnails get priority (Principle 3). ---
+  // which photos are visible so their thumbnails get priority / cloud photos
+  // get fetched on demand (Principle 3). ---
   const prioritizeTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
@@ -136,8 +162,8 @@ export default function PhotoGrid({ total }: { total: number }) {
         });
     }
 
-    // Debounced: report the visible (loaded, not-yet-ready) photo ids so the
-    // backend bumps them to the front of the work queue.
+    // Debounced: report the visible (loaded, not-yet-ready) photo ids. The
+    // backend prioritizes local thumbnails and fetches cloud photos on demand.
     if (prioritizeTimer.current) window.clearTimeout(prioritizeTimer.current);
     prioritizeTimer.current = window.setTimeout(() => {
       const ids: number[] = [];
@@ -165,22 +191,13 @@ export default function PhotoGrid({ total }: { total: number }) {
             const index = rowStart + c;
             if (index >= total) break;
             const photo = photosRef.current[index];
-            const ready = photo ? readyRef.current.has(photo.id) : false;
             cells.push(
               <div
                 key={index}
                 className="cell"
                 style={{ width: cellSize, height: cellSize, marginRight: c < columns - 1 ? GAP : 0 }}
               >
-                {photo && ready ? (
-                  <img
-                    src={thumbUrl(photo.id)}
-                    className="thumb"
-                    loading="eager"
-                    decoding="async"
-                    draggable={false}
-                  />
-                ) : null}
+                {renderCellContent(photo)}
               </div>,
             );
           }
@@ -203,5 +220,44 @@ export default function PhotoGrid({ total }: { total: number }) {
         })}
       </div>
     </div>
+  );
+
+  // Decide what a cell shows based on its photo's state. Inner closure so it can
+  // read the refs without prop-drilling; cheap, runs only for visible cells.
+  function renderCellContent(photo: PhotoRow | undefined) {
+    if (!photo) return null; // not loaded yet — gray box
+    const id = photo.id;
+    if (readyRef.current.has(id)) {
+      return (
+        <img
+          src={thumbUrl(id)}
+          className="thumb"
+          loading="eager"
+          decoding="async"
+          draggable={false}
+        />
+      );
+    }
+    if (downloadingRef.current.has(id) || photo.status === STATUS_DOWNLOADING) {
+      return <div className="cell-overlay" aria-label="downloading"><span className="spinner" /></div>;
+    }
+    if (photo.status === STATUS_CLOUD) {
+      return <div className="cell-overlay" aria-label="in the cloud"><CloudGlyph /></div>;
+    }
+    if (photo.status === STATUS_FAILED) {
+      return <div className="cell-overlay failed" aria-label="couldn't read" />;
+    }
+    return null; // local pending — gray box
+  }
+}
+
+function CloudGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="28" height="28" className="cloud-glyph" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M19 18H6a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 16.9 9.2 3.5 3.5 0 0 1 19 18Z"
+      />
+    </svg>
   );
 }

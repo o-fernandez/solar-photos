@@ -10,18 +10,30 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Thumbnail status values stored in the `photos.thumb_status` column.
-pub const STATUS_PENDING: i64 = 0;
-pub const STATUS_READY: i64 = 1;
-pub const STATUS_FAILED: i64 = 2;
+pub const STATUS_PENDING: i64 = 0; // local file, queued for thumbnailing
+pub const STATUS_READY: i64 = 1; // thumbnail cached on disk
+pub const STATUS_FAILED: i64 = 2; // local file we couldn't decode
+/// Cloud-only original (not downloaded locally). We do NOT thumbnail these up
+/// front — that would mean bulk-downloading the whole library. They wait as
+/// placeholders until the user scrolls to them (see on-demand handling in
+/// `lib.rs`), at which point they move to DOWNLOADING.
+pub const STATUS_CLOUD: i64 = 3;
+/// A cloud-only original the user has scrolled to; we're fetching + thumbnailing
+/// it now. On success it becomes READY; on failure it falls back to CLOUD so a
+/// later visit can retry.
+pub const STATUS_DOWNLOADING: i64 = 4;
 
 /// Open (or create) the library database.
 ///
-/// WAL mode lets the worker threads write thumbnail-status updates while the UI
-/// thread reads the photo list concurrently, without them blocking each other.
+/// WAL mode lets readers (the grid querying rows) run concurrently with writers
+/// (the scan inserting photos, workers updating status). `busy_timeout` makes the
+/// several writers (scan + local workers + cloud workers) wait politely for the
+/// single write lock instead of erroring out.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     Ok(conn)
 }
 
@@ -51,8 +63,9 @@ pub struct Job {
     pub path: String,
 }
 
-/// Every photo that still needs a thumbnail (status = pending). Used at startup
-/// to resume an interrupted indexing run from where it left off.
+/// Local photos that still need a thumbnail (status = pending). Used at startup
+/// to resume an interrupted indexing run. Cloud-only photos are intentionally
+/// excluded — they wait for the user to look at them.
 pub fn pending_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt =
         conn.prepare("SELECT id, path FROM photos WHERE thumb_status = ?1 ORDER BY id")?;
@@ -77,20 +90,22 @@ pub fn stats(conn: &Connection) -> Result<(i64, i64)> {
     Ok((total, ready))
 }
 
-/// One grid cell's worth of data: a stable id and whether its thumbnail is
-/// ready to display. Ordered by path so the grid order is stable across runs.
+/// One grid cell's worth of data: a stable id and its thumbnail status.
+///
+/// Ordered by `id` (discovery order) rather than path: during a live scan, newly
+/// found photos only ever append to the end, so the grid never reshuffles under
+/// the user (Principle 2). Sorting by date/path is a deliberate later action.
 #[derive(serde::Serialize)]
 pub struct PhotoRow {
     pub id: i64,
     pub status: i64,
 }
 
-/// Fetch a contiguous window of the library, ordered by path. The frontend
+/// Fetch a contiguous window of the library, in discovery order. The frontend
 /// requests only the ranges its virtualized grid is about to show.
 pub fn photos_range(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<PhotoRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, thumb_status FROM photos ORDER BY path LIMIT ?1 OFFSET ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, thumb_status FROM photos ORDER BY id LIMIT ?1 OFFSET ?2")?;
     let rows = stmt.query_map([limit, offset], |r| {
         Ok(PhotoRow {
             id: r.get(0)?,
@@ -100,11 +115,49 @@ pub fn photos_range(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<Ph
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Mark a thumbnail's outcome after a worker finishes (ready or failed).
+/// Look up status + path for a set of ids. Used by on-demand cloud handling to
+/// decide which of the currently-visible photos are cloud-only and need fetching.
+pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, thumb_status, path FROM photos WHERE id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(ids.iter());
+    let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Mark a thumbnail's outcome (ready / failed / downloading / cloud).
 pub fn set_status(conn: &Connection, id: i64, status: i64) -> Result<()> {
     conn.execute(
         "UPDATE photos SET thumb_status = ?1 WHERE id = ?2",
         rusqlite::params![status, id],
+    )?;
+    Ok(())
+}
+
+/// Move a set of ids to a status in one statement (used when we start fetching
+/// the cloud-only photos the user just scrolled to).
+pub fn set_status_many(conn: &Connection, ids: &[i64], status: i64) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE photos SET thumb_status = {status} WHERE id IN ({placeholders})");
+    let params = rusqlite::params_from_iter(ids.iter());
+    conn.execute(&sql, params)?;
+    Ok(())
+}
+
+/// At startup, any photo left in DOWNLOADING wasn't actually being fetched (the
+/// previous run ended). Reset it to CLOUD so it shows as a placeholder and gets
+/// re-fetched the next time it's visible.
+pub fn set_status_many_where_downloading(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET thumb_status = ?1 WHERE thumb_status = ?2",
+        rusqlite::params![STATUS_CLOUD, STATUS_DOWNLOADING],
     )?;
     Ok(())
 }

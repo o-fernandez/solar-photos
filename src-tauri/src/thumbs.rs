@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use image::{DynamicImage, ImageReader};
 
-use crate::db::{self, Job, STATUS_FAILED, STATUS_READY};
+use crate::db::{self, Job, STATUS_READY};
 
 /// Longest edge of a generated thumbnail, in pixels. One size for v1.
 const THUMB_EDGE: u32 = 256;
@@ -56,6 +56,10 @@ struct Inner {
     /// What the user is looking at right now — drained before `normal`.
     priority: VecDeque<i64>,
     priority_set: HashSet<i64>,
+    /// Jobs a worker has taken but not yet finished. Lets `enqueue` /
+    /// `replace_pending` avoid re-queueing a download that's already in flight
+    /// (the cloud lane re-reports the same visible ids on every scroll tick).
+    in_flight: HashSet<i64>,
     /// Set on shutdown so workers can exit their loop.
     shutdown: bool,
 }
@@ -68,17 +72,18 @@ impl ThumbQueue {
                 normal: VecDeque::new(),
                 priority: VecDeque::new(),
                 priority_set: HashSet::new(),
+                in_flight: HashSet::new(),
                 shutdown: false,
             }),
             available: Condvar::new(),
         })
     }
 
-    /// Add jobs to the background lane. No-op for ids already queued.
+    /// Add jobs to the background lane. Skips ids already queued or in flight.
     pub fn enqueue(&self, jobs: Vec<Job>) {
         let mut inner = self.inner.lock().unwrap();
         for job in jobs {
-            if !inner.jobs.contains_key(&job.id) {
+            if !inner.jobs.contains_key(&job.id) && !inner.in_flight.contains(&job.id) {
                 inner.normal.push_back(job.id);
                 inner.jobs.insert(job.id, job);
             }
@@ -103,6 +108,26 @@ impl ThumbQueue {
         self.available.notify_all();
     }
 
+    /// Replace the *entire* pending set with exactly these jobs. Used by the
+    /// cloud lane: as the user scrolls, we want to download only what's currently
+    /// visible and abandon cloud fetches they scrolled past before we started
+    /// them. Jobs already taken by a worker (a download in flight) keep running.
+    pub fn replace_pending(&self, jobs: Vec<Job>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.jobs.clear();
+        inner.normal.clear();
+        inner.priority.clear();
+        inner.priority_set.clear();
+        for job in jobs {
+            if !inner.jobs.contains_key(&job.id) && !inner.in_flight.contains(&job.id) {
+                inner.normal.push_back(job.id);
+                inner.jobs.insert(job.id, job);
+            }
+        }
+        drop(inner);
+        self.available.notify_all();
+    }
+
     /// Block until a job is available (priority first), or return `None` on
     /// shutdown. Taking a job removes it from `jobs`, so any stale copy left in
     /// the other lane is skipped when popped.
@@ -116,25 +141,43 @@ impl ThumbQueue {
             while let Some(id) = inner.priority.pop_front() {
                 inner.priority_set.remove(&id);
                 if let Some(job) = inner.jobs.remove(&id) {
+                    inner.in_flight.insert(id);
                     return Some(job);
                 }
             }
             // Then the background lane, skipping any stale ids.
             while let Some(id) = inner.normal.pop_front() {
                 if let Some(job) = inner.jobs.remove(&id) {
+                    inner.in_flight.insert(id);
                     return Some(job);
                 }
             }
             inner = self.available.wait(inner).unwrap();
         }
     }
+
+    /// Mark a taken job finished, so its id can be queued again later if needed.
+    fn complete(&self, id: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.in_flight.remove(&id);
+    }
 }
 
-/// Spawn `count` worker threads. Each owns its own DB connection (SQLite allows
-/// many connections to one WAL database) and emits a `thumb-ready` event after
-/// every photo so the frontend can update exactly one cell.
-pub fn spawn_workers<F>(count: usize, queue: Arc<ThumbQueue>, db_path: PathBuf, cache_dir: PathBuf, notify: F)
-where
+/// Spawn `count` worker threads draining `queue`. Each owns its own DB connection
+/// (SQLite allows many connections to one WAL database) and emits a `thumb-ready`
+/// event after every photo so the frontend can update exactly one cell.
+///
+/// `fail_status` is what a photo becomes if generation fails: local photos go to
+/// FAILED (we couldn't decode them), but cloud photos fall back to CLOUD so a
+/// later visit can retry the download.
+pub fn spawn_workers<F>(
+    count: usize,
+    queue: Arc<ThumbQueue>,
+    db_path: PathBuf,
+    cache_dir: PathBuf,
+    fail_status: i64,
+    notify: F,
+) where
     F: Fn(i64) + Send + Clone + 'static,
 {
     for _ in 0..count {
@@ -156,10 +199,11 @@ where
                     Ok(()) => STATUS_READY,
                     Err(e) => {
                         eprintln!("thumbnail failed for {}: {e}", job.path);
-                        STATUS_FAILED
+                        fail_status
                     }
                 };
                 let _ = db::set_status(&conn, job.id, status);
+                queue.complete(job.id);
                 // Always notify, even on failure, so the cell can stop waiting.
                 notify(job.id);
             }

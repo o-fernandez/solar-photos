@@ -10,6 +10,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 export const STATUS_PENDING = 0;
 export const STATUS_READY = 1;
 export const STATUS_FAILED = 2;
+/** Cloud-only original, not downloaded — shown as a placeholder until visited. */
+export const STATUS_CLOUD = 3;
+/** Cloud original we're fetching now (user scrolled to it). */
+export const STATUS_DOWNLOADING = 4;
 
 export interface PhotoRow {
   id: number;
@@ -31,9 +35,24 @@ export function getPhotosRange(offset: number, limit: number): Promise<PhotoRow[
   return invoke("get_photos_range", { offset, limit });
 }
 
-/** Index a folder. Returns the new library total. Thumbnailing runs after. */
-export function scanFolder(path: string): Promise<number> {
+/** Start indexing a folder. Returns immediately; progress streams via events. */
+export function scanFolder(path: string): Promise<void> {
   return invoke("scan_folder", { path });
+}
+
+export interface ScanProgress {
+  found: number;
+  done: boolean;
+}
+
+/** Subscribe to scan progress. Fires per batch as photos are discovered. */
+export function onScanProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {
+  return listen<ScanProgress>("scan-progress", (e) => cb(e.payload));
+}
+
+/** Subscribe to "started downloading these cloud photos" events. */
+export function onThumbDownloading(cb: (ids: number[]) => void): Promise<UnlistenFn> {
+  return listen<number[]>("thumb-downloading", (e) => cb(e.payload));
 }
 
 /** Tell the backend which photo ids are on screen so they jump the queue. */

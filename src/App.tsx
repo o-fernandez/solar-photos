@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
 import {
   getLibraryStats,
+  onScanProgress,
   onThumbReady,
   pickFolder,
   scanFolder,
@@ -35,18 +36,36 @@ function App() {
     return () => unlisten?.();
   }, []);
 
+  // The scan streams its progress: `total` grows per batch so the grid fills in
+  // live, and `scanning` clears when the walk finishes. The UI never blocks
+  // waiting for a huge or cloud-backed folder (Principle 1).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onScanProgress((p) => {
+      setTotal(p.found);
+      if (p.done) {
+        setScanning(false);
+        // Re-sync the authoritative counts once the walk is complete.
+        getLibraryStats()
+          .then((s) => {
+            setTotal(s.total);
+            setReady(s.ready);
+          })
+          .catch(() => {});
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
   const handlePick = useCallback(async () => {
     const path = await pickFolder();
     if (!path) return;
     setFolder(path);
     setScanning(true);
-    setReady(0);
-    try {
-      const newTotal = await scanFolder(path);
-      setTotal(newTotal);
-    } finally {
-      setScanning(false);
-    }
+    // Fire and forget — returns immediately; progress arrives via events.
+    scanFolder(path).catch(() => setScanning(false));
   }, []);
 
   const pct = total > 0 ? Math.round((ready / total) * 100) : 0;
@@ -77,13 +96,15 @@ function App() {
       </header>
 
       {total > 0 ? (
-        <PhotoGrid total={total} />
+        // Remount on a new folder so the grid's caches reset cleanly.
+        <PhotoGrid key={folder ?? "library"} total={total} />
       ) : (
         <div className="empty">
           <p>Pick a folder of photos to begin.</p>
           <p className="muted">
             JPEG, HEIC, PNG and WebP are indexed recursively. Thumbnails are
-            generated in the background and cached to disk.
+            generated in the background and cached to disk. Photos kept in the
+            cloud download on demand as you browse.
           </p>
         </div>
       )}
