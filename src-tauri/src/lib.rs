@@ -1,4 +1,4 @@
-//! Solar Photos — Rust backend.
+//! Solar — Rust backend.
 //!
 //! Responsibilities split across modules:
 //!   * `db`     — SQLite: the list of photos and each thumbnail's status.

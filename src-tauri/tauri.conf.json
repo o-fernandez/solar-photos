@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Solar Photos",
+  "productName": "Solar",
   "version": "0.1.0",
   "identifier": "com.solarphotos.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Solar Photos",
+        "title": "Solar",
         "width": 1200,
         "height": 800,
         "minWidth": 640,

@@ -1,4 +1,8 @@
-# Solar Photos
+# Solar
+
+> A photograph is captured light. **Solar** is where your light lives — on your
+> machine, in your hands, owned by you. The name's soul is *güey* (*gway*), the
+> Taíno word for the sun. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
 
 A local-first photo library manager in the spirit of Picasa — fast, opinionated,
 and respectful of the person using it. Your photos stay on your machine, in your
