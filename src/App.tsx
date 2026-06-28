@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
 import {
+  addFolder,
   getLibraryStats,
+  listRoots,
   onScanProgress,
   onThumbReady,
   pickFolder,
-  scanFolder,
+  removeFolder,
+  rescan,
 } from "./api";
 import "./App.css";
 
@@ -13,11 +16,18 @@ function App() {
   const [total, setTotal] = useState(0);
   const [ready, setReady] = useState(0);
   const [scanning, setScanning] = useState(false);
-  const [folder, setFolder] = useState<string | null>(null);
+  const [rescanning, setRescanning] = useState(false);
+  const [roots, setRoots] = useState<string[]>([]);
+  const [showRoots, setShowRoots] = useState(false);
+  // Bumped whenever the library changes on disk (add / rescan / remove) so the
+  // grid drops its cached index→photo mapping and refetches the truth.
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  // Cold start (Principle 4): on launch we read the already-indexed counts from
-  // the DB and render the grid immediately. No rescan, no "loading" wall.
-  useEffect(() => {
+  const refreshRoots = useCallback(() => {
+    listRoots().then(setRoots).catch(() => {});
+  }, []);
+
+  const refreshStats = useCallback(() => {
     getLibraryStats()
       .then((s) => {
         setTotal(s.total);
@@ -26,8 +36,14 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // Keep the "ready" counter live as thumbnails stream in. This is a count only;
-  // it never touches the grid's scroll position.
+  // Cold start (Principle 4): render from the already-indexed counts immediately;
+  // the backend's auto-rescan reconciles with disk in the background.
+  useEffect(() => {
+    refreshStats();
+    refreshRoots();
+  }, [refreshStats, refreshRoots]);
+
+  // Keep the "ready" counter live as thumbnails stream in (successes only).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onThumbReady((d) => {
@@ -38,46 +54,59 @@ function App() {
     return () => unlisten?.();
   }, []);
 
-  // The scan streams its progress: `total` grows per batch so the grid fills in
-  // live, and `scanning` clears when the walk finishes. The UI never blocks
-  // waiting for a huge or cloud-backed folder (Principle 1).
+  // Scan/rescan progress: grow the count live; on done, settle the truth and
+  // tell the grid to refresh.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onScanProgress((p) => {
       setTotal(p.found);
       if (p.done) {
         setScanning(false);
-        // Re-sync the authoritative counts once the walk is complete.
-        getLibraryStats()
-          .then((s) => {
-            setTotal(s.total);
-            setReady(s.ready);
-          })
-          .catch(() => {});
+        setRescanning(false);
+        refreshStats();
+        refreshRoots();
+        setRefreshKey((k) => k + 1);
       }
     }).then((fn) => {
       unlisten = fn;
     });
     return () => unlisten?.();
-  }, []);
+  }, [refreshStats, refreshRoots]);
 
-  const handlePick = useCallback(async () => {
+  const handleAdd = useCallback(async () => {
     const path = await pickFolder();
     if (!path) return;
-    setFolder(path);
     setScanning(true);
-    // Fire and forget — returns immediately; progress arrives via events.
-    scanFolder(path).catch(() => setScanning(false));
+    addFolder(path)
+      .then(refreshRoots)
+      .catch(() => setScanning(false));
+  }, [refreshRoots]);
+
+  const handleRescan = useCallback(() => {
+    setRescanning(true);
+    rescan().catch(() => setRescanning(false));
+  }, []);
+
+  const handleRemove = useCallback((path: string) => {
+    removeFolder(path).catch(() => {});
+    // The new total + refresh arrive via the scan-progress "done" event.
   }, []);
 
   const pct = total > 0 ? Math.round((ready / total) * 100) : 0;
+  const busy = scanning || rescanning;
 
   return (
     <div className="app">
       <header className="toolbar">
-        <button className="pick-btn" onClick={handlePick} disabled={scanning}>
-          {scanning ? "Scanning…" : "Pick folder"}
+        <button className="pick-btn" onClick={handleAdd} disabled={busy}>
+          {scanning ? "Scanning…" : "Add folder"}
         </button>
+        {total > 0 && (
+          <button className="ghost-btn" onClick={handleRescan} disabled={busy}>
+            {rescanning ? "Rescanning…" : "Rescan"}
+          </button>
+        )}
+
         <div className="status">
           {total > 0 ? (
             <>
@@ -94,17 +123,42 @@ function App() {
             <span className="count muted">No folder indexed yet</span>
           )}
         </div>
-        {folder && <div className="folder" title={folder}>{folder}</div>}
+
+        {roots.length > 0 && (
+          <div className="roots">
+            <button className="ghost-btn" onClick={() => setShowRoots((s) => !s)}>
+              {roots.length} {roots.length === 1 ? "folder" : "folders"} ▾
+            </button>
+            {showRoots && (
+              <div className="roots-menu">
+                {roots.map((r) => (
+                  <div className="roots-item" key={r}>
+                    <span className="roots-path" title={r}>
+                      {r}
+                    </span>
+                    <button
+                      className="roots-remove"
+                      aria-label={`Remove ${r}`}
+                      onClick={() => handleRemove(r)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </header>
 
       {total > 0 ? (
-        // Remount on a new folder so the grid's caches reset cleanly. While a
-        // scan runs, show discovery order (append-only, no reflow); once it
-        // finishes, snap to the newest-first timeline.
-        <PhotoGrid key={folder ?? "library"} total={total} byDate={!scanning} />
+        // Discovery order while a scan runs (append-only, no reflow); snap to the
+        // newest-first timeline otherwise. refreshKey forces a refetch when the
+        // library changes on disk.
+        <PhotoGrid total={total} byDate={!scanning} refreshKey={refreshKey} />
       ) : (
         <div className="empty">
-          <p>Pick a folder of photos to begin.</p>
+          <p>Add a folder of photos to begin.</p>
           <p className="muted">
             JPEG, HEIC, PNG and WebP are indexed recursively. Thumbnails are
             generated in the background and cached to disk. Photos kept in the

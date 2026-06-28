@@ -42,9 +42,25 @@ export function getPhotosRange(
   return invoke("get_photos_range", { offset, limit, byDate });
 }
 
-/** Start indexing a folder. Returns immediately; progress streams via events. */
-export function scanFolder(path: string): Promise<void> {
-  return invoke("scan_folder", { path });
+/** Add a folder to the library (remembered as a root) and scan it. Returns
+ *  immediately; progress streams via events. */
+export function addFolder(path: string): Promise<void> {
+  return invoke("add_folder", { path });
+}
+
+/** Reconcile the whole library with disk in the background (add new, prune gone). */
+export function rescan(): Promise<void> {
+  return invoke("rescan");
+}
+
+/** The folders the library is built from. */
+export function listRoots(): Promise<string[]> {
+  return invoke("list_roots");
+}
+
+/** Remove a folder from the library (drops its photos + cached files). */
+export function removeFolder(path: string): Promise<void> {
+  return invoke("remove_folder", { path });
 }
 
 export interface ScanProgress {

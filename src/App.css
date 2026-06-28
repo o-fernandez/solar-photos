@@ -75,16 +75,76 @@ body,
   color: #999;
 }
 
-.folder {
+/* Secondary toolbar button (Rescan, folders menu). */
+.ghost-btn {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  background: transparent;
+  color: #555;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.ghost-btn:hover:not(:disabled) {
+  background: #f0f0f0;
+  color: #1a1a1a;
+}
+.ghost-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Folders popover (multi-root management). */
+.roots {
   margin-left: auto;
-  max-width: 40%;
+  position: relative;
+}
+.roots-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 280px;
+  max-width: 460px;
+  background: #ffffff;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+}
+.roots-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.roots-item:hover {
+  background: #f5f5f5;
+}
+.roots-path {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #999;
   font-size: 12px;
+  color: #444;
   direction: rtl; /* keep the meaningful tail of the path visible */
   text-align: left;
+}
+.roots-remove {
+  border: none;
+  background: transparent;
+  color: #999;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.roots-remove:hover {
+  background: #f0d4d4;
+  color: #b23030;
 }
 
 /* --- Empty state --- */
@@ -338,5 +398,26 @@ body,
     background: #2c2c2c;
     border-color: #444;
     color: #ededed;
+  }
+  .ghost-btn {
+    color: #bbb;
+  }
+  .ghost-btn:hover:not(:disabled) {
+    background: #333;
+    color: #ededed;
+  }
+  .roots-menu {
+    background: #2a2a2a;
+    border-color: #444;
+  }
+  .roots-item:hover {
+    background: #333;
+  }
+  .roots-path {
+    color: #ccc;
+  }
+  .roots-remove:hover {
+    background: #5a2a2a;
+    color: #f0a0a0;
   }
 }

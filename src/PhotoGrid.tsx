@@ -38,7 +38,15 @@ const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill
 const CHUNK = 200; // how many rows we fetch from the DB per request
 const OVERSCAN_ROWS = 4; // rows rendered just outside the viewport, for smoothness
 
-export default function PhotoGrid({ total, byDate }: { total: number; byDate: boolean }) {
+export default function PhotoGrid({
+  total,
+  byDate,
+  refreshKey,
+}: {
+  total: number;
+  byDate: boolean;
+  refreshKey: number;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // --- Photo data, kept in refs so frequent updates don't re-render on their
@@ -94,7 +102,8 @@ export default function PhotoGrid({ total, byDate }: { total: number; byDate: bo
     invalidate();
   }, [total, invalidate]);
 
-  // Snap to the new ordering when the scan finishes (discovery → date). The
+  // Reset when the ordering changes (scan finished: discovery → date) or the
+  // library changed on disk (add / rescan / remove → refreshKey). The
   // index→photo mapping is order-dependent, so drop it and refetch from the top;
   // readyRef/downloadingRef are id-based and stay valid.
   const firstOrder = useRef(true);
@@ -107,7 +116,7 @@ export default function PhotoGrid({ total, byDate }: { total: number; byDate: bo
     loadedChunks.current.clear();
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     invalidate();
-  }, [byDate, invalidate]);
+  }, [byDate, refreshKey, invalidate]);
 
   // --- Timeline scrubber ---
   const [scrubbing, setScrubbing] = useState(false);

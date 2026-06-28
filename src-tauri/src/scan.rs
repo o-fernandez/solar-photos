@@ -81,7 +81,7 @@ struct Item {
 /// enqueued onto `queue` as they're discovered; cloud-only photos are recorded as
 /// placeholders and left for on-demand handling. `progress(total, done)` is
 /// invoked after each batch so the frontend can grow the grid live.
-pub fn run_scan<F>(db_path: &Path, root: &str, queue: Arc<ThumbQueue>, progress: F) -> Result<()>
+pub fn run_scan<F>(db_path: &Path, root: &str, gen: i64, queue: Arc<ThumbQueue>, progress: F) -> Result<()>
 where
     F: Fn(i64, bool),
 {
@@ -137,11 +137,14 @@ where
             let mut select =
                 tx.prepare("SELECT id, cache_key, thumb_status FROM photos WHERE path = ?1")?;
             let mut insert = tx.prepare(
-                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status, taken_ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status, taken_ts, seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             let mut update = tx.prepare(
-                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4, taken_ts = ?5 WHERE id = ?6",
+                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4, taken_ts = ?5, seen = ?6 WHERE id = ?7",
             )?;
+            // Bump only the seen-generation for files that are unchanged, so the
+            // post-rescan prune knows they still exist.
+            let mut touch = tx.prepare("UPDATE photos SET seen = ?1 WHERE id = ?2")?;
 
             for item in &items {
                 let key = cache_key(&item.path, item.mtime, item.size);
@@ -163,8 +166,9 @@ where
                     .ok();
 
                 match existing {
-                    Some((_id, old_key, status)) if old_key == key && status == STATUS_READY => {
-                        // Unchanged and already cached — nothing to do.
+                    Some((id, old_key, status)) if old_key == key && status == STATUS_READY => {
+                        // Unchanged and already cached — just mark it still here.
+                        touch.execute(rusqlite::params![gen, id])?;
                     }
                     Some((id, _, _)) => {
                         update.execute(rusqlite::params![
@@ -173,6 +177,7 @@ where
                             key,
                             fresh_status,
                             taken,
+                            gen,
                             id
                         ])?;
                         if !item.cloud {
@@ -186,7 +191,8 @@ where
                             item.size,
                             key,
                             fresh_status,
-                            taken
+                            taken,
+                            gen
                         ])?;
                         let id = tx.last_insert_rowid();
                         total += 1;

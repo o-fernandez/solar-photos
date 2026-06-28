@@ -47,19 +47,68 @@ pub fn init(conn: &Connection) -> Result<()> {
             size         INTEGER NOT NULL,
             cache_key    TEXT NOT NULL,
             thumb_status INTEGER NOT NULL DEFAULT 0,
-            taken_ts     INTEGER
+            taken_ts     INTEGER,
+            seen         INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
-         CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(thumb_status);",
+         CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(thumb_status);
+         CREATE TABLE IF NOT EXISTS roots (
+            id   INTEGER PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL
+         );",
     )?;
-    // Migration for libraries created before taken_ts existed. Ignore the error
-    // if the column is already there.
+    // Migrations for libraries created before these columns existed. Ignore the
+    // error if the column is already present.
     let _ = conn.execute("ALTER TABLE photos ADD COLUMN taken_ts INTEGER", []);
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN seen INTEGER NOT NULL DEFAULT 0", []);
     // The timeline orders on COALESCE(taken_ts, mtime); index it for fast paging.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));",
     )?;
     Ok(())
+}
+
+/// Remember a folder the user added. Idempotent.
+pub fn add_root(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("INSERT OR IGNORE INTO roots (path) VALUES (?1)", [path])?;
+    Ok(())
+}
+
+/// The folders the library is built from.
+pub fn list_roots(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Forget a root and return the ids of the photos it contained (so the caller
+/// can delete their cached files). The photo rows are deleted here.
+pub fn remove_root(conn: &Connection, path: &str) -> Result<Vec<i64>> {
+    conn.execute("DELETE FROM roots WHERE path = ?1", [path])?;
+    let pattern = format!("{path}/%");
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM photos WHERE path = ?1 OR path LIKE ?2")?;
+        let rows = stmt.query_map(rusqlite::params![path, pattern], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    conn.execute(
+        "DELETE FROM photos WHERE path = ?1 OR path LIKE ?2",
+        rusqlite::params![path, pattern],
+    )?;
+    Ok(ids)
+}
+
+/// After a full rescan, delete every photo not marked with the current
+/// generation (its file is gone, or its root was removed). Returns the deleted
+/// ids so their cached files can be removed too.
+pub fn take_unseen(conn: &Connection, gen: i64) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM photos WHERE seen <> ?1")?;
+        let rows = stmt.query_map([gen], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    conn.execute("DELETE FROM photos WHERE seen <> ?1", [gen])?;
+    Ok(ids)
 }
 
 /// A unit of work for the thumbnail pipeline: which photo, and where its

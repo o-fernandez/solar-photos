@@ -21,11 +21,13 @@ mod meta;
 mod scan;
 mod thumbs;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use db::Job;
 use thumbs::ThumbQueue;
@@ -48,6 +50,81 @@ struct AppState {
     local_queue: Arc<ThumbQueue>,
     /// Cloud-file queue (fed on demand with what's currently visible).
     cloud_queue: Arc<ThumbQueue>,
+    /// Guards against two full rescans running at once (e.g. launch + manual).
+    rescanning: Arc<AtomicBool>,
+}
+
+/// A monotonic-ish generation stamp for mark-and-sweep pruning.
+fn now_gen() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Remove a set of photos' cached files (thumbnail + preview) after they've been
+/// pruned or their root removed.
+fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
+    for &id in ids {
+        let _ = std::fs::remove_file(thumbs::thumb_path(cache_dir, id));
+        let _ = std::fs::remove_file(thumbs::preview_path(preview_dir, id));
+    }
+}
+
+/// Walk every root, mark what still exists, then prune what doesn't (deleted
+/// files, or files under a removed root) — including their cached thumbnails.
+/// This is the "second launch shows the truth" reconciliation (Principle 4). It
+/// runs in the background and never blocks the UI; a guard prevents overlap.
+fn rescan_all(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.rescanning.swap(true, Ordering::SeqCst) {
+        return; // a rescan is already in progress
+    }
+    let db_path = state.db_path.clone();
+    let cache_dir = state.cache_dir.clone();
+    let preview_dir = state.preview_dir.clone();
+    let queue = state.local_queue.clone();
+    let rescanning = state.rescanning.clone();
+    drop(state);
+
+    std::thread::spawn(move || {
+        let gen = now_gen();
+        let roots = match db::open(&db_path).and_then(|c| db::list_roots(&c)) {
+            Ok(r) => r,
+            Err(_) => {
+                rescanning.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        // Track whether every root was actually reachable. If any root is
+        // missing (drive unplugged, cloud not mounted) or errored mid-walk, we
+        // must NOT prune — otherwise a temporary outage would delete the library.
+        let mut all_roots_ok = true;
+        for root in &roots {
+            if !Path::new(root).exists() {
+                all_roots_ok = false;
+                continue;
+            }
+            let app = app.clone();
+            if scan::run_scan(&db_path, root, gen, queue.clone(), move |found, _| {
+                let _ = app.emit("scan-progress", ScanProgress { found, done: false });
+            })
+            .is_err()
+            {
+                all_roots_ok = false;
+            }
+        }
+        // Prune only when we trust the pass was complete.
+        if let Ok(conn) = db::open(&db_path) {
+            if all_roots_ok {
+                let removed = db::take_unseen(&conn, gen).unwrap_or_default();
+                delete_cache_files(&cache_dir, &preview_dir, &removed);
+            }
+            let total = db::stats(&conn).map(|(t, _)| t).unwrap_or(0);
+            let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
+        }
+        rescanning.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Library counts for the header readout. On a repeat launch this returns the
@@ -94,23 +171,58 @@ struct ThumbDone {
     ok: bool,
 }
 
-/// Start scanning a folder. Returns immediately — the walk runs on a background
-/// thread, registering photos in batches and emitting `scan-progress` events so
-/// the grid grows live. This is what keeps the UI from freezing on a huge (or
-/// cloud-backed) folder (Principle 1).
+/// Add a folder to the library: remember it as a root and scan it. Returns
+/// immediately — the walk runs on a background thread, registering photos in
+/// batches and emitting `scan-progress` events so the grid grows live. This is
+/// what keeps the UI from freezing on a huge (or cloud-backed) folder (P1).
 #[tauri::command]
-fn scan_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
+fn add_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
+    {
+        let conn = state.conn.lock().unwrap();
+        let _ = db::add_root(&conn, &path);
+    }
     let db_path = state.db_path.clone();
     let queue = state.local_queue.clone();
     std::thread::spawn(move || {
+        let gen = now_gen();
         let progress = |found: i64, done: bool| {
             let _ = app.emit("scan-progress", ScanProgress { found, done });
         };
-        if let Err(e) = scan::run_scan(&db_path, &path, queue, progress) {
+        if let Err(e) = scan::run_scan(&db_path, &path, gen, queue, progress) {
             eprintln!("scan failed: {e}");
             let _ = app.emit("scan-progress", ScanProgress { found: 0, done: true });
         }
     });
+}
+
+/// Reconcile the whole library with disk (add new, prune deleted) in the
+/// background. Safe to call anytime; overlapping calls are ignored.
+#[tauri::command]
+fn rescan(app: tauri::AppHandle) {
+    rescan_all(app);
+}
+
+/// The folders the library is built from.
+#[tauri::command]
+fn list_roots(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::list_roots(&conn).map_err(|e| e.to_string())
+}
+
+/// Remove a folder from the library: drop its photos and their cached files,
+/// then tell the frontend the new total so it can refresh.
+#[tauri::command]
+fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
+    let removed = {
+        let conn = state.conn.lock().unwrap();
+        db::remove_root(&conn, &path).unwrap_or_default()
+    };
+    delete_cache_files(&state.cache_dir, &state.preview_dir, &removed);
+    let total = {
+        let conn = state.conn.lock().unwrap();
+        db::stats(&conn).map(|(t, _)| t).unwrap_or(0)
+    };
+    let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
 }
 
 /// Detail for the viewer chrome: filename + a timestamp (capture date when we
@@ -311,14 +423,23 @@ pub fn run() {
                 conn: Mutex::new(conn),
                 local_queue,
                 cloud_queue,
+                rescanning: Arc::new(AtomicBool::new(false)),
             });
+
+            // Auto-sync on launch: reconcile every remembered root with disk in
+            // the background, so a repeat launch shows the truth (Principle 4)
+            // without the user having to ask. Cached content is already on screen.
+            rescan_all(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_library_stats,
             get_photos_range,
             get_photo_detail,
-            scan_folder,
+            add_folder,
+            rescan,
+            list_roots,
+            remove_folder,
             set_visible_range
         ])
         .run(tauri::generate_context!())
