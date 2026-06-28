@@ -129,6 +129,27 @@ pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>>
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// The original file path for one photo id (used by the preview protocol).
+pub fn path_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let path = conn
+        .query_row("SELECT path FROM photos WHERE id = ?1", [id], |r| r.get(0))
+        .ok();
+    Ok(path)
+}
+
+/// Detail shown in the viewer chrome: (full path, timestamp). The timestamp is
+/// the capture date once we have it, else the file's modified-time.
+pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64)>> {
+    let row = conn
+        .query_row(
+            "SELECT path, mtime FROM photos WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+    Ok(row)
+}
+
 /// Mark a thumbnail's outcome (ready / failed / downloading / cloud).
 pub fn set_status(conn: &Connection, id: i64, status: i64) -> Result<()> {
     conn.execute(

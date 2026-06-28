@@ -39,6 +39,8 @@ struct AppState {
     db_path: PathBuf,
     /// Directory holding cached thumbnail JPEGs.
     cache_dir: PathBuf,
+    /// Directory holding cached large viewer previews.
+    preview_dir: PathBuf,
     /// A single connection for the (UI-driven) command handlers.
     conn: Mutex<Connection>,
     /// Local-file thumbnail queue (drained eagerly).
@@ -101,6 +103,30 @@ fn scan_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: S
     });
 }
 
+/// Detail for the viewer chrome: filename + a timestamp (capture date when we
+/// have it, else file mtime).
+#[derive(serde::Serialize)]
+struct PhotoDetail {
+    filename: String,
+    timestamp: i64,
+}
+
+#[tauri::command]
+fn get_photo_detail(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<Option<PhotoDetail>, String> {
+    let conn = state.conn.lock().unwrap();
+    let detail = db::detail(&conn, id).map_err(|e| e.to_string())?;
+    Ok(detail.map(|(path, timestamp)| {
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(path);
+        PhotoDetail { filename, timestamp }
+    }))
+}
+
 /// Tell the backend which photos are currently on screen. Two effects:
 ///   * local pending thumbnails for those photos jump the queue (Principle 3);
 ///   * cloud-only photos among them are fetched on demand — we move them to
@@ -145,38 +171,63 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        // Serve cached thumbnails directly from disk. The frontend points an
-        // <img> at `thumb://localhost/<id>` and we stream back the JPEG bytes.
-        // No base64, no DB lookup — just id -> file path -> bytes.
+        // Serve cached images directly from disk over the `thumb` scheme (a
+        // single custom scheme keeps things inside the webview's CSP img-src):
+        //   thumb://localhost/<id>          -> the 256px grid thumbnail
+        //   thumb://localhost/preview/<id>  -> the large viewer preview
+        // The preview is generated on demand the first time it's requested
+        // (decoded, EXIF-oriented, downscaled) and cached forever; for a
+        // cloud-only original that first read triggers the on-demand download.
         .register_uri_scheme_protocol("thumb", |ctx, request| {
             use tauri::http::Response;
 
             let app = ctx.app_handle();
+            let ok = |bytes: Vec<u8>| {
+                Response::builder()
+                    .header("Content-Type", "image/jpeg")
+                    .header("Cache-Control", "no-cache")
+                    .body(bytes)
+                    .unwrap()
+            };
             let not_found = || Response::builder().status(404).body(Vec::new()).unwrap();
 
-            // URI looks like `thumb://localhost/<id>`; take the last path segment.
-            let id: Option<i64> = request
-                .uri()
-                .path()
-                .trim_matches('/')
-                .split('/')
-                .last()
-                .and_then(|s| s.parse().ok());
-
+            // Path is `/<id>` or `/preview/<id>`.
+            let full = request.uri().path().trim_matches('/').to_string();
+            let is_preview = full.starts_with("preview/");
+            let id: Option<i64> = full.rsplit('/').next().and_then(|s| s.parse().ok());
             let id = match id {
                 Some(id) => id,
                 None => return not_found(),
             };
 
             let state = app.state::<AppState>();
-            let path = thumbs::thumb_path(&state.cache_dir, id);
-            match std::fs::read(&path) {
-                Ok(bytes) => Response::builder()
-                    .header("Content-Type", "image/jpeg")
-                    .header("Cache-Control", "no-cache")
-                    .body(bytes)
-                    .unwrap(),
-                Err(_) => not_found(),
+
+            if !is_preview {
+                let path = thumbs::thumb_path(&state.cache_dir, id);
+                return match std::fs::read(&path) {
+                    Ok(bytes) => ok(bytes),
+                    Err(_) => not_found(),
+                };
+            }
+
+            let out = thumbs::preview_path(&state.preview_dir, id);
+            if let Ok(bytes) = std::fs::read(&out) {
+                return ok(bytes);
+            }
+            let original = {
+                let conn = state.conn.lock().unwrap();
+                db::path_for_id(&conn, id).ok().flatten()
+            };
+            let original = match original {
+                Some(p) => p,
+                None => return not_found(),
+            };
+            match thumbs::generate_preview(&out, &original) {
+                Ok(bytes) => ok(bytes),
+                Err(e) => {
+                    eprintln!("preview failed for {original}: {e}");
+                    not_found()
+                }
             }
         })
         .setup(|app| {
@@ -187,6 +238,8 @@ pub fn run() {
             let db_path = data_dir.join("library.db");
             let cache_dir = data_dir.join("thumbnails");
             std::fs::create_dir_all(&cache_dir)?;
+            let preview_dir = data_dir.join("previews");
+            std::fs::create_dir_all(&preview_dir)?;
 
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
@@ -238,6 +291,7 @@ pub fn run() {
             app.manage(AppState {
                 db_path,
                 cache_dir,
+                preview_dir,
                 conn: Mutex::new(conn),
                 local_queue,
                 cloud_queue,
@@ -247,6 +301,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_library_stats,
             get_photos_range,
+            get_photo_detail,
             scan_folder,
             set_visible_range
         ])

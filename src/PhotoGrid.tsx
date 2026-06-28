@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import Lightbox from "./Lightbox";
 import {
   getPhotosRange,
   onThumbDownloading,
@@ -48,6 +49,28 @@ export default function PhotoGrid({ total }: { total: number }) {
   const downloadingRef = useRef<Set<number>>(new Set());
   const loadedChunks = useRef<Set<number>>(new Set());
   const [, setTick] = useState(0);
+
+  // The viewer: which library index is open (null = closed).
+  const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+
+  // Resolve the photo id at an index for the viewer, loading its chunk if the
+  // grid hasn't fetched that far yet.
+  const resolveId = useCallback(async (i: number): Promise<number | null> => {
+    const existing = photosRef.current[i];
+    if (existing) return existing.id;
+    const c = Math.floor(i / CHUNK);
+    try {
+      const rows = await getPhotosRange(c * CHUNK, CHUNK);
+      rows.forEach((row, k) => {
+        photosRef.current[c * CHUNK + k] = row;
+        if (row.status === STATUS_READY) readyRef.current.add(row.id);
+      });
+      loadedChunks.current.add(c);
+      return photosRef.current[i]?.id ?? null;
+    } catch {
+      return null;
+    }
+  }, []);
 
   const invalidatePending = useRef(false);
   const invalidate = useCallback(() => {
@@ -176,6 +199,7 @@ export default function PhotoGrid({ total }: { total: number }) {
   }, [virtualRows, columns, total, invalidate]);
 
   return (
+    <>
     <div ref={scrollRef} className="grid-scroll">
       <div
         style={{
@@ -195,7 +219,15 @@ export default function PhotoGrid({ total }: { total: number }) {
               <div
                 key={index}
                 className="cell"
-                style={{ width: cellSize, height: cellSize, marginRight: c < columns - 1 ? GAP : 0 }}
+                role="button"
+                tabIndex={-1}
+                onClick={() => setViewerIndex(index)}
+                style={{
+                  width: cellSize,
+                  height: cellSize,
+                  marginRight: c < columns - 1 ? GAP : 0,
+                  cursor: "pointer",
+                }}
               >
                 {renderCellContent(photo)}
               </div>,
@@ -220,6 +252,15 @@ export default function PhotoGrid({ total }: { total: number }) {
         })}
       </div>
     </div>
+    {viewerIndex !== null && (
+      <Lightbox
+        index={viewerIndex}
+        total={total}
+        resolveId={resolveId}
+        onClose={() => setViewerIndex(null)}
+      />
+    )}
+    </>
   );
 
   // Decide what a cell shows based on its photo's state. Inner closure so it can

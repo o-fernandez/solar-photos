@@ -24,7 +24,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageReader};
 
 use crate::db::{self, Job, STATUS_READY};
 
@@ -32,6 +32,11 @@ use crate::db::{self, Job, STATUS_READY};
 const THUMB_EDGE: u32 = 256;
 /// JPEG quality for cached thumbnails (1–100). 80 is a good size/quality knee.
 const THUMB_QUALITY: u8 = 80;
+/// Longest edge of a viewer preview, in pixels. Big enough to look full-screen
+/// crisp, small enough to open instantly and stay cheap to cache.
+const PREVIEW_EDGE: u32 = 2560;
+/// JPEG quality for previews — a touch higher than thumbnails.
+const PREVIEW_QUALITY: u8 = 85;
 
 /// Where a photo's cached thumbnail lives. Derived from the id alone so the
 /// custom `thumb://` protocol can find it without touching the database.
@@ -211,20 +216,22 @@ pub fn spawn_workers<F>(
     }
 }
 
+/// Encode an RGB image as a JPEG byte buffer at the given quality.
+fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut buf), quality);
+    encoder.encode(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
+    Ok(buf)
+}
+
 /// Decode one original, downscale it, and write the cached JPEG thumbnail.
 fn generate(cache_dir: &Path, job: &Job) -> Result<()> {
-    let img = load_image(Path::new(&job.path))?;
+    let img = decode_oriented(Path::new(&job.path))?;
     // `thumbnail` is an optimized downscaler that preserves aspect ratio and
     // fits the image within THUMB_EDGE × THUMB_EDGE.
     let thumb = img.thumbnail(THUMB_EDGE, THUMB_EDGE).to_rgb8();
-    let (w, h) = thumb.dimensions();
-
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut encoder =
-            image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut buf), THUMB_QUALITY);
-        encoder.encode(thumb.as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
-    }
+    let buf = encode_jpeg(&thumb, THUMB_QUALITY)?;
 
     let out = thumb_path(cache_dir, job.id);
     if let Some(parent) = out.parent() {
@@ -234,9 +241,35 @@ fn generate(cache_dir: &Path, job: &Job) -> Result<()> {
     Ok(())
 }
 
-/// Decode any supported format into an in-memory image. HEIC/HEIF go through
-/// libheif; everything else through the `image` crate.
-fn load_image(path: &Path) -> Result<DynamicImage> {
+/// Generate the large viewer preview for one photo: decode the original
+/// (orientation already applied), downscale to fit PREVIEW_EDGE, encode JPEG,
+/// cache to disk, and return the bytes. Called on demand when the viewer opens a
+/// photo (and to prefetch its neighbors). Cached forever after first view.
+pub fn generate_preview(out: &Path, original_path: &str) -> Result<Vec<u8>> {
+    let img = decode_oriented(Path::new(original_path))?;
+    // Only downscale; never upscale a small original.
+    let preview = if img.width() > PREVIEW_EDGE || img.height() > PREVIEW_EDGE {
+        img.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
+    } else {
+        img
+    };
+    let buf = encode_jpeg(&preview.to_rgb8(), PREVIEW_QUALITY)?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, &buf)?;
+    Ok(buf)
+}
+
+/// Where a photo's cached preview lives (sibling scheme to `thumb_path`).
+pub fn preview_path(preview_dir: &Path, id: i64) -> std::path::PathBuf {
+    preview_dir.join((id / 1000).to_string()).join(format!("{id}.jpg"))
+}
+
+/// Decode any supported format into an in-memory image, with EXIF orientation
+/// applied so nothing is ever sideways. HEIC/HEIF go through libheif (which
+/// already honors rotation); other formats are oriented via their EXIF tag.
+fn decode_oriented(path: &Path) -> Result<DynamicImage> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -244,10 +277,14 @@ fn load_image(path: &Path) -> Result<DynamicImage> {
         .unwrap_or_default();
 
     if ext == "heic" || ext == "heif" {
-        decode_heic(path)
-    } else {
-        Ok(ImageReader::open(path)?.with_guessed_format()?.decode()?)
+        return decode_heic(path);
     }
+
+    let mut decoder = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder)?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
 /// Decode a HEIC/HEIF file using libheif and copy its interleaved RGB plane into

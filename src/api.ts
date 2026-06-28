@@ -75,3 +75,19 @@ export async function pickFolder(): Promise<string | null> {
 export function thumbUrl(id: number): string {
   return `thumb://localhost/${id}`;
 }
+
+/** The custom-protocol URL for a photo's large viewer preview. Requesting it
+ *  generates + caches the preview on first view (and downloads cloud originals). */
+export function photoUrl(id: number): string {
+  return `thumb://localhost/preview/${id}`;
+}
+
+export interface PhotoDetail {
+  filename: string;
+  timestamp: number;
+}
+
+/** Filename + timestamp for the viewer chrome. */
+export function getPhotoDetail(id: number): Promise<PhotoDetail | null> {
+  return invoke("get_photo_detail", { id });
+}
