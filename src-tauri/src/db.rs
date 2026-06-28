@@ -219,7 +219,7 @@ pub fn path_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
 pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64)>> {
     let row = conn
         .query_row(
-            "SELECT path, mtime FROM photos WHERE id = ?1",
+            "SELECT path, COALESCE(taken_ts, mtime) FROM photos WHERE id = ?1",
             [id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )
