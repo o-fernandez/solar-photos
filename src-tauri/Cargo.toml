@@ -1,0 +1,35 @@
+[package]
+name = "solar-photos"
+version = "0.1.0"
+description = "A local-first photo library manager"
+authors = ["Solar Photos"]
+edition = "2021"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (Windows quirk).
+name = "solar_photos_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Backend pipeline
+rusqlite = { version = "0.32", features = ["bundled"] }   # bundled = no system sqlite needed
+jwalk = "0.8"                                             # fast parallel directory walk
+image = "0.25"                                            # decode/encode jpeg/png/webp
+libheif-rs = "1.0"                                        # HEIC/HEIF decode (links system libheif)
+sha2 = "0.10"                                             # cache-key hashing
+anyhow = "1"                                              # ergonomic error handling in workers
+
+[profile.release]
+# Smaller, faster release binaries.
+codegen-units = 1
+lto = true
+opt-level = "s"
