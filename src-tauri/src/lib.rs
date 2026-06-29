@@ -436,6 +436,41 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
     Ok(out)
 }
 
+/// Debug-only: print the cosine distribution of mutual-kNN edges over the whole
+/// face set. This is the *measurement* that sets `TAU_LINK` from a real library
+/// rather than from vibes — a clean separation shows up as a trough between the
+/// within-person mass (high) and the across-person tail (low); put `TAU_LINK` in
+/// the trough. Returns the report as a string (also printed to the log).
+#[tauri::command]
+fn cluster_debug(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let faces = {
+        let conn = state.conn.lock().unwrap();
+        db::all_face_embeddings(&conn).map_err(|e| e.to_string())?
+    };
+    let sims = cluster::mutual_edge_sims(&faces);
+    let mut report = format!(
+        "cluster_debug: {} faces, {} mutual-kNN edges\n",
+        faces.len(),
+        sims.len()
+    );
+    if !sims.is_empty() {
+        // 0.30..1.00 in 0.05-wide buckets — the band where TAU_LINK lives.
+        let mut buckets = [0usize; 14];
+        for &s in &sims {
+            let b = (((s - 0.30) / 0.05).floor() as isize).clamp(0, 13) as usize;
+            buckets[b] += 1;
+        }
+        let max = buckets.iter().copied().max().unwrap_or(1).max(1);
+        for (b, &c) in buckets.iter().enumerate() {
+            let lo = 0.30 + 0.05 * b as f32;
+            let bar = "#".repeat(c * 40 / max);
+            report.push_str(&format!("  {lo:.2}-{:.2} | {bar} {c}\n", lo + 0.05));
+        }
+    }
+    eprintln!("{report}");
+    Ok(report)
+}
+
 /// Locate a bundled model: prefer the packaged resource dir, fall back to the
 /// source tree for `tauri dev`.
 fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
@@ -750,6 +785,7 @@ pub fn run() {
             name_cluster,
             merge_clusters,
             get_merge_suggestions,
+            cluster_debug,
             get_person_photos,
             remove_person_face,
             restore_person_faces

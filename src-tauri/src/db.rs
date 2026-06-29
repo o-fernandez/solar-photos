@@ -85,6 +85,10 @@ pub fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS cluster_names (
             cluster_id INTEGER PRIMARY KEY,
             name       TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS app_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
          );",
     )?;
     Ok(())
@@ -137,6 +141,13 @@ pub fn save_faces(
     Ok(())
 }
 
+/// Decode a stored little-endian f32 embedding blob back into a vector.
+fn decode_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 /// (cluster_id, embedding) for every already-clustered face — used to rebuild the
 /// in-memory cluster index at startup.
 pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
@@ -145,13 +156,93 @@ pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     let rows = stmt.query_map([], |r| {
         let cid: i64 = r.get(0)?;
         let blob: Vec<u8> = r.get(1)?;
-        let emb: Vec<f32> = blob
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        Ok((cid, emb))
+        Ok((cid, decode_embedding(&blob)))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (face_id, embedding) for every face that still belongs to a cluster — the input
+/// to a full [`crate::cluster::recluster`]. We deliberately skip NULL-cluster faces:
+/// those were detached by "not this person" and must stay out (a re-cluster must not
+/// resurrect them).
+pub fn all_face_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        let id: i64 = r.get(0)?;
+        let blob: Vec<u8> = r.get(1)?;
+        Ok((id, decode_embedding(&blob)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (face_id, cluster_id) for every clustered face — used to learn where each old
+/// cluster's faces landed after a re-cluster, so names can follow them.
+pub fn face_clusters(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, cluster_id FROM faces WHERE cluster_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Apply a full re-cluster: set every face's cluster id in one transaction. Pairs
+/// are `(face_id, cluster_id)`.
+pub fn set_face_clusters(conn: &mut Connection, pairs: &[(i64, i64)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut up = tx.prepare("UPDATE faces SET cluster_id = ?1 WHERE id = ?2")?;
+        for (face_id, cluster_id) in pairs {
+            up.execute(rusqlite::params![cluster_id, face_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replace the whole `cluster_names` table with `(cluster_id, name)` pairs — used
+/// after a re-cluster to re-anchor each surviving name to its new cluster id. Done
+/// in one transaction so People never sees a half-named state.
+pub fn replace_cluster_names(conn: &mut Connection, names: &[(i64, String)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        tx.execute("DELETE FROM cluster_names", [])?;
+        let mut ins = tx.prepare(
+            "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
+             ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
+        )?;
+        for (cluster_id, name) in names {
+            ins.execute(rusqlite::params![cluster_id, name])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The highest-confidence face ids for a cluster (detector `score` desc) — the
+/// example faces shown on a merge card so one glance decides.
+pub fn top_face_ids(conn: &Connection, cluster_id: i64, limit: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM faces WHERE cluster_id = ?1 ORDER BY score DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cluster_id, limit], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Read an app-level key/value flag (e.g. "have we run the one-time re-cluster").
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |r| r.get(0))
+        .ok())
+}
+
+/// Set an app-level key/value flag.
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
 }
 
 /// One person's group: cluster id, face count, a cover face (highest-confidence

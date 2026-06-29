@@ -1,94 +1,408 @@
-//! Incremental online clustering of face embeddings into people.
+//! Clustering of face embeddings into people — purity first.
 //!
-//! Each face is assigned to the nearest existing cluster centroid if their cosine
-//! similarity clears a threshold, otherwise it starts a new cluster. This is
-//! O(faces × clusters) — cheap, streaming, and resumable — which suits the
-//! background worker and scales to large libraries (Principle 6).
+//! Governing law (PRINCIPLES.md #5): **optimize for cluster purity, not
+//! completeness.** Merging two pure piles is one batch click; un-mixing a polluted
+//! pile is face-by-face misery. So we bias hard toward *not* merging: a person
+//! split across a few clean clusters is fine, a cluster holding two people is not.
 //!
-//! We bias toward *more* clusters (a conservative threshold): over-splitting a
-//! person into two clusters is recoverable via the "same person?" merge UX,
-//! whereas merging two different people is not. Clusters are identified by the
-//! integer `cluster_id` stored on each face; centroids are derived from members,
-//! so a restart rebuilds the exact same state from the database.
+//! The old approach matched each face to the nearest running-mean *centroid* and
+//! updated the mean. A few unlucky early assignments polluted a mean, and the
+//! polluted mean became a magnet that pulled in ever more different faces — a
+//! "pollution snowball" that produced one cluster spanning 20 years and four
+//! people. There is no centroid here. Evidence is **face-to-face** only.
 //!
-//! Threshold tuned against real embeddings: at 0.5 two (similar-looking) people
-//! collapsed into one cluster; 0.65 separated them into balanced clusters while
-//! leaving only a few hard-angle singletons for the merge UX to absorb.
+//! ## Batch [`recluster`] (order-independent)
+//! 1. **kNN graph.** Each face's `K` nearest other faces by cosine similarity
+//!    (embeddings are L2-normalized, so cosine == dot product). Computed with
+//!    blocked matrix multiplication so memory stays bounded at ~100k faces.
+//! 2. **Mutual edges only.** Keep an edge `(i, j)` only if each is in the other's
+//!    top-`K` and the similarity clears [`TAU_LINK`]. Mutuality kills "hub" faces
+//!    (a generic-looking face near everyone) that would otherwise chain the world
+//!    into one blob.
+//! 3. **Complete-linkage agglomeration (the anti-chaining guard).** Walk the
+//!    candidate edges strongest-first, merging the two faces' groups only if
+//!    *every* cross-pair between them clears [`TAU_LINK`] — complete linkage. The
+//!    result is that each cluster is a clique in the τ-graph: no two faces inside
+//!    it are below threshold. A bridge face may join the one group it's genuinely
+//!    close to, but it can never fuse two groups, because the far group's members
+//!    fail the all-pairs test. This is the concrete embodiment of "over-merge =
+//!    catastrophe," and it makes the result order-independent (it depends only on
+//!    the edge similarities, not on face arrival order).
+//! 4. A face with no qualifying edge is its own cluster — over-split is the safe
+//!    state, collapsed later by a single trustworthy merge click.
+//!
+//! ## Incremental [`ClusterIndex::assign`] (new faces after the batch)
+//! No running mean. A new face votes among its nearest already-clustered faces:
+//! it joins the majority cluster among neighbors above [`TAU_LINK`] (needing real
+//! agreement, not a single weak link), else starts a singleton. One outlier face
+//! can never pollute a cluster because there is no mean to drag. The full batch
+//! [`recluster`] is re-run periodically to consolidate.
 
-const ASSIGN_THR: f32 = 0.65;
+use ndarray::Array2;
 
-struct Cluster {
-    id: i64,
-    sum: Vec<f32>,
-    centroid: Vec<f32>,
-}
-
-pub struct ClusterIndex {
-    clusters: Vec<Cluster>,
-    next_id: i64,
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
+/// Neighbors examined per face when building the graph / voting.
+const K: usize = 10;
+/// Minimum cosine similarity for two faces to be considered linkable. Set
+/// conservatively above SFace's ~0.363 balance point so we err toward purity;
+/// raise toward 0.55 if any mixed cluster survives (tune from the histogram).
+const TAU_LINK: f32 = 0.5;
+/// Similarity at which two faces are treated as near-duplicates — strong enough
+/// to link a true pair on its own, without needing a corroborating triangle.
+const TAU_DUP: f32 = 0.8;
+/// Incremental: how many neighbors must agree on a cluster to join it (below this
+/// only a near-duplicate, single strong neighbor, can pull a face in).
+const MIN_VOTE: usize = 2;
 
 fn normalized(v: &[f32]) -> Vec<f32> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
     v.iter().map(|x| x / n).collect()
 }
 
-impl ClusterIndex {
-    /// Rebuild the in-memory centroids from the faces already clustered in the DB.
-    pub fn load(rows: Vec<(i64, Vec<f32>)>) -> Self {
-        let mut by_id: std::collections::HashMap<i64, Vec<f32>> = std::collections::HashMap::new();
-        let mut max_id = 0i64;
-        for (cid, emb) in rows {
-            max_id = max_id.max(cid);
-            let sum = by_id.entry(cid).or_insert_with(|| vec![0.0; emb.len()]);
-            if sum.len() == emb.len() {
-                for (s, e) in sum.iter_mut().zip(&emb) {
-                    *s += e;
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Bounded top-`K` selection: insert `(idx, sim)` keeping `top` sorted descending
+/// and capped at `K`. Cheap because `K` is tiny.
+fn push_topk(top: &mut Vec<(usize, f32)>, idx: usize, sim: f32) {
+    if top.len() < K {
+        top.push((idx, sim));
+        top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    } else if sim > top[K - 1].1 {
+        top[K - 1] = (idx, sim);
+        top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    }
+}
+
+/// Disjoint-set (union-find) over face indices, for connected components.
+struct UnionFind {
+    parent: Vec<usize>,
+}
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        UnionFind { parent: (0..n).collect() }
+    }
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+}
+
+/// Build the per-face top-`K` neighbor lists (index + similarity) over the whole
+/// set, using blocked matrix multiplication to bound transient memory. `progress`
+/// is called with a fraction in `[0, 1)` as blocks complete.
+fn knn_graph<F: FnMut(f32)>(mat: &Array2<f32>, mut progress: F) -> Vec<Vec<(usize, f32)>> {
+    let n = mat.nrows();
+    let mut neighbors: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    // ~B*N floats transient per block; B=256 keeps that near 100 MB at 100k faces.
+    const BLOCK: usize = 256;
+    let mut start = 0;
+    while start < n {
+        let end = (start + BLOCK).min(n);
+        // (B x dim) . (dim x N) -> (B x N) similarities for this block of rows.
+        let sims = mat.slice(ndarray::s![start..end, ..]).dot(&mat.t());
+        for (bi, row) in sims.outer_iter().enumerate() {
+            let i = start + bi;
+            let top = &mut neighbors[i];
+            for (j, &s) in row.iter().enumerate() {
+                if j != i && s >= TAU_LINK {
+                    push_topk(top, j, s);
                 }
             }
         }
-        let clusters = by_id
-            .into_iter()
-            .map(|(id, sum)| {
-                let centroid = normalized(&sum);
-                Cluster { id, sum, centroid }
-            })
-            .collect();
-        ClusterIndex { clusters, next_id: max_id + 1 }
+        start = end;
+        progress(start as f32 / n as f32);
+    }
+    neighbors
+}
+
+/// Re-cluster every face from scratch — order-independent, purity-biased.
+///
+/// Input is `(face_id, embedding)`; output maps every input `face_id` to a new
+/// 1-based `cluster_id`. Pure (no DB, no globals) so it is unit-tested directly.
+/// `progress` reports a fraction in `[0, 1]` for the long kNN phase.
+pub fn recluster<F: FnMut(f32)>(faces: &[(i64, Vec<f32>)], mut progress: F) -> Vec<(i64, i64)> {
+    let n = faces.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let dim = faces[0].1.len();
+    // Defensive re-normalization so cosine == dot even if a stored vector drifted.
+    let mut data = Vec::with_capacity(n * dim);
+    for (_, e) in faces {
+        data.extend(normalized(e));
+    }
+    let mat = Array2::from_shape_vec((n, dim), data).expect("uniform embedding length");
+
+    let neighbors = knn_graph(&mat, |f| progress(f * 0.5));
+
+    // Candidate edges: every kNN pair (either direction), deduped to i<j, carrying
+    // its similarity. These are only *candidates* — the complete-linkage test below
+    // decides which actually merge. Strongest first so tight groups form before any
+    // looser edge is considered.
+    use std::collections::HashSet;
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut edges: Vec<(f32, usize, usize)> = Vec::new();
+    for (i, nbrs) in neighbors.iter().enumerate() {
+        for &(j, sim) in nbrs {
+            let (a, b) = if i < j { (i, j) } else { (j, i) };
+            if seen.insert((a, b)) {
+                edges.push((sim, a, b));
+            }
+        }
+    }
+    edges.sort_unstable_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+
+    // Greedy complete-linkage agglomeration. `members[root]` is the face set of the
+    // cluster rooted at `root`; two clusters merge only if all cross-pairs clear
+    // TAU_LINK, keeping every cluster a clique (pure by construction).
+    let mut uf = UnionFind::new(n);
+    let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    let total = edges.len().max(1);
+    for (idx, &(_, a, b)) in edges.iter().enumerate() {
+        let (ra, rb) = (uf.find(a), uf.find(b));
+        if ra != rb && complete_link(&mat, &members[ra], &members[rb]) {
+            // Fold the smaller set into the larger so root membership stays cheap.
+            let (keep, gone) = if members[ra].len() >= members[rb].len() { (ra, rb) } else { (rb, ra) };
+            let moved = std::mem::take(&mut members[gone]);
+            members[keep].extend(moved);
+            uf.parent[gone] = keep;
+        }
+        if idx % 4096 == 0 {
+            progress(0.5 + 0.5 * idx as f32 / total as f32);
+        }
+    }
+    progress(1.0);
+
+    // Map each component root to a compact 1-based cluster id.
+    use std::collections::HashMap;
+    let mut root_to_cid: HashMap<usize, i64> = HashMap::new();
+    let mut next: i64 = 1;
+    let mut out = Vec::with_capacity(n);
+    for (i, (face_id, _)) in faces.iter().enumerate() {
+        let root = uf.find(i);
+        let cid = *root_to_cid.entry(root).or_insert_with(|| {
+            let c = next;
+            next += 1;
+            c
+        });
+        out.push((*face_id, cid));
+    }
+    out
+}
+
+/// Complete-linkage test: true iff *every* cross-pair between the two member sets
+/// has cosine ≥ [`TAU_LINK`]. Early-exits on the first pair that fails, so an
+/// obvious non-merge is cheap. Cosine == dot since rows are normalized.
+fn complete_link(mat: &Array2<f32>, a: &[usize], b: &[usize]) -> bool {
+    for &i in a {
+        let ri = mat.row(i);
+        for &j in b {
+            if ri.dot(&mat.row(j)) < TAU_LINK {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Cosine similarities of every mutual-kNN edge over the face set. This is the
+/// distribution that should set [`TAU_LINK`] from a real library rather than from
+/// vibes: a clean separation shows up as a gap between the within-person mass and
+/// the across-person tail. Exposed for the `cluster_debug` command.
+pub fn mutual_edge_sims(faces: &[(i64, Vec<f32>)]) -> Vec<f32> {
+    let n = faces.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let dim = faces[0].1.len();
+    let mut data = Vec::with_capacity(n * dim);
+    for (_, e) in faces {
+        data.extend(normalized(e));
+    }
+    let mat = Array2::from_shape_vec((n, dim), data).expect("uniform embedding length");
+    let neighbors = knn_graph(&mat, |_| {});
+    let nbr_sets: Vec<std::collections::HashSet<usize>> = neighbors
+        .iter()
+        .map(|v| v.iter().map(|&(j, _)| j).collect())
+        .collect();
+    let mut sims = Vec::new();
+    for i in 0..n {
+        for &(j, sim) in &neighbors[i] {
+            if i < j && nbr_sets[j].contains(&i) {
+                sims.push(sim);
+            }
+        }
+    }
+    sims
+}
+
+/// In-memory state for incremental assignment of newly-detected faces. Holds every
+/// already-clustered face's `(cluster_id, embedding)` so a new face can vote among
+/// its nearest neighbors. Rebuilt from the DB at startup, so a restart reproduces
+/// the same state.
+pub struct ClusterIndex {
+    faces: Vec<(i64, Vec<f32>)>, // (cluster_id, embedding)
+    next_id: i64,
+}
+
+impl ClusterIndex {
+    /// Rebuild from `(cluster_id, embedding)` rows of the already-clustered faces.
+    pub fn load(rows: Vec<(i64, Vec<f32>)>) -> Self {
+        let next_id = rows.iter().map(|(c, _)| *c).max().unwrap_or(0) + 1;
+        ClusterIndex { faces: rows, next_id }
     }
 
-    /// Assign an embedding to a cluster, updating centroids. Returns the cluster id.
+    /// Assign a new embedding by majority vote among its nearest clustered faces —
+    /// no centroid, so no single face can drag a cluster. Returns the cluster id
+    /// (an existing one, or a fresh singleton). The face is remembered so later
+    /// faces in the same batch can match against it.
     pub fn assign(&mut self, emb: &[f32]) -> i64 {
-        let mut best = -2.0f32;
-        let mut best_i: Option<usize> = None;
-        for (i, c) in self.clusters.iter().enumerate() {
-            let s = cosine(emb, &c.centroid);
-            if s > best {
-                best = s;
-                best_i = Some(i);
+        let q = normalized(emb);
+        // Top-K nearest already-clustered faces above the link threshold.
+        let mut top: Vec<(usize, f32)> = Vec::new();
+        for (idx, (_, e)) in self.faces.iter().enumerate() {
+            let s = cosine(&q, e);
+            if s >= TAU_LINK {
+                push_topk(&mut top, idx, s);
             }
         }
-        if let Some(i) = best_i {
-            if best >= ASSIGN_THR {
-                let c = &mut self.clusters[i];
-                for (s, e) in c.sum.iter_mut().zip(emb) {
-                    *s += e;
-                }
-                c.centroid = normalized(&c.sum);
-                return c.id;
-            }
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.clusters.push(Cluster {
-            id,
-            sum: emb.to_vec(),
-            centroid: normalized(emb),
+
+        let chosen = self.vote(&top);
+        let cid = chosen.unwrap_or_else(|| {
+            let c = self.next_id;
+            self.next_id += 1;
+            c
         });
-        id
+        self.faces.push((cid, q));
+        cid
+    }
+
+    /// Pick a cluster from the neighbor list: the plurality cluster, but only if it
+    /// has real support (`MIN_VOTE` neighbors) — unless the single nearest neighbor
+    /// is a near-duplicate, which is evidence enough on its own. `None` ⇒ singleton.
+    fn vote(&self, top: &[(usize, f32)]) -> Option<i64> {
+        if top.is_empty() {
+            return None;
+        }
+        if top[0].1 >= TAU_DUP {
+            return Some(self.faces[top[0].0].0);
+        }
+        use std::collections::HashMap;
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for &(idx, _) in top {
+            *counts.entry(self.faces[idx].0).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, c)| c >= MIN_VOTE)
+            .max_by_key(|&(_, c)| c)
+            .map(|(cid, _)| cid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unit vector pointing mostly along axis `axis` with a little spread, so a
+    /// "blob" is a set of near-but-not-identical faces of one synthetic person.
+    fn vec_near(dim: usize, axis: usize, jitter: usize, scale: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[axis] = 1.0;
+        v[(jitter + 1) % dim] += scale; // perturb a different component each time
+        normalized(&v)
+    }
+
+    fn blob(dim: usize, axis: usize, count: usize) -> Vec<Vec<f32>> {
+        (0..count).map(|k| vec_near(dim, axis, axis * 10 + k, 0.05 * k as f32)).collect()
+    }
+
+    fn cluster_of(assignments: &[(i64, i64)], face_id: i64) -> i64 {
+        assignments.iter().find(|(f, _)| *f == face_id).unwrap().1
+    }
+
+    #[test]
+    fn well_separated_blobs_do_not_merge() {
+        // Two tight groups on orthogonal axes — cross-similarity ~0, far below TAU.
+        let mut faces = Vec::new();
+        for (k, e) in blob(16, 0, 5).into_iter().enumerate() {
+            faces.push((k as i64, e));
+        }
+        for (k, e) in blob(16, 8, 5).into_iter().enumerate() {
+            faces.push((100 + k as i64, e));
+        }
+        let a = recluster(&faces, |_| {});
+        // All of group A share one cluster; all of group B share another; distinct.
+        let ca = cluster_of(&a, 0);
+        let cb = cluster_of(&a, 100);
+        assert_ne!(ca, cb, "orthogonal blobs must not merge");
+        for k in 0..5 {
+            assert_eq!(cluster_of(&a, k), ca);
+            assert_eq!(cluster_of(&a, 100 + k), cb);
+        }
+    }
+
+    #[test]
+    fn single_bridge_does_not_chain_two_blobs() {
+        // Two blobs plus one face sitting partway between them, weakly linked to a
+        // single member of each. The mutual+triangle guard must refuse to chain.
+        let dim = 16;
+        let mut faces = Vec::new();
+        for (k, e) in blob(dim, 0, 5).into_iter().enumerate() {
+            faces.push((k as i64, e));
+        }
+        for (k, e) in blob(dim, 8, 5).into_iter().enumerate() {
+            faces.push((100 + k as i64, e));
+        }
+        // Bridge: equal mix of the two axes — similar to each blob but not a member.
+        let mut bridge = vec![0.0f32; dim];
+        bridge[0] = 0.72;
+        bridge[8] = 0.72;
+        faces.push((999, normalized(&bridge)));
+
+        let a = recluster(&faces, |_| {});
+        let ca = cluster_of(&a, 0);
+        let cb = cluster_of(&a, 100);
+        assert_ne!(ca, cb, "bridge must not chain the two blobs together");
+    }
+
+    #[test]
+    fn near_duplicates_group() {
+        // A pair of almost-identical faces (cosine well above TAU_DUP) must land
+        // in the same cluster even without a third face to form a triangle.
+        let dim = 16;
+        let mut a = vec![0.0f32; dim];
+        a[3] = 1.0;
+        a[4] = 0.02;
+        let mut b = vec![0.0f32; dim];
+        b[3] = 1.0;
+        b[4] = 0.01;
+        let faces = vec![(1i64, normalized(&a)), (2i64, normalized(&b))];
+        let asn = recluster(&faces, |_| {});
+        assert_eq!(cluster_of(&asn, 1), cluster_of(&asn, 2));
+    }
+
+    #[test]
+    fn incremental_outlier_starts_its_own_cluster() {
+        // Seed a cluster, then assign a far-away face: it must NOT join (no magnet).
+        let seed: Vec<(i64, Vec<f32>)> = blob(16, 0, 4).into_iter().map(|e| (1, e)).collect();
+        let mut idx = ClusterIndex::load(seed);
+        let mut outlier = vec![0.0f32; 16];
+        outlier[8] = 1.0;
+        let cid = idx.assign(&normalized(&outlier));
+        assert_ne!(cid, 1, "an outlier must start a new cluster, not pollute cluster 1");
+    }
+
+    #[test]
+    fn incremental_neighbor_joins_cluster() {
+        let seed: Vec<(i64, Vec<f32>)> = blob(16, 0, 4).into_iter().map(|e| (7, e)).collect();
+        let mut idx = ClusterIndex::load(seed);
+        // A new face squarely inside the blob should join cluster 7.
+        let cid = idx.assign(&vec_near(16, 0, 3, 0.04));
+        assert_eq!(cid, 7);
     }
 }
