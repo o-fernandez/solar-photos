@@ -13,6 +13,7 @@ import {
   getMergeSuggestions,
   mergeClusters,
   nameCluster,
+  onClusterProgress,
   type Cluster,
   type MergeSuggestion,
 } from "./api";
@@ -25,6 +26,8 @@ export default function People() {
   const [draft, setDraft] = useState("");
   // The person whose page is open, in place of the people-grid (null = grid).
   const [selected, setSelected] = useState<Cluster | null>(null);
+  // True while a background re-cluster is rebuilding people.
+  const [reorganizing, setReorganizing] = useState(false);
 
   const reload = useCallback(() => {
     getClusters().then(setClusters).catch(() => {});
@@ -33,6 +36,19 @@ export default function People() {
 
   useEffect(() => {
     reload();
+  }, [reload]);
+
+  // The re-cluster runs in the background. We reload exactly once, when it
+  // finishes (`running` → false), so the grid settles in one update instead of
+  // reflowing mid-rebuild (Principle 2). A subtle banner shows it's working.
+  useEffect(() => {
+    const un = onClusterProgress((p) => {
+      setReorganizing(p.running);
+      if (!p.running) reload();
+    });
+    return () => {
+      un.then((f) => f());
+    };
   }, [reload]);
 
   const startEdit = (c: Cluster) => {
@@ -85,6 +101,9 @@ export default function People() {
 
   return (
     <div className="people-scroll">
+      {reorganizing && (
+        <div className="reorg-banner">Reorganizing people…</div>
+      )}
       {suggestion && (
         <div className="merge-card">
           <div className="merge-faces">

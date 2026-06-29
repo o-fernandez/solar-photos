@@ -58,6 +58,8 @@ struct AppState {
     rescanning: Arc<AtomicBool>,
     /// When true, the face worker pauses (e.g. user toggled it off).
     faces_paused: Arc<AtomicBool>,
+    /// Guards against two re-clusters running at once (migration + manual + sweep).
+    reclustering: Arc<AtomicBool>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -436,6 +438,94 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
     Ok(out)
 }
 
+/// Set once the one-time migration off the old greedy clustering has run.
+const RECLUSTER_FLAG: &str = "reclustered_v1";
+
+/// Progress of a background re-cluster. `running` flips false when it finishes, so
+/// the People view can reload exactly once (and never mid-rebuild → no reflow).
+#[derive(Clone, serde::Serialize)]
+struct ClusterProgress {
+    running: bool,
+    fraction: f32,
+}
+
+/// Re-cluster every face from scratch, in the background (Principle 1: off the UI
+/// thread, no focus steal). Order-independent and purity-biased. Names are carried
+/// across by re-anchoring each to the new cluster holding the plurality of its old
+/// faces. A guard prevents overlap; progress streams via `cluster-progress`.
+fn run_recluster(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.reclustering.swap(true, Ordering::SeqCst) {
+        return; // a re-cluster is already in progress
+    }
+    let db_path = state.db_path.clone();
+    let reclustering = state.reclustering.clone();
+    drop(state);
+
+    std::thread::spawn(move || {
+        use std::collections::HashMap;
+        let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
+        let result = (|| -> anyhow::Result<()> {
+            let mut conn = db::open(&db_path)?;
+            let faces = db::all_face_embeddings(&conn)?;
+            if faces.is_empty() {
+                db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+                return Ok(());
+            }
+            let old_names: HashMap<i64, String> = db::cluster_names_all(&conn)?.into_iter().collect();
+            let old_fc = db::face_clusters(&conn)?;
+
+            // Throttle progress events to ~every 2% so we don't flood the channel.
+            let app2 = app.clone();
+            let mut last = 0.0f32;
+            let assignments = cluster::recluster(&faces, |f| {
+                if f - last >= 0.02 || f >= 1.0 {
+                    last = f;
+                    let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
+                }
+            });
+            db::set_face_clusters(&mut conn, &assignments)?;
+
+            // Name preservation: for each old *named* cluster, find where the bulk
+            // of its faces landed and move the name there. If two old names collide
+            // on one new cluster, the one that contributed more faces wins.
+            let new_of: HashMap<i64, i64> = assignments.iter().cloned().collect();
+            let mut tally: HashMap<i64, HashMap<i64, usize>> = HashMap::new();
+            for (face, oldc) in old_fc {
+                if old_names.contains_key(&oldc) {
+                    if let Some(&newc) = new_of.get(&face) {
+                        *tally.entry(oldc).or_default().entry(newc).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut winner: HashMap<i64, (String, usize)> = HashMap::new();
+            for (oldc, m) in tally {
+                if let Some((&newc, &cnt)) = m.iter().max_by_key(|(_, c)| **c) {
+                    if winner.get(&newc).map_or(true, |(_, e)| cnt > *e) {
+                        winner.insert(newc, (old_names[&oldc].clone(), cnt));
+                    }
+                }
+            }
+            let names: Vec<(i64, String)> = winner.into_iter().map(|(c, (n, _))| (c, n)).collect();
+            db::replace_cluster_names(&mut conn, &names)?;
+            db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("recluster failed: {e}");
+        }
+        let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
+        reclustering.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Rebuild all clusters from scratch (purity-biased), in the background. Safe to
+/// call anytime; overlapping calls are ignored.
+#[tauri::command]
+fn recluster(app: tauri::AppHandle) {
+    run_recluster(app);
+}
+
 /// Debug-only: print the cosine distribution of mutual-kNN edges over the whole
 /// face set. This is the *measurement* that sets `TAU_LINK` from a real library
 /// rather than from vibes — a clean separation shows up as a trough between the
@@ -660,6 +750,13 @@ pub fn run() {
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
 
+            // Has the one-time migration off the old greedy clustering run yet?
+            // (Checked now, before `conn` moves into the shared state.)
+            let needs_recluster = db::get_meta(&conn, RECLUSTER_FLAG)
+                .ok()
+                .flatten()
+                .is_none();
+
             // A download interrupted by a previous quit is no longer running;
             // reset those placeholders so they show as cloud again (and can be
             // re-fetched when next visible).
@@ -762,7 +859,16 @@ pub fn run() {
                 cloud_queue,
                 rescanning: Arc::new(AtomicBool::new(false)),
                 faces_paused,
+                reclustering: Arc::new(AtomicBool::new(false)),
             });
+
+            // One-time migration of the existing (greedy-clustered) mess to the
+            // purity-first algorithm. Runs in the background; sets a flag so it
+            // happens exactly once. New libraries simply set the flag on an empty
+            // pass and rely on the incremental path + periodic consolidation.
+            if needs_recluster {
+                run_recluster(app.handle().clone());
+            }
 
             // Auto-sync on launch: reconcile every remembered root with disk in
             // the background, so a repeat launch shows the truth (Principle 4)
@@ -785,6 +891,7 @@ pub fn run() {
             name_cluster,
             merge_clusters,
             get_merge_suggestions,
+            recluster,
             cluster_debug,
             get_person_photos,
             remove_person_face,

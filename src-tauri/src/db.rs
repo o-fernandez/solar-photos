@@ -276,6 +276,14 @@ pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Every named cluster as `(cluster_id, name)` — used to carry names across a
+/// re-cluster.
+pub fn cluster_names_all(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT cluster_id, name FROM cluster_names")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Name (or rename) a cluster. Empty name clears it.
 pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()> {
     if name.trim().is_empty() {
