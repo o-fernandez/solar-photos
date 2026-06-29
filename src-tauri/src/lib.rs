@@ -604,6 +604,10 @@ fn spawn_face_worker(
         };
         // Rebuild the cluster index from any faces clustered in a prior session.
         let mut index = cluster::ClusterIndex::load(db::clustered_embeddings(&conn).unwrap_or_default());
+        // Faces assigned by the (cheap, approximate) incremental path since the last
+        // full consolidation. When the sweep drains we run a purity-first rebuild to
+        // tidy them up — the incremental path keeps things usable in the meantime.
+        let mut pending_consolidation: u64 = 0;
         loop {
             if paused.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -611,6 +615,24 @@ fn spawn_face_worker(
             }
             let jobs = db::next_unscanned_for_faces(&conn, 1).unwrap_or_default();
             if jobs.is_empty() {
+                // Sweep is drained. If new faces accreted via the incremental path,
+                // consolidate once with the full batch algorithm, then refresh our
+                // in-memory index from the rebuilt cluster ids so later incremental
+                // assignments don't drift from them. Skipped if a re-cluster (e.g.
+                // the startup migration) is already running — we retry next drain.
+                if pending_consolidation > 0
+                    && !app.state::<AppState>().reclustering.load(Ordering::SeqCst)
+                {
+                    run_recluster(app.clone());
+                    let guard = app.state::<AppState>().reclustering.clone();
+                    while guard.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    index = cluster::ClusterIndex::load(
+                        db::clustered_embeddings(&conn).unwrap_or_default(),
+                    );
+                    pending_consolidation = 0;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 continue;
             }
@@ -623,6 +645,7 @@ fn spawn_face_worker(
                     .unwrap_or_default();
                 // Assign each face to a person-cluster (online, incremental).
                 let cluster_ids: Vec<i64> = found.iter().map(|f| index.assign(&f.embedding)).collect();
+                pending_consolidation += found.len() as u64;
                 let _ = db::save_faces(&mut conn, job.id, &found, &cluster_ids);
                 if let Ok((scanned, eligible)) = db::face_progress(&conn) {
                     let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
