@@ -321,6 +321,85 @@ fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>
     db::clusters_overview(&conn).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn name_cluster(state: tauri::State<'_, AppState>, cluster_id: i64, name: String) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn merge_clusters(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())
+}
+
+/// A "same person?" suggestion: two clusters whose centroids are similar but
+/// landed below the clustering threshold (likely an over-split).
+#[derive(Clone, serde::Serialize)]
+struct MergeSuggestion {
+    into: i64,
+    from: i64,
+    into_cover: i64,
+    from_cover: i64,
+    into_name: Option<String>,
+    similarity: f32,
+}
+
+/// Find likely over-splits: cluster centroid pairs with cosine in
+/// [SUGGEST_LOW, ASSIGN_THR). Bigger, more-similar pairs first. The "into" side
+/// is the larger cluster, so merging folds the small group into the person.
+#[tauri::command]
+fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
+    const SUGGEST_LOW: f32 = 0.45;
+    const ASSIGN_THR: f32 = 0.65;
+    let conn = state.conn.lock().unwrap();
+    let overview = db::clusters_overview(&conn).map_err(|e| e.to_string())?;
+    let embs = db::clustered_embeddings(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+
+    // Centroids + counts + cover per cluster.
+    use std::collections::HashMap;
+    let mut sums: HashMap<i64, Vec<f32>> = HashMap::new();
+    for (cid, e) in &embs {
+        let s = sums.entry(*cid).or_insert_with(|| vec![0.0; e.len()]);
+        for (a, b) in s.iter_mut().zip(e) {
+            *a += b;
+        }
+    }
+    let norm = |v: &[f32]| {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        v.iter().map(|x| x / n).collect::<Vec<f32>>()
+    };
+    let centroids: HashMap<i64, Vec<f32>> = sums.iter().map(|(k, v)| (*k, norm(v))).collect();
+
+    let mut out = Vec::new();
+    for i in 0..overview.len() {
+        for j in (i + 1)..overview.len() {
+            let (a, b) = (&overview[i], &overview[j]);
+            let (ca, cb) = match (centroids.get(&a.cluster_id), centroids.get(&b.cluster_id)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => continue,
+            };
+            let sim: f32 = ca.iter().zip(cb).map(|(x, y)| x * y).sum();
+            if sim >= SUGGEST_LOW && sim < ASSIGN_THR {
+                // Larger cluster is the merge target.
+                let (big, small) = if a.count >= b.count { (a, b) } else { (b, a) };
+                out.push(MergeSuggestion {
+                    into: big.cluster_id,
+                    from: small.cluster_id,
+                    into_cover: big.cover_face_id,
+                    from_cover: small.cover_face_id,
+                    into_name: big.name.clone(),
+                    similarity: sim,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    out.truncate(20);
+    Ok(out)
+}
+
 /// Locate a bundled model: prefer the packaged resource dir, fall back to the
 /// source tree for `tauri dev`.
 fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
@@ -418,9 +497,10 @@ pub fn run() {
             };
             let not_found = || Response::builder().status(404).body(Vec::new()).unwrap();
 
-            // Path is `/<id>` or `/preview/<id>`.
+            // Path is `/<id>`, `/preview/<id>`, or `/face/<face_id>`.
             let full = request.uri().path().trim_matches('/').to_string();
             let is_preview = full.starts_with("preview/");
+            let is_face = full.starts_with("face/");
             let id: Option<i64> = full.rsplit('/').next().and_then(|s| s.parse().ok());
             let id = match id {
                 Some(id) => id,
@@ -428,6 +508,23 @@ pub fn run() {
             };
 
             let state = app.state::<AppState>();
+
+            // Cover face for the People screen: crop it from the photo's thumbnail.
+            if is_face {
+                let bbox = {
+                    let conn = state.conn.lock().unwrap();
+                    db::face_box(&conn, id).ok().flatten()
+                };
+                let (photo_id, x1, y1, x2, y2) = match bbox {
+                    Some(b) => b,
+                    None => return not_found(),
+                };
+                let thumb = thumbs::thumb_path(&state.cache_dir, photo_id);
+                return match faces::crop_face_jpeg(&thumb, (x1, y1, x2, y2)) {
+                    Ok(bytes) => ok(bytes),
+                    Err(_) => not_found(),
+                };
+            }
 
             if !is_preview {
                 let path = thumbs::thumb_path(&state.cache_dir, id);
@@ -562,7 +659,10 @@ pub fn run() {
             set_visible_range,
             get_face_progress,
             set_faces_paused,
-            get_clusters
+            get_clusters,
+            name_cluster,
+            merge_clusters,
+            get_merge_suggestions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -166,6 +166,29 @@ fn align(img: &RgbImage, lm: &[[f32; 2]; 5]) -> RgbImage {
     out
 }
 
+/// Crop a square, margined face from a cached thumbnail and return JPEG bytes.
+/// `bbox` is normalized (0-1). Used to serve cover faces for the People screen.
+pub fn crop_face_jpeg(thumb_path: &Path, bbox: (f32, f32, f32, f32)) -> Result<Vec<u8>> {
+    let img = image::open(thumb_path)?.to_rgb8();
+    let (w, h) = img.dimensions();
+    let (nx1, ny1, nx2, ny2) = bbox;
+    let cx = (nx1 + nx2) / 2.0 * w as f32;
+    let cy = (ny1 + ny2) / 2.0 * h as f32;
+    let side = ((nx2 - nx1) * w as f32).max((ny2 - ny1) * h as f32) * 1.4; // 40% margin
+    let half = side / 2.0;
+    let x0 = (cx - half).max(0.0) as u32;
+    let y0 = (cy - half).max(0.0) as u32;
+    let x1 = (cx + half).min(w as f32) as u32;
+    let y1 = (cy + half).min(h as f32) as u32;
+    let cw = x1.saturating_sub(x0).max(1);
+    let ch = y1.saturating_sub(y0).max(1);
+    let crop = image::imageops::crop_imm(&img, x0, y0, cw, ch).to_image();
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::Cursor::new(&mut buf), 85);
+    enc.encode(crop.as_raw(), crop.width(), crop.height(), image::ExtendedColorType::Rgb8)?;
+    Ok(buf)
+}
+
 impl FaceModels {
     pub fn load(yunet_path: &Path, sface_path: &Path) -> Result<Self> {
         Ok(Self {
@@ -174,18 +197,22 @@ impl FaceModels {
         })
     }
 
-    /// Detect faces in an image and return each with its embedding.
+    /// Detect faces in an image and return each with its embedding. The stored
+    /// bounding box is normalized to 0-1 (relative to the image) so a face crop
+    /// can be taken from the cached thumbnail without knowing the original size.
     pub fn process(&mut self, img: &RgbImage) -> Result<Vec<DetectedFace>> {
+        let (ow, oh) = img.dimensions();
+        let (ow, oh) = (ow as f32, oh as f32);
         let cands = self.detect(img)?;
         let mut out = Vec::with_capacity(cands.len());
         for c in cands {
-            let aligned = align(img, &c.lm);
+            let aligned = align(img, &c.lm); // alignment uses pixel landmarks
             let embedding = self.embed(&aligned)?;
             out.push(DetectedFace {
-                x1: c.x1,
-                y1: c.y1,
-                x2: c.x2,
-                y2: c.y2,
+                x1: c.x1 / ow,
+                y1: c.y1 / oh,
+                x2: c.x2 / ow,
+                y2: c.y2 / oh,
                 score: c.score,
                 embedding,
             });

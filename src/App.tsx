@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
+import People from "./People";
 import {
   addFolder,
   getFaceProgress,
@@ -26,6 +27,7 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [faceScanned, setFaceScanned] = useState(0);
   const [faceEligible, setFaceEligible] = useState(0);
+  const [view, setView] = useState<"timeline" | "people">("timeline");
 
   const refreshRoots = useCallback(() => {
     listRoots().then(setRoots).catch(() => {});
@@ -129,6 +131,23 @@ function App() {
           </button>
         )}
 
+        {total > 0 && (
+          <nav className="view-nav">
+            <button
+              className={view === "timeline" ? "on" : ""}
+              onClick={() => setView("timeline")}
+            >
+              Timeline
+            </button>
+            <button
+              className={view === "people" ? "on" : ""}
+              onClick={() => setView("people")}
+            >
+              People
+            </button>
+          </nav>
+        )}
+
         <div className="status">
           {total > 0 ? (
             <>
@@ -180,10 +199,14 @@ function App() {
       </header>
 
       {total > 0 ? (
-        // Discovery order while a scan runs (append-only, no reflow); snap to the
-        // newest-first timeline otherwise. refreshKey forces a refetch when the
-        // library changes on disk.
-        <PhotoGrid total={total} byDate={!scanning} refreshKey={refreshKey} />
+        view === "people" ? (
+          <People />
+        ) : (
+          // Discovery order while a scan runs (append-only, no reflow); snap to
+          // the newest-first timeline otherwise. refreshKey forces a refetch
+          // when the library changes on disk.
+          <PhotoGrid total={total} byDate={!scanning} refreshKey={refreshKey} />
+        )
       ) : (
         <div className="empty">
           <p>Add a folder of photos to begin.</p>

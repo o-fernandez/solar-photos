@@ -81,7 +81,11 @@ pub fn init(conn: &Connection) -> Result<()> {
             cluster_id INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
-         CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);",
+         CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
+         CREATE TABLE IF NOT EXISTS cluster_names (
+            cluster_id INTEGER PRIMARY KEY,
+            name       TEXT NOT NULL
+         );",
     )?;
     Ok(())
 }
@@ -150,22 +154,24 @@ pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// One person's group: its cluster id, photo/face count, and a cover face (the
-/// highest-confidence detection). Biggest groups first.
+/// One person's group: cluster id, face count, a cover face (highest-confidence
+/// detection), and a name if it's been named. Biggest groups first.
 #[derive(serde::Serialize)]
 pub struct ClusterRow {
     pub cluster_id: i64,
     pub count: i64,
     pub cover_face_id: i64,
+    pub name: Option<String>,
 }
 
 pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
     let mut stmt = conn.prepare(
-        "SELECT cluster_id, COUNT(*) AS c,
-                (SELECT id FROM faces f2 WHERE f2.cluster_id = f.cluster_id ORDER BY score DESC LIMIT 1)
+        "SELECT f.cluster_id, COUNT(*) AS c,
+                (SELECT id FROM faces f2 WHERE f2.cluster_id = f.cluster_id ORDER BY score DESC LIMIT 1),
+                (SELECT name FROM cluster_names cn WHERE cn.cluster_id = f.cluster_id)
          FROM faces f
-         WHERE cluster_id IS NOT NULL
-         GROUP BY cluster_id
+         WHERE f.cluster_id IS NOT NULL
+         GROUP BY f.cluster_id
          ORDER BY c DESC",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -173,9 +179,47 @@ pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
             cluster_id: r.get(0)?,
             count: r.get(1)?,
             cover_face_id: r.get(2)?,
+            name: r.get(3)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Name (or rename) a cluster. Empty name clears it.
+pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [cluster_id])?;
+    } else {
+        conn.execute(
+            "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
+             ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
+            rusqlite::params![cluster_id, name.trim()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Merge cluster `from` into `into`: reassign its faces and drop its name.
+/// The surviving cluster keeps `into`'s name.
+pub fn merge_clusters(conn: &Connection, into: i64, from: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE faces SET cluster_id = ?1 WHERE cluster_id = ?2",
+        rusqlite::params![into, from],
+    )?;
+    conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [from])?;
+    Ok(())
+}
+
+/// The photo id and (normalized 0-1) bounding box of a face, for cropping.
+pub fn face_box(conn: &Connection, face_id: i64) -> Result<Option<(i64, f32, f32, f32, f32)>> {
+    let row = conn
+        .query_row(
+            "SELECT photo_id, x1, y1, x2, y2 FROM faces WHERE id = ?1",
+            [face_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .ok();
+    Ok(row)
 }
 
 /// Delete the faces belonging to a set of photos (call when photos are removed

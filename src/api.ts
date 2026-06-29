@@ -140,3 +140,44 @@ export function onFaceProgress(cb: (p: FaceProgress) => void): Promise<UnlistenF
 export function setFacesPaused(paused: boolean): Promise<void> {
   return invoke("set_faces_paused", { paused });
 }
+
+export interface Cluster {
+  cluster_id: number;
+  count: number;
+  cover_face_id: number;
+  name: string | null;
+}
+
+/** The detected people (clusters), biggest first. */
+export function getClusters(): Promise<Cluster[]> {
+  return invoke("get_clusters");
+}
+
+/** Name (or rename, or clear with "") a person-cluster. */
+export function nameCluster(clusterId: number, name: string): Promise<void> {
+  return invoke("name_cluster", { clusterId, name });
+}
+
+/** Merge one cluster into another (folds `from`'s faces into `into`). */
+export function mergeClusters(into: number, from: number): Promise<void> {
+  return invoke("merge_clusters", { into, from });
+}
+
+export interface MergeSuggestion {
+  into: number;
+  from: number;
+  into_cover: number;
+  from_cover: number;
+  into_name: string | null;
+  similarity: number;
+}
+
+/** "Same person?" suggestions — likely over-splits to fold together. */
+export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
+  return invoke("get_merge_suggestions");
+}
+
+/** The custom-protocol URL for a face's cover crop. */
+export function faceCropUrl(faceId: number): string {
+  return `thumb://localhost/face/${faceId}`;
+}
