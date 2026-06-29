@@ -166,8 +166,9 @@ export function mergeClusters(into: number, from: number): Promise<void> {
 export interface MergeSuggestion {
   into: number;
   from: number;
-  into_cover: number;
-  from_cover: number;
+  /** Example face ids per side (highest confidence) — the merge card's strips. */
+  into_faces: number[];
+  from_faces: number[];
   into_name: string | null;
   similarity: number;
 }
@@ -175,6 +176,22 @@ export interface MergeSuggestion {
 /** "Same person?" suggestions — likely over-splits to fold together. */
 export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
   return invoke("get_merge_suggestions");
+}
+
+/** Rebuild all clusters from scratch (purity-biased) in the background. */
+export function recluster(): Promise<void> {
+  return invoke("recluster");
+}
+
+export interface ClusterProgress {
+  running: boolean;
+  fraction: number;
+}
+
+/** Subscribe to background re-cluster progress. `running` flips false when done,
+ *  the cue for People to reload once (never mid-rebuild → no reflow). */
+export function onClusterProgress(cb: (p: ClusterProgress) => void): Promise<UnlistenFn> {
+  return listen<ClusterProgress>("cluster-progress", (e) => cb(e.payload));
 }
 
 /** The custom-protocol URL for a face's cover crop. */

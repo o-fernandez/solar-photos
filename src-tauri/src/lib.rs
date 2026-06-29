@@ -58,6 +58,8 @@ struct AppState {
     rescanning: Arc<AtomicBool>,
     /// When true, the face worker pauses (e.g. user toggled it off).
     faces_paused: Arc<AtomicBool>,
+    /// Guards against two re-clusters running at once (migration + manual + sweep).
+    reclustering: Arc<AtomicBool>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -369,71 +371,193 @@ fn restore_person_faces(
     db::restore_person_faces(&conn, &face_ids, cluster_id).map_err(|e| e.to_string())
 }
 
-/// A "same person?" suggestion: two clusters whose centroids are similar but
-/// landed below the clustering threshold (likely an over-split).
+/// A "same person?" suggestion: two clusters with several near-neighbor face pairs
+/// across them (face-to-face evidence, not centroid angles). The card shows a strip
+/// of example faces from each side so one glance decides.
 #[derive(Clone, serde::Serialize)]
 struct MergeSuggestion {
     into: i64,
     from: i64,
-    into_cover: i64,
-    from_cover: i64,
+    /// Example face ids from each side (highest detector confidence), for the card.
+    into_faces: Vec<i64>,
+    from_faces: Vec<i64>,
     into_name: Option<String>,
     similarity: f32,
 }
 
-/// Find likely over-splits: cluster centroid pairs with cosine in
-/// [SUGGEST_LOW, ASSIGN_THR). Bigger, more-similar pairs first. The "into" side
-/// is the larger cluster, so merging folds the small group into the person.
+/// Find likely over-splits from **face-to-face** evidence: cluster pairs with at
+/// least a few cross-cluster face pairs above the suggestion threshold (see
+/// `cluster::merge_evidence`). Ranked by leverage — strength × combined size —
+/// so the most worthwhile, most confident merges come first. The larger cluster
+/// is the "into" side, so merging folds the small group into the person.
 #[tauri::command]
 fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
-    const SUGGEST_LOW: f32 = 0.45;
-    const ASSIGN_THR: f32 = 0.65;
     let conn = state.conn.lock().unwrap();
     let overview = db::clusters_overview(&conn).map_err(|e| e.to_string())?;
-    let embs = db::clustered_embeddings(&conn).map_err(|e| e.to_string())?;
+    let faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
     drop(conn);
 
-    // Centroids + counts + cover per cluster.
     use std::collections::HashMap;
-    let mut sums: HashMap<i64, Vec<f32>> = HashMap::new();
-    for (cid, e) in &embs {
-        let s = sums.entry(*cid).or_insert_with(|| vec![0.0; e.len()]);
-        for (a, b) in s.iter_mut().zip(e) {
-            *a += b;
-        }
-    }
-    let norm = |v: &[f32]| {
-        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-        v.iter().map(|x| x / n).collect::<Vec<f32>>()
-    };
-    let centroids: HashMap<i64, Vec<f32>> = sums.iter().map(|(k, v)| (*k, norm(v))).collect();
+    let info: HashMap<i64, &db::ClusterRow> = overview.iter().map(|c| (c.cluster_id, c)).collect();
 
-    let mut out = Vec::new();
-    for i in 0..overview.len() {
-        for j in (i + 1)..overview.len() {
-            let (a, b) = (&overview[i], &overview[j]);
-            let (ca, cb) = match (centroids.get(&a.cluster_id), centroids.get(&b.cluster_id)) {
-                (Some(x), Some(y)) => (x, y),
-                _ => continue,
-            };
-            let sim: f32 = ca.iter().zip(cb).map(|(x, y)| x * y).sum();
-            if sim >= SUGGEST_LOW && sim < ASSIGN_THR {
-                // Larger cluster is the merge target.
-                let (big, small) = if a.count >= b.count { (a, b) } else { (b, a) };
-                out.push(MergeSuggestion {
-                    into: big.cluster_id,
-                    from: small.cluster_id,
-                    into_cover: big.cover_face_id,
-                    from_cover: small.cover_face_id,
-                    into_name: big.name.clone(),
-                    similarity: sim,
-                });
+    let evidence = cluster::merge_evidence(&faces);
+    // Rank by leverage: evidence strength × impact. Strength is the best cross-pair
+    // similarity weighted by how many pairs corroborate it; impact is the combined
+    // size (sqrt-damped so a few huge clusters don't crowd out confident small ones).
+    let mut ranked: Vec<(cluster::PairEvidence, f32)> = evidence
+        .into_iter()
+        .filter_map(|e| {
+            let (ca, cb) = (info.get(&e.a)?, info.get(&e.b)?);
+            let leverage = e.max_sim * e.pairs as f32 * ((ca.count + cb.count) as f32).sqrt();
+            Some((e, leverage))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    ranked.truncate(20);
+
+    let conn = state.conn.lock().unwrap();
+    let mut out = Vec::with_capacity(ranked.len());
+    for (e, _) in ranked {
+        let (big, small) = {
+            let (ca, cb) = (info[&e.a], info[&e.b]);
+            if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
+        };
+        out.push(MergeSuggestion {
+            into: big.cluster_id,
+            from: small.cluster_id,
+            into_faces: db::top_face_ids(&conn, big.cluster_id, 4).unwrap_or_default(),
+            from_faces: db::top_face_ids(&conn, small.cluster_id, 4).unwrap_or_default(),
+            into_name: big.name.clone(),
+            similarity: e.max_sim,
+        });
+    }
+    Ok(out)
+}
+
+/// Set once the one-time migration off the old greedy clustering has run.
+const RECLUSTER_FLAG: &str = "reclustered_v1";
+/// Set once faces have been re-detected with the fixed alignment (see the
+/// migration in `setup`). Bumping this string forces a one-time face re-sweep.
+const FACES_ALIGNED_FLAG: &str = "faces_aligned_v2";
+
+/// Progress of a background re-cluster. `running` flips false when it finishes, so
+/// the People view can reload exactly once (and never mid-rebuild → no reflow).
+#[derive(Clone, serde::Serialize)]
+struct ClusterProgress {
+    running: bool,
+    fraction: f32,
+}
+
+/// Re-cluster every face from scratch, in the background (Principle 1: off the UI
+/// thread, no focus steal). Order-independent and purity-biased. Names are carried
+/// across by re-anchoring each to the new cluster holding the plurality of its old
+/// faces. A guard prevents overlap; progress streams via `cluster-progress`.
+fn run_recluster(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.reclustering.swap(true, Ordering::SeqCst) {
+        return; // a re-cluster is already in progress
+    }
+    let db_path = state.db_path.clone();
+    let reclustering = state.reclustering.clone();
+    drop(state);
+
+    std::thread::spawn(move || {
+        use std::collections::HashMap;
+        let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
+        let result = (|| -> anyhow::Result<()> {
+            let mut conn = db::open(&db_path)?;
+            let faces = db::all_face_embeddings(&conn)?;
+            if faces.is_empty() {
+                db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+                return Ok(());
             }
+            let old_names: HashMap<i64, String> = db::cluster_names_all(&conn)?.into_iter().collect();
+            let old_fc = db::face_clusters(&conn)?;
+
+            // Throttle progress events to ~every 2% so we don't flood the channel.
+            let app2 = app.clone();
+            let mut last = 0.0f32;
+            let assignments = cluster::recluster(&faces, |f| {
+                if f - last >= 0.02 || f >= 1.0 {
+                    last = f;
+                    let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
+                }
+            });
+            db::set_face_clusters(&mut conn, &assignments)?;
+
+            // Name preservation: for each old *named* cluster, find where the bulk
+            // of its faces landed and move the name there. If two old names collide
+            // on one new cluster, the one that contributed more faces wins.
+            let new_of: HashMap<i64, i64> = assignments.iter().cloned().collect();
+            let mut tally: HashMap<i64, HashMap<i64, usize>> = HashMap::new();
+            for (face, oldc) in old_fc {
+                if old_names.contains_key(&oldc) {
+                    if let Some(&newc) = new_of.get(&face) {
+                        *tally.entry(oldc).or_default().entry(newc).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut winner: HashMap<i64, (String, usize)> = HashMap::new();
+            for (oldc, m) in tally {
+                if let Some((&newc, &cnt)) = m.iter().max_by_key(|(_, c)| **c) {
+                    if winner.get(&newc).map_or(true, |(_, e)| cnt > *e) {
+                        winner.insert(newc, (old_names[&oldc].clone(), cnt));
+                    }
+                }
+            }
+            let names: Vec<(i64, String)> = winner.into_iter().map(|(c, (n, _))| (c, n)).collect();
+            db::replace_cluster_names(&mut conn, &names)?;
+            db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("recluster failed: {e}");
+        }
+        let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
+        reclustering.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Rebuild all clusters from scratch (purity-biased), in the background. Safe to
+/// call anytime; overlapping calls are ignored.
+#[tauri::command]
+fn recluster(app: tauri::AppHandle) {
+    run_recluster(app);
+}
+
+/// Debug-only: print the cosine distribution of mutual-kNN edges over the whole
+/// face set. This is the *measurement* that sets `TAU_LINK` from a real library
+/// rather than from vibes — a clean separation shows up as a trough between the
+/// within-person mass (high) and the across-person tail (low); put `TAU_LINK` in
+/// the trough. Returns the report as a string (also printed to the log).
+#[tauri::command]
+fn cluster_debug(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let faces = {
+        let conn = state.conn.lock().unwrap();
+        db::all_face_embeddings(&conn).map_err(|e| e.to_string())?
+    };
+    let sims = cluster::mutual_edge_sims(&faces);
+    let mut report = format!(
+        "cluster_debug: {} faces, {} mutual-kNN edges\n",
+        faces.len(),
+        sims.len()
+    );
+    if !sims.is_empty() {
+        // 0.30..1.00 in 0.05-wide buckets — the band where TAU_LINK lives.
+        let mut buckets = [0usize; 14];
+        for &s in &sims {
+            let b = (((s - 0.30) / 0.05).floor() as isize).clamp(0, 13) as usize;
+            buckets[b] += 1;
+        }
+        let max = buckets.iter().copied().max().unwrap_or(1).max(1);
+        for (b, &c) in buckets.iter().enumerate() {
+            let lo = 0.30 + 0.05 * b as f32;
+            let bar = "#".repeat(c * 40 / max);
+            report.push_str(&format!("  {lo:.2}-{:.2} | {bar} {c}\n", lo + 0.05));
         }
     }
-    out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-    out.truncate(20);
-    Ok(out)
+    eprintln!("{report}");
+    Ok(report)
 }
 
 /// Locate a bundled model: prefer the packaged resource dir, fall back to the
@@ -540,6 +664,10 @@ fn spawn_face_workers(
         // Rebuild the cluster index from any faces clustered in a prior session.
         let mut index = cluster::ClusterIndex::load(db::clustered_embeddings(&conn).unwrap_or_default());
         let mut outstanding = 0usize;
+        // Faces assigned by the (cheap, approximate) incremental path since the last
+        // full consolidation. When the sweep drains we run a purity-first rebuild to
+        // tidy them up — the incremental path keeps things usable in the meantime.
+        let mut pending_consolidation: u64 = 0;
         loop {
             if paused.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -564,6 +692,7 @@ fn spawn_face_workers(
                 Ok((id, found)) => {
                     let cluster_ids: Vec<i64> =
                         found.iter().map(|f| index.assign(&f.embedding)).collect();
+                    pending_consolidation += found.len() as u64;
                     let _ = db::save_faces(&mut conn, id, &found, &cluster_ids);
                     outstanding -= 1;
                     if let Ok((scanned, eligible)) = db::face_progress(&conn) {
@@ -571,9 +700,27 @@ fn spawn_face_workers(
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Nothing finished this tick. If the whole library is scanned,
-                    // there's no backlog to claim and nothing in flight — idle.
+                    // Nothing finished this tick. When the whole library is scanned,
+                    // there's no backlog to claim and nothing in flight — the sweep
+                    // has drained. If new faces accreted via the incremental path,
+                    // consolidate once with the full batch algorithm and refresh our
+                    // in-memory index so later incremental assignments don't drift.
+                    // Skipped while a re-cluster (e.g. the startup migration) runs —
+                    // we retry on the next drain.
                     if outstanding == 0 {
+                        if pending_consolidation > 0
+                            && !app.state::<AppState>().reclustering.load(Ordering::SeqCst)
+                        {
+                            run_recluster(app.clone());
+                            let guard = app.state::<AppState>().reclustering.clone();
+                            while guard.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            index = cluster::ClusterIndex::load(
+                                db::clustered_embeddings(&conn).unwrap_or_default(),
+                            );
+                            pending_consolidation = 0;
+                        }
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
                 }
@@ -700,6 +847,25 @@ pub fn run() {
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
 
+            // One-time migration for the face-alignment fix: faces detected before it
+            // have collapsed embeddings (landmarks were swapped, mangling every
+            // aligned crop). Embeddings can't be repaired in place — landmarks aren't
+            // stored — so discard the old faces and let the sweep re-detect them
+            // correctly. Cached crops are stale too; clear them.
+            if db::get_meta(&conn, FACES_ALIGNED_FLAG).ok().flatten().is_none() {
+                db::reset_faces_for_recompute(&conn)?;
+                let _ = std::fs::remove_dir_all(&faces_dir);
+                std::fs::create_dir_all(&faces_dir)?;
+                db::set_meta(&conn, FACES_ALIGNED_FLAG, "1")?;
+            }
+
+            // Has the one-time migration off the old greedy clustering run yet?
+            // (Checked now, before `conn` moves into the shared state.)
+            let needs_recluster = db::get_meta(&conn, RECLUSTER_FLAG)
+                .ok()
+                .flatten()
+                .is_none();
+
             // A download interrupted by a previous quit is no longer running;
             // reset those placeholders so they show as cloud again (and can be
             // re-fetched when next visible).
@@ -803,7 +969,16 @@ pub fn run() {
                 cloud_queue,
                 rescanning: Arc::new(AtomicBool::new(false)),
                 faces_paused,
+                reclustering: Arc::new(AtomicBool::new(false)),
             });
+
+            // One-time migration of the existing (greedy-clustered) mess to the
+            // purity-first algorithm. Runs in the background; sets a flag so it
+            // happens exactly once. New libraries simply set the flag on an empty
+            // pass and rely on the incremental path + periodic consolidation.
+            if needs_recluster {
+                run_recluster(app.handle().clone());
+            }
 
             // Auto-sync on launch: reconcile every remembered root with disk in
             // the background, so a repeat launch shows the truth (Principle 4)
@@ -826,6 +1001,8 @@ pub fn run() {
             name_cluster,
             merge_clusters,
             get_merge_suggestions,
+            recluster,
+            cluster_debug,
             get_person_photos,
             remove_person_face,
             restore_person_faces
