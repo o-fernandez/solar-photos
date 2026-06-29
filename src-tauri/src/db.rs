@@ -110,20 +110,83 @@ pub fn next_unscanned_for_faces(conn: &Connection, limit: i64) -> Result<Vec<Job
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Persist a photo's detected faces and mark it scanned (one transaction).
-pub fn save_faces(conn: &mut Connection, photo_id: i64, faces: &[DetectedFace]) -> Result<()> {
+/// Persist a photo's detected faces (each with its assigned cluster id) and mark
+/// the photo scanned (one transaction).
+pub fn save_faces(
+    conn: &mut Connection,
+    photo_id: i64,
+    faces: &[DetectedFace],
+    cluster_ids: &[i64],
+) -> Result<()> {
     let tx = conn.transaction()?;
     {
         let mut ins = tx.prepare(
-            "INSERT INTO faces (photo_id, x1, y1, x2, y2, score, embedding) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO faces (photo_id, x1, y1, x2, y2, score, embedding, cluster_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         )?;
-        for f in faces {
+        for (f, cid) in faces.iter().zip(cluster_ids) {
             let bytes: Vec<u8> = f.embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
-            ins.execute(rusqlite::params![photo_id, f.x1, f.y1, f.x2, f.y2, f.score, bytes])?;
+            ins.execute(rusqlite::params![photo_id, f.x1, f.y1, f.x2, f.y2, f.score, bytes, cid])?;
         }
         tx.execute("UPDATE photos SET faces_scanned = 1 WHERE id = ?1", [photo_id])?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// (cluster_id, embedding) for every already-clustered face — used to rebuild the
+/// in-memory cluster index at startup.
+pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
+    let mut stmt =
+        conn.prepare("SELECT cluster_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        let cid: i64 = r.get(0)?;
+        let blob: Vec<u8> = r.get(1)?;
+        let emb: Vec<f32> = blob
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok((cid, emb))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One person's group: its cluster id, photo/face count, and a cover face (the
+/// highest-confidence detection). Biggest groups first.
+#[derive(serde::Serialize)]
+pub struct ClusterRow {
+    pub cluster_id: i64,
+    pub count: i64,
+    pub cover_face_id: i64,
+}
+
+pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT cluster_id, COUNT(*) AS c,
+                (SELECT id FROM faces f2 WHERE f2.cluster_id = f.cluster_id ORDER BY score DESC LIMIT 1)
+         FROM faces f
+         WHERE cluster_id IS NOT NULL
+         GROUP BY cluster_id
+         ORDER BY c DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ClusterRow {
+            cluster_id: r.get(0)?,
+            count: r.get(1)?,
+            cover_face_id: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Delete the faces belonging to a set of photos (call when photos are removed
+/// so we don't leave orphaned faces behind).
+pub fn delete_faces_for_photos(conn: &Connection, photo_ids: &[i64]) -> Result<()> {
+    if photo_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM faces WHERE photo_id IN ({placeholders})");
+    conn.execute(&sql, rusqlite::params_from_iter(photo_ids.iter()))?;
     Ok(())
 }
 

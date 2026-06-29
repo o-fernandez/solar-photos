@@ -16,6 +16,7 @@
 //!     cloud library; we fetch-and-thumbnail what's on screen, then cache it
 //!     forever.
 
+mod cluster;
 mod db;
 mod faces;
 mod meta;
@@ -121,6 +122,7 @@ fn rescan_all(app: AppHandle) {
         if let Ok(conn) = db::open(&db_path) {
             if all_roots_ok {
                 let removed = db::take_unseen(&conn, gen).unwrap_or_default();
+                let _ = db::delete_faces_for_photos(&conn, &removed);
                 delete_cache_files(&cache_dir, &preview_dir, &removed);
             }
             let total = db::stats(&conn).map(|(t, _)| t).unwrap_or(0);
@@ -218,7 +220,9 @@ fn list_roots(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> 
 fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
     let removed = {
         let conn = state.conn.lock().unwrap();
-        db::remove_root(&conn, &path).unwrap_or_default()
+        let ids = db::remove_root(&conn, &path).unwrap_or_default();
+        let _ = db::delete_faces_for_photos(&conn, &ids);
+        ids
     };
     delete_cache_files(&state.cache_dir, &state.preview_dir, &removed);
     let total = {
@@ -310,6 +314,13 @@ fn set_faces_paused(state: tauri::State<'_, AppState>, paused: bool) {
     state.faces_paused.store(paused, Ordering::Relaxed);
 }
 
+/// The detected people (clusters), biggest first, with a cover face each.
+#[tauri::command]
+fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::clusters_overview(&conn).map_err(|e| e.to_string())
+}
+
 /// Locate a bundled model: prefer the packaged resource dir, fall back to the
 /// source tree for `tauri dev`.
 fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
@@ -351,6 +362,8 @@ fn spawn_face_worker(
                 return;
             }
         };
+        // Rebuild the cluster index from any faces clustered in a prior session.
+        let mut index = cluster::ClusterIndex::load(db::clustered_embeddings(&conn).unwrap_or_default());
         loop {
             if paused.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -368,7 +381,9 @@ fn spawn_face_worker(
                     .ok()
                     .map(|img| models.process(&img.to_rgb8()).unwrap_or_default())
                     .unwrap_or_default();
-                let _ = db::save_faces(&mut conn, job.id, &found);
+                // Assign each face to a person-cluster (online, incremental).
+                let cluster_ids: Vec<i64> = found.iter().map(|f| index.assign(&f.embedding)).collect();
+                let _ = db::save_faces(&mut conn, job.id, &found, &cluster_ids);
                 if let Ok((scanned, eligible)) = db::face_progress(&conn) {
                     let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
                 }
@@ -546,7 +561,8 @@ pub fn run() {
             remove_folder,
             set_visible_range,
             get_face_progress,
-            set_faces_paused
+            set_faces_paused,
+            get_clusters
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
