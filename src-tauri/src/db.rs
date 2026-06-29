@@ -101,17 +101,43 @@ pub struct DetectedFace {
     pub embedding: Vec<f32>,
 }
 
-/// Photos that have a thumbnail (so the original is available locally) but whose
-/// faces haven't been detected yet. This naturally limits face work to files we
-/// already have — cloud-only photos are processed after they're downloaded.
-pub fn next_unscanned_for_faces(conn: &Connection, limit: i64) -> Result<Vec<Job>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, path FROM photos WHERE thumb_status = ?1 AND faces_scanned = 0 ORDER BY id LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![STATUS_READY, limit], |r| {
-        Ok(Job { id: r.get(0)?, path: r.get(1)? })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+/// `faces_scanned` sentinel: claimed by a worker, detection in flight. Sits
+/// between 0 (unscanned) and 1 (done) so concurrent workers never grab the same
+/// photo, and so `claim_faces_batch` / `face_progress` ignore it. Any rows
+/// left at this value after a crash are reset to 0 at startup.
+pub const FACES_CLAIMED: i64 = 2;
+
+/// Atomically take up to `limit` unscanned photos and mark them in-flight, so a
+/// pool of face workers can run in parallel without processing the same photo
+/// twice. Returns the claimed jobs (already flipped to FACES_CLAIMED).
+pub fn claim_faces_batch(conn: &mut Connection, limit: i64) -> Result<Vec<Job>> {
+    let tx = conn.transaction()?;
+    let jobs: Vec<Job> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, path FROM photos WHERE thumb_status = ?1 AND faces_scanned = 0 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![STATUS_READY, limit], |r| {
+            Ok(Job { id: r.get(0)?, path: r.get(1)? })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for j in &jobs {
+        tx.execute(
+            "UPDATE photos SET faces_scanned = ?1 WHERE id = ?2",
+            rusqlite::params![FACES_CLAIMED, j.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(jobs)
+}
+
+/// Clear any in-flight claims left behind by a crash/quit, so those photos are
+/// scanned again on the next run. Returns how many rows were reset.
+pub fn reset_claimed_faces(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE photos SET faces_scanned = 0 WHERE faces_scanned = ?1",
+        [FACES_CLAIMED],
+    )?)
 }
 
 /// Persist a photo's detected faces (each with its assigned cluster id) and mark
