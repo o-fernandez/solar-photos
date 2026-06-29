@@ -450,18 +450,83 @@ fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models").join(name)
 }
 
-/// The background face worker: lowest-priority, one photo at a time, pausable.
-/// It only touches photos that already have a thumbnail (i.e. are local), so it
-/// never triggers a cloud download, and it's resumable across launches via the
-/// `faces_scanned` flag. A short sleep between photos keeps foreground work and
-/// the thumbnail pipeline ahead of it.
-fn spawn_face_worker(
+/// How many face workers detect + embed in parallel. The per-photo cost is
+/// dominated by reading the (cloud-backed) original off ProtonDrive, which is
+/// I/O-latency-bound — overlapping several reads is the main lever on sweep
+/// throughput. CoreML serializes at the hardware level, so this is sized for
+/// I/O overlap, not CPU.
+const FACE_WORKERS: usize = 6;
+
+/// The background face sweep: a pool of `FACE_WORKERS` that decode + detect +
+/// embed in parallel, plus a single coordinator thread that hands out work and
+/// does all the clustering and DB writes. Splitting it this way keeps the
+/// expensive, parallelizable part (I/O + inference) concurrent while clustering
+/// stays single-threaded and deterministic — the online cluster index is mutated
+/// in exactly one place, in a well-defined order.
+///
+/// It only touches photos that already have a thumbnail (i.e. are local), so the
+/// first pass over a cloud library lags thumbnailing, and it's resumable across
+/// launches via `faces_scanned` (claims are reset on startup, see below).
+fn spawn_face_workers(
     app: AppHandle,
     db_path: PathBuf,
+    preview_dir: PathBuf,
     yunet: PathBuf,
     sface: PathBuf,
     paused: Arc<AtomicBool>,
 ) {
+    use std::sync::mpsc;
+
+    // Keep ~2 jobs in flight per worker so a worker rarely waits for the
+    // coordinator to refill, but a crash/quit leaves only a handful of photos in
+    // the "claimed" state to recover.
+    let target_outstanding = FACE_WORKERS * 2;
+    let claim_batch = (FACE_WORKERS * 2) as i64;
+
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (res_tx, res_rx) = mpsc::channel::<(i64, Vec<db::DetectedFace>)>();
+
+    // Worker pool: parallel decode + detect + embed. Each owns its own models.
+    for _ in 0..FACE_WORKERS {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let preview_dir = preview_dir.clone();
+        let yunet = yunet.clone();
+        let sface = sface.clone();
+        std::thread::spawn(move || {
+            let mut models = match faces::FaceModels::load(&yunet, &sface) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("faces: model load failed: {e}");
+                    return;
+                }
+            };
+            loop {
+                // Block until a job is available (or the coordinator is gone).
+                let job = {
+                    let rx = job_rx.lock().unwrap();
+                    rx.recv()
+                };
+                let job = match job {
+                    Ok(j) => j,
+                    Err(_) => break, // coordinator dropped the sender → shut down
+                };
+                // On any decode/inference error, fall through to an empty result —
+                // the coordinator still marks the photo scanned so we never re-loop.
+                let found = thumbs::load_face_source(&preview_dir, job.id, &job.path)
+                    .ok()
+                    .map(|img| models.process(&img).unwrap_or_default())
+                    .unwrap_or_default();
+                if res_tx.send((job.id, found)).is_err() {
+                    break; // coordinator gone
+                }
+            }
+        });
+    }
+    drop(res_tx); // only the workers hold result senders now
+
+    // Coordinator: claims work, feeds the pool, and serially clusters + saves.
     std::thread::spawn(move || {
         let mut conn = match db::open(&db_path) {
             Ok(c) => c,
@@ -470,39 +535,49 @@ fn spawn_face_worker(
                 return;
             }
         };
-        let mut models = match faces::FaceModels::load(&yunet, &sface) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("faces: model load failed: {e}");
-                return;
-            }
-        };
+        // Recover any photos a previous run claimed but didn't finish.
+        let _ = db::reset_claimed_faces(&conn);
         // Rebuild the cluster index from any faces clustered in a prior session.
         let mut index = cluster::ClusterIndex::load(db::clustered_embeddings(&conn).unwrap_or_default());
+        let mut outstanding = 0usize;
         loop {
             if paused.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 continue;
             }
-            let jobs = db::next_unscanned_for_faces(&conn, 1).unwrap_or_default();
-            if jobs.is_empty() {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                continue;
-            }
-            for job in jobs {
-                // On any decode/inference error, fall through to an empty result —
-                // save_faces still marks the photo scanned so we never loop on it.
-                let found = thumbs::load_oriented(std::path::Path::new(&job.path))
-                    .ok()
-                    .map(|img| models.process(&img.to_rgb8()).unwrap_or_default())
-                    .unwrap_or_default();
-                // Assign each face to a person-cluster (online, incremental).
-                let cluster_ids: Vec<i64> = found.iter().map(|f| index.assign(&f.embedding)).collect();
-                let _ = db::save_faces(&mut conn, job.id, &found, &cluster_ids);
-                if let Ok((scanned, eligible)) = db::face_progress(&conn) {
-                    let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
+            // Top up the pool's backlog.
+            while outstanding < target_outstanding {
+                let batch = db::claim_faces_batch(&mut conn, claim_batch).unwrap_or_default();
+                if batch.is_empty() {
+                    break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(15));
+                for job in batch {
+                    outstanding += 1;
+                    if job_tx.send(job).is_err() {
+                        return; // all workers gone
+                    }
+                }
+            }
+            // Drain a finished photo: assign clusters (online, incremental) and
+            // persist. Time out so we periodically re-check pause / refill / idle.
+            match res_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok((id, found)) => {
+                    let cluster_ids: Vec<i64> =
+                        found.iter().map(|f| index.assign(&f.embedding)).collect();
+                    let _ = db::save_faces(&mut conn, id, &found, &cluster_ids);
+                    outstanding -= 1;
+                    if let Ok((scanned, eligible)) = db::face_progress(&conn) {
+                        let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Nothing finished this tick. If the whole library is scanned,
+                    // there's no backlog to claim and nothing in flight — idle.
+                    if outstanding == 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // workers gone
             }
         }
     });
@@ -675,14 +750,15 @@ pub fn run() {
             let pending = db::pending_jobs(&conn)?;
             local_queue.enqueue(pending);
 
-            // Background face sweep (lowest priority). Resolve the bundled models
-            // and start a single polite worker; paused-flag shared with commands.
+            // Background face sweep. Resolve the bundled models and start the
+            // worker pool + coordinator; paused-flag shared with commands.
             let faces_paused = Arc::new(AtomicBool::new(false));
             let yunet = resolve_model(app.handle(), "yunet.onnx");
             let sface = resolve_model(app.handle(), "sface.onnx");
-            spawn_face_worker(
+            spawn_face_workers(
                 app.handle().clone(),
                 db_path.clone(),
+                preview_dir.clone(),
                 yunet,
                 sface,
                 faces_paused.clone(),

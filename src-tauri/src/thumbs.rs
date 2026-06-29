@@ -282,6 +282,41 @@ pub fn load_oriented(path: &Path) -> Result<DynamicImage> {
     decode_oriented(path)
 }
 
+/// The image the face sweep detects + embeds from. Prefers the cached preview
+/// (local, already downscaled) so we never re-read the original — the originals
+/// are cloud-backed, and re-materializing each one is the whole cost of the
+/// sweep. If no preview exists yet, decode the original once, cache a preview
+/// (so this never repeats, and the viewer opens instantly later), and return it.
+///
+/// A PREVIEW_EDGE (2560px) source is plenty for detection (YuNet runs at 640) and
+/// for SFace's 112px aligned crops — measured cosine vs the full-res embedding is
+/// ~0.94, well inside same-person territory, so clustering quality is unchanged.
+pub fn load_face_source(preview_dir: &Path, id: i64, original_path: &str) -> Result<image::RgbImage> {
+    let pv = preview_path(preview_dir, id);
+    if let Ok(bytes) = std::fs::read(&pv) {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            return Ok(img.to_rgb8());
+        }
+    }
+    // One read of the original (cold cloud fetch); cache a preview so the next
+    // pass — and the viewer — stay local.
+    let img = decode_oriented(Path::new(original_path))?;
+    let preview = if img.width() > PREVIEW_EDGE || img.height() > PREVIEW_EDGE {
+        img.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
+    } else {
+        img
+    };
+    let rgb = preview.to_rgb8();
+    // Best-effort cache; a write failure shouldn't sink the face work.
+    if let Ok(buf) = encode_jpeg(&rgb, PREVIEW_QUALITY) {
+        if let Some(parent) = pv.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&pv, &buf);
+    }
+    Ok(rgb)
+}
+
 /// Decode any supported format into an in-memory image, with EXIF orientation
 /// applied so nothing is ever sideways. HEIC/HEIF go through libheif (which
 /// already honors rotation); other formats are oriented via their EXIF tag.
