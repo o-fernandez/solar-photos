@@ -242,6 +242,21 @@ pub fn top_face_ids(conn: &Connection, cluster_id: i64, limit: i64) -> Result<Ve
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Discard all detected faces and re-arm the sweep. Used as a one-time migration
+/// when the embedding pipeline itself changes (e.g. the alignment fix): every
+/// stored embedding is now invalid, and landmarks aren't persisted, so faces must
+/// be re-detected from scratch. Clears names and the recluster flag too, since
+/// they're keyed to the old (bad) clusters.
+pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM faces;
+         DELETE FROM cluster_names;
+         UPDATE photos SET faces_scanned = 0;
+         DELETE FROM app_meta WHERE key = 'reclustered_v1';",
+    )?;
+    Ok(())
+}
+
 /// Read an app-level key/value flag (e.g. "have we run the one-time re-cluster").
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn

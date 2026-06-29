@@ -274,13 +274,18 @@ impl FaceModels {
                 let (x1, y1) = back(cx - bw / 2.0, cy - bh / 2.0);
                 let (x2, y2) = back(cx + bw / 2.0, cy + bh / 2.0);
 
-                // YuNet landmark order: right eye, left eye, nose, right mouth,
-                // left mouth. Reorder to TEMPLATE order [LE, RE, N, LM, RM].
-                let raw: [[f32; 2]; 5] = std::array::from_fn(|k| {
+                // YuNet emits its 5 keypoints already in the same slot order as the
+                // ArcFace `TEMPLATE` (eye, eye, nose, mouth, mouth — matched by image
+                // position), so they map straight through. An earlier version swapped
+                // the eye/mouth pairs, which forced a horizontal reflection the
+                // similarity transform can't express: every aligned crop came out
+                // mangled and SFace collapsed all faces toward one generic vector
+                // (measured: different people at ~0.55 cosine instead of ~0.15). Pass
+                // the landmarks through unswapped. Verified on real group photos.
+                let lm: [[f32; 2]; 5] = std::array::from_fn(|k| {
                     let (lx, ly) = back((c + kps[idx * 10 + k * 2]) * sf, (r + kps[idx * 10 + k * 2 + 1]) * sf);
                     [lx, ly]
                 });
-                let lm = [raw[1], raw[0], raw[2], raw[4], raw[3]];
 
                 cands.push(Candidate { x1, y1, x2, y2, score, lm });
             }

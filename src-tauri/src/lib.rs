@@ -436,6 +436,9 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
 
 /// Set once the one-time migration off the old greedy clustering has run.
 const RECLUSTER_FLAG: &str = "reclustered_v1";
+/// Set once faces have been re-detected with the fixed alignment (see the
+/// migration in `setup`). Bumping this string forces a one-time face re-sweep.
+const FACES_ALIGNED_FLAG: &str = "faces_aligned_v2";
 
 /// Progress of a background re-cluster. `running` flips false when it finishes, so
 /// the People view can reload exactly once (and never mid-rebuild → no reflow).
@@ -768,6 +771,18 @@ pub fn run() {
 
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
+
+            // One-time migration for the face-alignment fix: faces detected before it
+            // have collapsed embeddings (landmarks were swapped, mangling every
+            // aligned crop). Embeddings can't be repaired in place — landmarks aren't
+            // stored — so discard the old faces and let the sweep re-detect them
+            // correctly. Cached crops are stale too; clear them.
+            if db::get_meta(&conn, FACES_ALIGNED_FLAG).ok().flatten().is_none() {
+                db::reset_faces_for_recompute(&conn)?;
+                let _ = std::fs::remove_dir_all(&faces_dir);
+                std::fs::create_dir_all(&faces_dir)?;
+                db::set_meta(&conn, FACES_ALIGNED_FLAG, "1")?;
+            }
 
             // Has the one-time migration off the old greedy clustering run yet?
             // (Checked now, before `conn` moves into the shared state.)
