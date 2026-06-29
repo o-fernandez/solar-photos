@@ -210,6 +210,61 @@ pub fn merge_clusters(conn: &Connection, into: i64, from: i64) -> Result<()> {
     Ok(())
 }
 
+/// Every photo containing this person, newest first — the same ordering as the
+/// timeline, so the person page reads as a filtered timeline. One row per photo
+/// (a photo with two of their faces still appears once).
+pub fn person_photos(conn: &Connection, cluster_id: i64) -> Result<Vec<PhotoRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.thumb_status, COALESCE(p.taken_ts, p.mtime) AS ts
+         FROM photos p
+         JOIN faces f ON f.photo_id = p.id
+         WHERE f.cluster_id = ?1
+         GROUP BY p.id
+         ORDER BY ts DESC, p.id DESC",
+    )?;
+    let rows = stmt.query_map([cluster_id], |r| {
+        Ok(PhotoRow {
+            id: r.get(0)?,
+            status: r.get(1)?,
+            ts: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// "Not this person": detach this cluster's face(s) in one photo, which drops the
+/// photo from their set. Returns the affected face ids so the action can be undone.
+/// A NULL-cluster face is excluded from People and not re-clustered (the sweep only
+/// touches faces_scanned = 0), so the removal sticks short of a full rescan.
+pub fn remove_person_face(conn: &Connection, photo_id: i64, cluster_id: i64) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM faces WHERE photo_id = ?1 AND cluster_id = ?2")?;
+        let rows = stmt.query_map(rusqlite::params![photo_id, cluster_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    conn.execute(
+        "UPDATE faces SET cluster_id = NULL WHERE photo_id = ?1 AND cluster_id = ?2",
+        rusqlite::params![photo_id, cluster_id],
+    )?;
+    Ok(ids)
+}
+
+/// Undo a "not this person": re-attach the given faces to the cluster.
+pub fn restore_person_faces(conn: &Connection, face_ids: &[i64], cluster_id: i64) -> Result<()> {
+    if face_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?").take(face_ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE faces SET cluster_id = ? WHERE id IN ({placeholders})");
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(face_ids.len() + 1);
+    params.push(&cluster_id);
+    for id in face_ids {
+        params.push(id);
+    }
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
+}
+
 /// The photo id and (normalized 0-1) bounding box of a face, for cropping.
 pub fn face_box(conn: &Connection, face_id: i64) -> Result<Option<(i64, f32, f32, f32, f32)>> {
     let row = conn

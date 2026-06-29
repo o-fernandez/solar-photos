@@ -181,3 +181,19 @@ export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
 export function faceCropUrl(faceId: number): string {
   return `thumb://localhost/face/${faceId}`;
 }
+
+/** Every photo containing this person, newest first (a filtered timeline). */
+export function getPersonPhotos(clusterId: number): Promise<PhotoRow[]> {
+  return invoke("get_person_photos", { clusterId });
+}
+
+/** "Not this person": detach their face(s) in one photo. Returns the affected
+ *  face ids so the removal can be undone. */
+export function removePersonFace(photoId: number, clusterId: number): Promise<number[]> {
+  return invoke("remove_person_face", { photoId, clusterId });
+}
+
+/** Undo a "not this person": re-attach the given faces to the cluster. */
+export function restorePersonFaces(faceIds: number[], clusterId: number): Promise<void> {
+  return invoke("restore_person_faces", { faceIds, clusterId });
+}

@@ -6,6 +6,7 @@
 // the tab) and after every action, so it reflects the current clustering.
 
 import { useCallback, useEffect, useState } from "react";
+import PersonView from "./PersonView";
 import {
   faceCropUrl,
   getClusters,
@@ -22,6 +23,8 @@ export default function People() {
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
+  // The person whose page is open, in place of the people-grid (null = grid).
+  const [selected, setSelected] = useState<Cluster | null>(null);
 
   const reload = useCallback(() => {
     getClusters().then(setClusters).catch(() => {});
@@ -53,6 +56,20 @@ export default function People() {
   };
 
   const suggestion = suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
+
+  // A person's page replaces the grid; returning reloads so counts reflect any
+  // "not this person" corrections and renames made there.
+  if (selected) {
+    return (
+      <PersonView
+        cluster={selected}
+        onBack={() => {
+          setSelected(null);
+          reload();
+        }}
+      />
+    );
+  }
 
   if (clusters.length === 0) {
     return (
@@ -95,7 +112,9 @@ export default function People() {
               className="pavatar"
               src={faceCropUrl(c.cover_face_id)}
               alt={c.name ?? "Unnamed person"}
+              title={c.name ? `See ${c.name}` : "See this person"}
               draggable={false}
+              onClick={() => setSelected(c)}
             />
             {editing === c.cluster_id ? (
               <input

@@ -335,6 +335,40 @@ fn merge_clusters(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Re
     db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())
 }
 
+/// Every photo containing this person, newest first (same ordering as the
+/// timeline) — backs the person page.
+#[tauri::command]
+fn get_person_photos(
+    state: tauri::State<'_, AppState>,
+    cluster_id: i64,
+) -> Result<Vec<db::PhotoRow>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
+}
+
+/// "Not this person": detach this person's face(s) in one photo. Returns the
+/// affected face ids so the frontend can offer an Undo.
+#[tauri::command]
+fn remove_person_face(
+    state: tauri::State<'_, AppState>,
+    photo_id: i64,
+    cluster_id: i64,
+) -> Result<Vec<i64>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::remove_person_face(&conn, photo_id, cluster_id).map_err(|e| e.to_string())
+}
+
+/// Undo a "not this person": re-attach the given faces to the cluster.
+#[tauri::command]
+fn restore_person_faces(
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+    cluster_id: i64,
+) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::restore_person_faces(&conn, &face_ids, cluster_id).map_err(|e| e.to_string())
+}
+
 /// A "same person?" suggestion: two clusters whose centroids are similar but
 /// landed below the clustering threshold (likely an over-split).
 #[derive(Clone, serde::Serialize)]
@@ -715,7 +749,10 @@ pub fn run() {
             get_clusters,
             name_cluster,
             merge_clusters,
-            get_merge_suggestions
+            get_merge_suggestions,
+            get_person_photos,
+            remove_person_face,
+            restore_person_faces
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

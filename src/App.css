@@ -192,6 +192,111 @@ body,
   font-size: 12px;
   color: #999;
 }
+.pavatar {
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+.pavatar:hover {
+  box-shadow: 0 0 0 3px #cdddf5;
+}
+
+/* --- Person page: a filtered timeline for one person --- */
+.person-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.person-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #ececec;
+}
+.person-back {
+  flex: 0 0 auto;
+}
+.person-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #ececec;
+}
+.person-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.person-name {
+  border: none;
+  background: none;
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1a1a;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+.person-sub {
+  font-size: 13px;
+  color: #999;
+}
+
+/* Per-cell "not this person" affordance: hidden until the cell is hovered. */
+.person-cell {
+  position: relative;
+}
+.person-remove {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.person-cell:hover .person-remove {
+  opacity: 1;
+}
+.person-remove:hover {
+  background: rgba(200, 50, 50, 0.9);
+}
+
+/* Undo toast for a "not this person" removal. */
+.undo-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: #232323;
+  color: #f2f2f2;
+  border-radius: 10px;
+  padding: 10px 16px;
+  font-size: 14px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  z-index: 30;
+}
+.undo-btn {
+  border: none;
+  background: none;
+  color: #6fb0f5;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
 
 /* Secondary toolbar button (Rescan, folders menu). */
 .ghost-btn {
@@ -572,6 +677,18 @@ body,
   .pname-input {
     background: #2c2c2c;
     border-color: #444;
+    color: #ededed;
+  }
+  .pavatar:hover {
+    box-shadow: 0 0 0 3px #2f4a6e;
+  }
+  .person-header {
+    border-bottom-color: #333;
+  }
+  .person-avatar {
+    background: #2a2a2a;
+  }
+  .person-name {
     color: #ededed;
   }
 }
