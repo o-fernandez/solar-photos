@@ -61,11 +61,86 @@ pub fn init(conn: &Connection) -> Result<()> {
     // error if the column is already present.
     let _ = conn.execute("ALTER TABLE photos ADD COLUMN taken_ts INTEGER", []);
     let _ = conn.execute("ALTER TABLE photos ADD COLUMN seen INTEGER NOT NULL DEFAULT 0", []);
+    // Whether faces have been detected for this photo (0 = not yet).
+    let _ = conn.execute(
+        "ALTER TABLE photos ADD COLUMN faces_scanned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // The timeline orders on COALESCE(taken_ts, mtime); index it for fast paging.
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));",
+        "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));
+         CREATE TABLE IF NOT EXISTS faces (
+            id         INTEGER PRIMARY KEY,
+            photo_id   INTEGER NOT NULL,
+            x1         REAL NOT NULL,
+            y1         REAL NOT NULL,
+            x2         REAL NOT NULL,
+            y2         REAL NOT NULL,
+            score      REAL NOT NULL,
+            embedding  BLOB NOT NULL,
+            cluster_id INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
+         CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);",
     )?;
     Ok(())
+}
+
+/// One detected face ready to persist: bounding box, detector score, and the
+/// L2-normalized embedding.
+pub struct DetectedFace {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub score: f32,
+    pub embedding: Vec<f32>,
+}
+
+/// Photos that have a thumbnail (so the original is available locally) but whose
+/// faces haven't been detected yet. This naturally limits face work to files we
+/// already have — cloud-only photos are processed after they're downloaded.
+pub fn next_unscanned_for_faces(conn: &Connection, limit: i64) -> Result<Vec<Job>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM photos WHERE thumb_status = ?1 AND faces_scanned = 0 ORDER BY id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![STATUS_READY, limit], |r| {
+        Ok(Job { id: r.get(0)?, path: r.get(1)? })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Persist a photo's detected faces and mark it scanned (one transaction).
+pub fn save_faces(conn: &mut Connection, photo_id: i64, faces: &[DetectedFace]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut ins = tx.prepare(
+            "INSERT INTO faces (photo_id, x1, y1, x2, y2, score, embedding) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?;
+        for f in faces {
+            let bytes: Vec<u8> = f.embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
+            ins.execute(rusqlite::params![photo_id, f.x1, f.y1, f.x2, f.y2, f.score, bytes])?;
+        }
+        tx.execute("UPDATE photos SET faces_scanned = 1 WHERE id = ?1", [photo_id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// (photos scanned for faces, photos eligible) — drives the "Finding people…"
+/// progress readout. Eligible = has a thumbnail (is local).
+pub fn face_progress(conn: &Connection) -> Result<(i64, i64)> {
+    let eligible: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM photos WHERE thumb_status = ?1",
+        [STATUS_READY],
+        |r| r.get(0),
+    )?;
+    let scanned: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM photos WHERE thumb_status = ?1 AND faces_scanned = 1",
+        [STATUS_READY],
+        |r| r.get(0),
+    )?;
+    Ok((scanned, eligible))
 }
 
 /// Remember a folder the user added. Idempotent.

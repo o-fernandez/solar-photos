@@ -17,6 +17,7 @@
 //!     forever.
 
 mod db;
+mod faces;
 mod meta;
 mod scan;
 mod thumbs;
@@ -52,6 +53,8 @@ struct AppState {
     cloud_queue: Arc<ThumbQueue>,
     /// Guards against two full rescans running at once (e.g. launch + manual).
     rescanning: Arc<AtomicBool>,
+    /// When true, the face worker pauses (e.g. user toggled it off).
+    faces_paused: Arc<AtomicBool>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -288,6 +291,93 @@ fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
     }
 }
 
+/// Progress of the background face sweep (drives the "Finding people…" readout).
+#[derive(Clone, serde::Serialize)]
+struct FaceProgress {
+    scanned: i64,
+    eligible: i64,
+}
+
+#[tauri::command]
+fn get_face_progress(state: tauri::State<'_, AppState>) -> Result<FaceProgress, String> {
+    let conn = state.conn.lock().unwrap();
+    let (scanned, eligible) = db::face_progress(&conn).map_err(|e| e.to_string())?;
+    Ok(FaceProgress { scanned, eligible })
+}
+
+#[tauri::command]
+fn set_faces_paused(state: tauri::State<'_, AppState>, paused: bool) {
+    state.faces_paused.store(paused, Ordering::Relaxed);
+}
+
+/// Locate a bundled model: prefer the packaged resource dir, fall back to the
+/// source tree for `tauri dev`.
+fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
+    if let Ok(p) = app
+        .path()
+        .resolve(format!("models/{name}"), tauri::path::BaseDirectory::Resource)
+    {
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models").join(name)
+}
+
+/// The background face worker: lowest-priority, one photo at a time, pausable.
+/// It only touches photos that already have a thumbnail (i.e. are local), so it
+/// never triggers a cloud download, and it's resumable across launches via the
+/// `faces_scanned` flag. A short sleep between photos keeps foreground work and
+/// the thumbnail pipeline ahead of it.
+fn spawn_face_worker(
+    app: AppHandle,
+    db_path: PathBuf,
+    yunet: PathBuf,
+    sface: PathBuf,
+    paused: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut conn = match db::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("faces: cannot open db: {e}");
+                return;
+            }
+        };
+        let mut models = match faces::FaceModels::load(&yunet, &sface) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("faces: model load failed: {e}");
+                return;
+            }
+        };
+        loop {
+            if paused.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+            let jobs = db::next_unscanned_for_faces(&conn, 1).unwrap_or_default();
+            if jobs.is_empty() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+            for job in jobs {
+                // On any decode/inference error, fall through to an empty result —
+                // save_faces still marks the photo scanned so we never loop on it.
+                let found = thumbs::load_oriented(std::path::Path::new(&job.path))
+                    .ok()
+                    .map(|img| models.process(&img.to_rgb8()).unwrap_or_default())
+                    .unwrap_or_default();
+                let _ = db::save_faces(&mut conn, job.id, &found);
+                if let Ok((scanned, eligible)) = db::face_progress(&conn) {
+                    let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -416,6 +506,19 @@ pub fn run() {
             let pending = db::pending_jobs(&conn)?;
             local_queue.enqueue(pending);
 
+            // Background face sweep (lowest priority). Resolve the bundled models
+            // and start a single polite worker; paused-flag shared with commands.
+            let faces_paused = Arc::new(AtomicBool::new(false));
+            let yunet = resolve_model(app.handle(), "yunet.onnx");
+            let sface = resolve_model(app.handle(), "sface.onnx");
+            spawn_face_worker(
+                app.handle().clone(),
+                db_path.clone(),
+                yunet,
+                sface,
+                faces_paused.clone(),
+            );
+
             app.manage(AppState {
                 db_path,
                 cache_dir,
@@ -424,6 +527,7 @@ pub fn run() {
                 local_queue,
                 cloud_queue,
                 rescanning: Arc::new(AtomicBool::new(false)),
+                faces_paused,
             });
 
             // Auto-sync on launch: reconcile every remembered root with disk in
@@ -440,7 +544,9 @@ pub fn run() {
             rescan,
             list_roots,
             remove_folder,
-            set_visible_range
+            set_visible_range,
+            get_face_progress,
+            set_faces_paused
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Face models (fetched via scripts/fetch-models.sh; not committed)
+src-tauri/models/*.onnx

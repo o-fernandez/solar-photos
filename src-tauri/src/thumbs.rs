@@ -276,6 +276,12 @@ pub fn preview_path(preview_dir: &Path, id: i64) -> std::path::PathBuf {
     preview_dir.join((id / 1000).to_string()).join(format!("{id}.jpg"))
 }
 
+/// Public wrapper: load an original as an upright (EXIF-oriented) image. Used by
+/// the face pipeline, which needs the full-resolution oriented pixels.
+pub fn load_oriented(path: &Path) -> Result<DynamicImage> {
+    decode_oriented(path)
+}
+
 /// Decode any supported format into an in-memory image, with EXIF orientation
 /// applied so nothing is ever sideways. HEIC/HEIF go through libheif (which
 /// already honors rotation); other formats are oriented via their EXIF tag.

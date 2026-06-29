@@ -120,3 +120,23 @@ export interface PhotoDetail {
 export function getPhotoDetail(id: number): Promise<PhotoDetail | null> {
   return invoke("get_photo_detail", { id });
 }
+
+export interface FaceProgress {
+  scanned: number;
+  eligible: number;
+}
+
+/** How many local photos have been analyzed for faces so far. */
+export function getFaceProgress(): Promise<FaceProgress> {
+  return invoke("get_face_progress");
+}
+
+/** Subscribe to background face-sweep progress. */
+export function onFaceProgress(cb: (p: FaceProgress) => void): Promise<UnlistenFn> {
+  return listen<FaceProgress>("faces-progress", (e) => cb(e.payload));
+}
+
+/** Pause or resume the background face sweep. */
+export function setFacesPaused(paused: boolean): Promise<void> {
+  return invoke("set_faces_paused", { paused });
+}

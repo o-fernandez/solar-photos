@@ -2,8 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
 import {
   addFolder,
+  getFaceProgress,
   getLibraryStats,
   listRoots,
+  onFaceProgress,
   onScanProgress,
   onThumbReady,
   pickFolder,
@@ -22,6 +24,8 @@ function App() {
   // Bumped whenever the library changes on disk (add / rescan / remove) so the
   // grid drops its cached index→photo mapping and refetches the truth.
   const [refreshKey, setRefreshKey] = useState(0);
+  const [faceScanned, setFaceScanned] = useState(0);
+  const [faceEligible, setFaceEligible] = useState(0);
 
   const refreshRoots = useCallback(() => {
     listRoots().then(setRoots).catch(() => {});
@@ -41,7 +45,25 @@ function App() {
   useEffect(() => {
     refreshStats();
     refreshRoots();
+    getFaceProgress()
+      .then((p) => {
+        setFaceScanned(p.scanned);
+        setFaceEligible(p.eligible);
+      })
+      .catch(() => {});
   }, [refreshStats, refreshRoots]);
+
+  // Background face-sweep progress (non-intrusive; full People view comes later).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onFaceProgress((p) => {
+      setFaceScanned(p.scanned);
+      setFaceEligible(p.eligible);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
 
   // Keep the "ready" counter live as thumbnails stream in (successes only).
   useEffect(() => {
@@ -123,6 +145,12 @@ function App() {
             <span className="count muted">No folder indexed yet</span>
           )}
         </div>
+
+        {faceEligible > 0 && faceScanned < faceEligible && (
+          <span className="faces-pill">
+            Finding faces… {Math.round((faceScanned / faceEligible) * 100)}%
+          </span>
+        )}
 
         {roots.length > 0 && (
           <div className="roots">
