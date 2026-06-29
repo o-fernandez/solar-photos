@@ -364,6 +364,27 @@ pub fn photos_range(conn: &Connection, offset: i64, limit: i64, by_date: bool) -
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Photos missing a capture date (id, path) — used to backfill filename dates
+/// into a library that was indexed before that fallback existed.
+pub fn null_date_photos(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, path FROM photos WHERE taken_ts IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Set capture dates for many photos in one transaction.
+pub fn set_taken_ts_batch(conn: &mut Connection, pairs: &[(i64, i64)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut up = tx.prepare("UPDATE photos SET taken_ts = ?1 WHERE id = ?2 AND taken_ts IS NULL")?;
+        for (id, ts) in pairs {
+            up.execute(rusqlite::params![ts, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Record a photo's capture date once we've read it from a now-local file.
 /// Only fills it when still empty, so we never clobber a date set at scan time.
 pub fn set_taken_ts_if_empty(conn: &Connection, id: i64, ts: i64) -> Result<()> {

@@ -46,6 +46,8 @@ struct AppState {
     cache_dir: PathBuf,
     /// Directory holding cached large viewer previews.
     preview_dir: PathBuf,
+    /// Directory holding cached cover-face crops.
+    faces_dir: PathBuf,
     /// A single connection for the (UI-driven) command handlers.
     conn: Mutex<Connection>,
     /// Local-file thumbnail queue (drained eagerly).
@@ -509,19 +511,38 @@ pub fn run() {
 
             let state = app.state::<AppState>();
 
-            // Cover face for the People screen: crop it from the photo's thumbnail.
+            // Cover face for the People screen: a crisp crop from the original,
+            // generated on first request and cached forever.
             if is_face {
-                let bbox = {
+                let out = faces::face_crop_path(&state.faces_dir, id);
+                if let Ok(bytes) = std::fs::read(&out) {
+                    return ok(bytes);
+                }
+                let (photo_id, x1, y1, x2, y2) = {
                     let conn = state.conn.lock().unwrap();
-                    db::face_box(&conn, id).ok().flatten()
+                    match db::face_box(&conn, id).ok().flatten() {
+                        Some(b) => b,
+                        None => return not_found(),
+                    }
                 };
-                let (photo_id, x1, y1, x2, y2) = match bbox {
-                    Some(b) => b,
+                let original = {
+                    let conn = state.conn.lock().unwrap();
+                    db::path_for_id(&conn, photo_id).ok().flatten()
+                };
+                let img = match original
+                    .and_then(|p| thumbs::load_oriented(std::path::Path::new(&p)).ok())
+                {
+                    Some(i) => i.to_rgb8(),
                     None => return not_found(),
                 };
-                let thumb = thumbs::thumb_path(&state.cache_dir, photo_id);
-                return match faces::crop_face_jpeg(&thumb, (x1, y1, x2, y2)) {
-                    Ok(bytes) => ok(bytes),
+                return match faces::crop_face_jpeg(&img, (x1, y1, x2, y2)) {
+                    Ok(bytes) => {
+                        if let Some(parent) = out.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&out, &bytes);
+                        ok(bytes)
+                    }
                     Err(_) => not_found(),
                 };
             }
@@ -564,6 +585,8 @@ pub fn run() {
             std::fs::create_dir_all(&cache_dir)?;
             let preview_dir = data_dir.join("previews");
             std::fs::create_dir_all(&preview_dir)?;
+            let faces_dir = data_dir.join("faces");
+            std::fs::create_dir_all(&faces_dir)?;
 
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
@@ -631,10 +654,40 @@ pub fn run() {
                 faces_paused.clone(),
             );
 
+            // One-time backfill: give photos missing a capture date one parsed
+            // from their filename, so a cloud library (whose EXIF we can't read
+            // without downloading) still gets a sensible timeline. Then nudge the
+            // frontend to re-sort.
+            {
+                let app2 = app.handle().clone();
+                let db_path2 = db_path.clone();
+                std::thread::spawn(move || {
+                    if let Ok(mut c) = db::open(&db_path2) {
+                        let rows = db::null_date_photos(&c).unwrap_or_default();
+                        let pairs: Vec<(i64, i64)> = rows
+                            .into_iter()
+                            .filter_map(|(id, path)| {
+                                std::path::Path::new(&path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .and_then(meta::parse_filename_date)
+                                    .map(|ts| (id, ts))
+                            })
+                            .collect();
+                        if !pairs.is_empty() {
+                            let _ = db::set_taken_ts_batch(&mut c, &pairs);
+                            let total = db::stats(&c).map(|(t, _)| t).unwrap_or(0);
+                            let _ = app2.emit("scan-progress", ScanProgress { found: total, done: true });
+                        }
+                    }
+                });
+            }
+
             app.manage(AppState {
                 db_path,
                 cache_dir,
                 preview_dir,
+                faces_dir,
                 conn: Mutex::new(conn),
                 local_queue,
                 cloud_queue,

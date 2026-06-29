@@ -150,14 +150,20 @@ where
                 let key = cache_key(&item.path, item.mtime, item.size);
                 // Cloud-only files become placeholders; local files are queued.
                 let fresh_status = if item.cloud { STATUS_CLOUD } else { STATUS_PENDING };
-                // Read the capture date now only for local files — reading a
-                // cloud original's EXIF would force a download. Cloud dates are
-                // filled in later, when the file is downloaded for its thumbnail.
+                // Capture date: EXIF for local files (reading a cloud original's
+                // EXIF would force a download), else the date parsed from the
+                // filename — free, and the main signal for cloud photos.
                 let taken: Option<i64> = if item.cloud {
                     None
                 } else {
                     meta::read_taken_ts(Path::new(&item.path))
-                };
+                }
+                .or_else(|| {
+                    Path::new(&item.path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(meta::parse_filename_date)
+                });
 
                 let existing = select
                     .query_row([&item.path], |r| {

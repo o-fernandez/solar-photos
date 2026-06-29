@@ -166,10 +166,18 @@ fn align(img: &RgbImage, lm: &[[f32; 2]; 5]) -> RgbImage {
     out
 }
 
-/// Crop a square, margined face from a cached thumbnail and return JPEG bytes.
-/// `bbox` is normalized (0-1). Used to serve cover faces for the People screen.
-pub fn crop_face_jpeg(thumb_path: &Path, bbox: (f32, f32, f32, f32)) -> Result<Vec<u8>> {
-    let img = image::open(thumb_path)?.to_rgb8();
+/// Edge length of a cached face-crop, in pixels (crisp on retina tiles).
+const FACE_CROP: u32 = 256;
+
+/// Where a face's cached cover crop lives, bucketed by id like thumbnails.
+pub fn face_crop_path(faces_dir: &Path, face_id: i64) -> std::path::PathBuf {
+    faces_dir.join((face_id / 1000).to_string()).join(format!("{face_id}.jpg"))
+}
+
+/// Crop a square, margined face from a full-resolution image and return JPEG
+/// bytes at FACE_CROP px. `bbox` is normalized (0-1). Cropping from the original
+/// (not the 256px thumbnail) keeps cover faces sharp even when small in frame.
+pub fn crop_face_jpeg(img: &RgbImage, bbox: (f32, f32, f32, f32)) -> Result<Vec<u8>> {
     let (w, h) = img.dimensions();
     let (nx1, ny1, nx2, ny2) = bbox;
     let cx = (nx1 + nx2) / 2.0 * w as f32;
@@ -182,7 +190,8 @@ pub fn crop_face_jpeg(thumb_path: &Path, bbox: (f32, f32, f32, f32)) -> Result<V
     let y1 = (cy + half).min(h as f32) as u32;
     let cw = x1.saturating_sub(x0).max(1);
     let ch = y1.saturating_sub(y0).max(1);
-    let crop = image::imageops::crop_imm(&img, x0, y0, cw, ch).to_image();
+    let crop = image::imageops::crop_imm(img, x0, y0, cw, ch).to_image();
+    let crop = image::imageops::resize(&crop, FACE_CROP, FACE_CROP, FilterType::Triangle);
     let mut buf = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::Cursor::new(&mut buf), 85);
     enc.encode(crop.as_raw(), crop.width(), crop.height(), image::ExtendedColorType::Rgb8)?;
