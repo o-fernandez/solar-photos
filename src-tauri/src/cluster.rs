@@ -52,6 +52,15 @@ const TAU_DUP: f32 = 0.8;
 /// Incremental: how many neighbors must agree on a cluster to join it (below this
 /// only a near-duplicate, single strong neighbor, can pull a face in).
 const MIN_VOTE: usize = 2;
+/// Merge suggestions: the lowest similarity a cross-cluster face pair may have and
+/// still count as evidence the two clusters are one person. Deliberately below
+/// [`TAU_LINK`] — a suggestion is a *prompt*, confirmed by the user, so it can reach
+/// a little further than automatic clustering dares.
+const TAU_SUGGEST: f32 = 0.45;
+/// Merge suggestions: how many qualifying cross-cluster face pairs two clusters
+/// need before we'll suggest merging them. Several pairs (not one centroid angle)
+/// is what makes a suggestion trustworthy — the fix for "you vs. grandma".
+const MIN_PAIRS: usize = 3;
 
 fn normalized(v: &[f32]) -> Vec<f32> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
@@ -94,7 +103,7 @@ impl UnionFind {
 /// Build the per-face top-`K` neighbor lists (index + similarity) over the whole
 /// set, using blocked matrix multiplication to bound transient memory. `progress`
 /// is called with a fraction in `[0, 1)` as blocks complete.
-fn knn_graph<F: FnMut(f32)>(mat: &Array2<f32>, mut progress: F) -> Vec<Vec<(usize, f32)>> {
+fn knn_graph<F: FnMut(f32)>(mat: &Array2<f32>, min_sim: f32, mut progress: F) -> Vec<Vec<(usize, f32)>> {
     let n = mat.nrows();
     let mut neighbors: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
     // ~B*N floats transient per block; B=256 keeps that near 100 MB at 100k faces.
@@ -108,7 +117,7 @@ fn knn_graph<F: FnMut(f32)>(mat: &Array2<f32>, mut progress: F) -> Vec<Vec<(usiz
             let i = start + bi;
             let top = &mut neighbors[i];
             for (j, &s) in row.iter().enumerate() {
-                if j != i && s >= TAU_LINK {
+                if j != i && s >= min_sim {
                     push_topk(top, j, s);
                 }
             }
@@ -117,6 +126,17 @@ fn knn_graph<F: FnMut(f32)>(mat: &Array2<f32>, mut progress: F) -> Vec<Vec<(usiz
         progress(start as f32 / n as f32);
     }
     neighbors
+}
+
+/// Build the (re-normalized) N×dim embedding matrix from `(.., embedding)` rows.
+fn embedding_matrix<T>(faces: &[(T, Vec<f32>)]) -> Array2<f32> {
+    let n = faces.len();
+    let dim = faces[0].1.len();
+    let mut data = Vec::with_capacity(n * dim);
+    for (_, e) in faces {
+        data.extend(normalized(e));
+    }
+    Array2::from_shape_vec((n, dim), data).expect("uniform embedding length")
 }
 
 /// Re-cluster every face from scratch — order-independent, purity-biased.
@@ -129,15 +149,11 @@ pub fn recluster<F: FnMut(f32)>(faces: &[(i64, Vec<f32>)], mut progress: F) -> V
     if n == 0 {
         return Vec::new();
     }
-    let dim = faces[0].1.len();
-    // Defensive re-normalization so cosine == dot even if a stored vector drifted.
-    let mut data = Vec::with_capacity(n * dim);
-    for (_, e) in faces {
-        data.extend(normalized(e));
-    }
-    let mat = Array2::from_shape_vec((n, dim), data).expect("uniform embedding length");
+    // Defensive re-normalization (inside `embedding_matrix`) so cosine == dot even
+    // if a stored vector drifted.
+    let mat = embedding_matrix(faces);
 
-    let neighbors = knn_graph(&mat, |f| progress(f * 0.5));
+    let neighbors = knn_graph(&mat, TAU_LINK, |f| progress(f * 0.5));
 
     // Candidate edges: every kNN pair (either direction), deduped to i<j, carrying
     // its similarity. These are only *candidates* — the complete-linkage test below
@@ -218,13 +234,8 @@ pub fn mutual_edge_sims(faces: &[(i64, Vec<f32>)]) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let dim = faces[0].1.len();
-    let mut data = Vec::with_capacity(n * dim);
-    for (_, e) in faces {
-        data.extend(normalized(e));
-    }
-    let mat = Array2::from_shape_vec((n, dim), data).expect("uniform embedding length");
-    let neighbors = knn_graph(&mat, |_| {});
+    let mat = embedding_matrix(faces);
+    let neighbors = knn_graph(&mat, TAU_LINK, |_| {});
     let nbr_sets: Vec<std::collections::HashSet<usize>> = neighbors
         .iter()
         .map(|v| v.iter().map(|&(j, _)| j).collect())
@@ -238,6 +249,58 @@ pub fn mutual_edge_sims(faces: &[(i64, Vec<f32>)]) -> Vec<f32> {
         }
     }
     sims
+}
+
+/// Evidence that two clusters are the same person: the count of qualifying
+/// cross-cluster face pairs and the strongest such pair's similarity.
+pub struct PairEvidence {
+    pub a: i64,
+    pub b: i64,
+    pub pairs: usize,
+    pub max_sim: f32,
+}
+
+/// Face-to-face merge evidence between clusters — the trustworthy replacement for
+/// centroid-to-centroid suggestions (which surfaced "you vs. grandma"). Input is
+/// `(face_id, cluster_id, embedding)`. For every pair of distinct-cluster faces
+/// that are near neighbors (cosine ≥ [`TAU_SUGGEST`]) we tally the cluster pair;
+/// only cluster pairs backed by at least [`MIN_PAIRS`] such face pairs are
+/// returned. Several independent face matches — not one lucky angle — is what
+/// makes a suggestion one you say yes to.
+pub fn merge_evidence(faces: &[(i64, i64, Vec<f32>)]) -> Vec<PairEvidence> {
+    let n = faces.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Reuse the matrix/kNN machinery, dropping the cluster id for the embedding.
+    let rows: Vec<(i64, Vec<f32>)> = faces.iter().map(|(f, _, e)| (*f, e.clone())).collect();
+    let mat = embedding_matrix(&rows);
+    let neighbors = knn_graph(&mat, TAU_SUGGEST, |_| {});
+    let cluster_of: Vec<i64> = faces.iter().map(|(_, c, _)| *c).collect();
+
+    use std::collections::HashMap;
+    // (min_cluster, max_cluster) -> (pair count, max similarity).
+    let mut tally: HashMap<(i64, i64), (usize, f32)> = HashMap::new();
+    for i in 0..n {
+        for &(j, sim) in &neighbors[i] {
+            if i >= j {
+                continue; // each unordered face pair once
+            }
+            let (ca, cb) = (cluster_of[i], cluster_of[j]);
+            if ca == cb {
+                continue; // same cluster — nothing to suggest
+            }
+            let key = if ca < cb { (ca, cb) } else { (cb, ca) };
+            let e = tally.entry(key).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 = e.1.max(sim);
+        }
+    }
+    tally
+        .into_iter()
+        .filter(|&(_, (pairs, _))| pairs >= MIN_PAIRS)
+        .map(|((a, b), (pairs, max_sim))| PairEvidence { a, b, pairs, max_sim })
+        .collect()
 }
 
 /// In-memory state for incremental assignment of newly-detected faces. Holds every
@@ -395,6 +458,29 @@ mod tests {
         outlier[8] = 1.0;
         let cid = idx.assign(&normalized(&outlier));
         assert_ne!(cid, 1, "an outlier must start a new cluster, not pollute cluster 1");
+    }
+
+    #[test]
+    fn merge_evidence_finds_split_person_not_strangers() {
+        // Clusters 1 and 2 are the same person split in two (both near axis 0, so
+        // many cross-pairs above TAU_SUGGEST). Cluster 3 is a stranger on axis 8.
+        let dim = 16;
+        let mut faces: Vec<(i64, i64, Vec<f32>)> = Vec::new();
+        for (k, e) in blob(dim, 0, 5).into_iter().enumerate() {
+            faces.push((k as i64, 1, e));
+        }
+        for (k, e) in blob(dim, 0, 5).into_iter().enumerate() {
+            faces.push((100 + k as i64, 2, e));
+        }
+        for (k, e) in blob(dim, 8, 5).into_iter().enumerate() {
+            faces.push((200 + k as i64, 3, e));
+        }
+        let ev = merge_evidence(&faces);
+        let has = |x: i64, y: i64| {
+            ev.iter().any(|e| (e.a, e.b) == (x.min(y), x.max(y)) && e.pairs >= MIN_PAIRS)
+        };
+        assert!(has(1, 2), "the split person (1,2) should be suggested");
+        assert!(!has(1, 3) && !has(2, 3), "strangers must not be suggested");
     }
 
     #[test]

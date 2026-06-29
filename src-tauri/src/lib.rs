@@ -371,70 +371,66 @@ fn restore_person_faces(
     db::restore_person_faces(&conn, &face_ids, cluster_id).map_err(|e| e.to_string())
 }
 
-/// A "same person?" suggestion: two clusters whose centroids are similar but
-/// landed below the clustering threshold (likely an over-split).
+/// A "same person?" suggestion: two clusters with several near-neighbor face pairs
+/// across them (face-to-face evidence, not centroid angles). The card shows a strip
+/// of example faces from each side so one glance decides.
 #[derive(Clone, serde::Serialize)]
 struct MergeSuggestion {
     into: i64,
     from: i64,
-    into_cover: i64,
-    from_cover: i64,
+    /// Example face ids from each side (highest detector confidence), for the card.
+    into_faces: Vec<i64>,
+    from_faces: Vec<i64>,
     into_name: Option<String>,
     similarity: f32,
 }
 
-/// Find likely over-splits: cluster centroid pairs with cosine in
-/// [SUGGEST_LOW, ASSIGN_THR). Bigger, more-similar pairs first. The "into" side
-/// is the larger cluster, so merging folds the small group into the person.
+/// Find likely over-splits from **face-to-face** evidence: cluster pairs with at
+/// least a few cross-cluster face pairs above the suggestion threshold (see
+/// `cluster::merge_evidence`). Ranked by leverage — strength × combined size —
+/// so the most worthwhile, most confident merges come first. The larger cluster
+/// is the "into" side, so merging folds the small group into the person.
 #[tauri::command]
 fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
-    const SUGGEST_LOW: f32 = 0.45;
-    const ASSIGN_THR: f32 = 0.65;
     let conn = state.conn.lock().unwrap();
     let overview = db::clusters_overview(&conn).map_err(|e| e.to_string())?;
-    let embs = db::clustered_embeddings(&conn).map_err(|e| e.to_string())?;
+    let faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
     drop(conn);
 
-    // Centroids + counts + cover per cluster.
     use std::collections::HashMap;
-    let mut sums: HashMap<i64, Vec<f32>> = HashMap::new();
-    for (cid, e) in &embs {
-        let s = sums.entry(*cid).or_insert_with(|| vec![0.0; e.len()]);
-        for (a, b) in s.iter_mut().zip(e) {
-            *a += b;
-        }
-    }
-    let norm = |v: &[f32]| {
-        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-        v.iter().map(|x| x / n).collect::<Vec<f32>>()
-    };
-    let centroids: HashMap<i64, Vec<f32>> = sums.iter().map(|(k, v)| (*k, norm(v))).collect();
+    let info: HashMap<i64, &db::ClusterRow> = overview.iter().map(|c| (c.cluster_id, c)).collect();
 
-    let mut out = Vec::new();
-    for i in 0..overview.len() {
-        for j in (i + 1)..overview.len() {
-            let (a, b) = (&overview[i], &overview[j]);
-            let (ca, cb) = match (centroids.get(&a.cluster_id), centroids.get(&b.cluster_id)) {
-                (Some(x), Some(y)) => (x, y),
-                _ => continue,
-            };
-            let sim: f32 = ca.iter().zip(cb).map(|(x, y)| x * y).sum();
-            if sim >= SUGGEST_LOW && sim < ASSIGN_THR {
-                // Larger cluster is the merge target.
-                let (big, small) = if a.count >= b.count { (a, b) } else { (b, a) };
-                out.push(MergeSuggestion {
-                    into: big.cluster_id,
-                    from: small.cluster_id,
-                    into_cover: big.cover_face_id,
-                    from_cover: small.cover_face_id,
-                    into_name: big.name.clone(),
-                    similarity: sim,
-                });
-            }
-        }
+    let evidence = cluster::merge_evidence(&faces);
+    // Rank by leverage: evidence strength × impact. Strength is the best cross-pair
+    // similarity weighted by how many pairs corroborate it; impact is the combined
+    // size (sqrt-damped so a few huge clusters don't crowd out confident small ones).
+    let mut ranked: Vec<(cluster::PairEvidence, f32)> = evidence
+        .into_iter()
+        .filter_map(|e| {
+            let (ca, cb) = (info.get(&e.a)?, info.get(&e.b)?);
+            let leverage = e.max_sim * e.pairs as f32 * ((ca.count + cb.count) as f32).sqrt();
+            Some((e, leverage))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    ranked.truncate(20);
+
+    let conn = state.conn.lock().unwrap();
+    let mut out = Vec::with_capacity(ranked.len());
+    for (e, _) in ranked {
+        let (big, small) = {
+            let (ca, cb) = (info[&e.a], info[&e.b]);
+            if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
+        };
+        out.push(MergeSuggestion {
+            into: big.cluster_id,
+            from: small.cluster_id,
+            into_faces: db::top_face_ids(&conn, big.cluster_id, 4).unwrap_or_default(),
+            from_faces: db::top_face_ids(&conn, small.cluster_id, 4).unwrap_or_default(),
+            into_name: big.name.clone(),
+            similarity: e.max_sim,
+        });
     }
-    out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-    out.truncate(20);
     Ok(out)
 }
 

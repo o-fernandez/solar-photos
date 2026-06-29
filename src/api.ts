@@ -166,8 +166,9 @@ export function mergeClusters(into: number, from: number): Promise<void> {
 export interface MergeSuggestion {
   into: number;
   from: number;
-  into_cover: number;
-  from_cover: number;
+  /** Example face ids per side (highest confidence) — the merge card's strips. */
+  into_faces: number[];
+  from_faces: number[];
   into_name: string | null;
   similarity: number;
 }

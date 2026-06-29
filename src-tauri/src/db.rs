@@ -176,6 +176,20 @@ pub fn all_face_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// (face_id, cluster_id, embedding) for every clustered face — the input to
+/// face-to-face merge-suggestion evidence.
+pub fn face_cluster_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f32>)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, cluster_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        let id: i64 = r.get(0)?;
+        let cid: i64 = r.get(1)?;
+        let blob: Vec<u8> = r.get(2)?;
+        Ok((id, cid, decode_embedding(&blob)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// (face_id, cluster_id) for every clustered face — used to learn where each old
 /// cluster's faces landed after a re-cluster, so names can follow them.
 pub fn face_clusters(conn: &Connection) -> Result<Vec<(i64, i64)>> {

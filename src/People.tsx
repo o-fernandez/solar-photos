@@ -107,9 +107,17 @@ export default function People() {
       {suggestion && (
         <div className="merge-card">
           <div className="merge-faces">
-            <img className="mface" src={faceCropUrl(suggestion.into_cover)} alt="" draggable={false} />
+            <div className="mside">
+              {suggestion.into_faces.map((id) => (
+                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+              ))}
+            </div>
             <span className="mplus">+</span>
-            <img className="mface" src={faceCropUrl(suggestion.from_cover)} alt="" draggable={false} />
+            <div className="mside">
+              {suggestion.from_faces.map((id) => (
+                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+              ))}
+            </div>
           </div>
           <div className="merge-text">
             These look like the same person — merge

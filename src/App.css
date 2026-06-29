@@ -136,13 +136,23 @@ body,
 .merge-faces {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
+}
+.mside {
+  display: flex;
+  align-items: center;
+}
+/* Overlap the strip of example faces so several fit without crowding the card. */
+.mside .mface:not(:first-child) {
+  margin-left: -10px;
 }
 .mface {
   width: 44px;
   height: 44px;
   border-radius: 50%;
   object-fit: cover;
+  border: 2px solid #eaf1fb;
+  background: #ececec;
 }
 .mplus {
   color: #185fa5;
