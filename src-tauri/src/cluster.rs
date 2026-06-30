@@ -32,11 +32,16 @@
 //!    state, collapsed later by a single trustworthy merge click.
 //!
 //! ## Incremental [`ClusterIndex::assign`] (new faces after the batch)
-//! No running mean. A new face votes among its nearest already-clustered faces:
-//! it joins the majority cluster among neighbors above [`TAU_LINK`] (needing real
-//! agreement, not a single weak link), else starts a singleton. One outlier face
-//! can never pollute a cluster because there is no mean to drag. The full batch
-//! [`recluster`] is re-run periodically to consolidate.
+//! No running mean. A new face votes among its nearest already-clustered faces: it
+//! joins the majority cluster among neighbors above [`TAU_LINK`] (needing real
+//! agreement, not a single weak link) — but only if it also clears [`TAU_LINK`]
+//! against *every* member of that cluster, the same complete-linkage purity test the
+//! batch path uses. That keeps each cluster a clique even mid-scan, so a
+//! mid-similarity "bridge" face cannot vote its way into a pile and chain two people
+//! together before the next consolidation. A lone near-duplicate neighbor
+//! ([`TAU_DUP`]) is still decisive on its own. One outlier face can never pollute a
+//! cluster because there is no mean to drag. The full batch [`recluster`] is re-run
+//! periodically to consolidate.
 
 use ndarray::Array2;
 
@@ -390,17 +395,28 @@ impl ClusterIndex {
     /// (an existing one, or a fresh singleton). The face is remembered so later
     /// faces in the same batch can match against it.
     pub fn assign(&mut self, emb: &[f32]) -> i64 {
+        use std::collections::HashMap;
         let q = normalized(emb);
-        // Top-K nearest already-clustered faces above the link threshold.
+        // One pass over every clustered face: collect the Top-K nearest above the
+        // link threshold (the vote candidates) and, separately, each cluster's
+        // *minimum* similarity across *all* its members — including those below
+        // TAU_LINK, which never enter `top`. That minimum is the complete-linkage
+        // guard: a cluster is a valid join target only if the new face clears
+        // TAU_LINK against every one of its members, which keeps the cluster a clique
+        // and stops a mid-similarity bridge face from accreting two people into one
+        // pile during the live scan.
         let mut top: Vec<(usize, f32)> = Vec::new();
-        for (idx, (_, e)) in self.faces.iter().enumerate() {
+        let mut cluster_min: HashMap<i64, f32> = HashMap::new();
+        for (idx, (cid, e)) in self.faces.iter().enumerate() {
             let s = cosine(&q, e);
+            let m = cluster_min.entry(*cid).or_insert(f32::INFINITY);
+            *m = m.min(s);
             if s >= TAU_LINK {
                 push_topk(&mut top, idx, s);
             }
         }
 
-        let chosen = self.vote(&top);
+        let chosen = self.vote(&top, &cluster_min);
         let cid = chosen.unwrap_or_else(|| {
             let c = self.next_id;
             self.next_id += 1;
@@ -411,9 +427,14 @@ impl ClusterIndex {
     }
 
     /// Pick a cluster from the neighbor list: the plurality cluster, but only if it
-    /// has real support (`MIN_VOTE` neighbors) — unless the single nearest neighbor
-    /// is a near-duplicate, which is evidence enough on its own. `None` ⇒ singleton.
-    fn vote(&self, top: &[(usize, f32)]) -> Option<i64> {
+    /// has real support (`MIN_VOTE` neighbors) *and* the new face clears [`TAU_LINK`]
+    /// against every member of it (`cluster_min` — complete linkage, so the join
+    /// keeps the cluster a clique). A single near-duplicate neighbor is still enough
+    /// on its own: a ≥[`TAU_DUP`] match is unambiguous and is never the bridge that
+    /// chains two people, so it bypasses the all-members test (and so a confirmed
+    /// identity, whose members can be spread, keeps accreting its duplicates).
+    /// `None` ⇒ singleton.
+    fn vote(&self, top: &[(usize, f32)], cluster_min: &std::collections::HashMap<i64, f32>) -> Option<i64> {
         if top.is_empty() {
             return None;
         }
@@ -427,7 +448,7 @@ impl ClusterIndex {
         }
         counts
             .into_iter()
-            .filter(|&(_, c)| c >= MIN_VOTE)
+            .filter(|&(cid, c)| c >= MIN_VOTE && cluster_min.get(&cid).map_or(false, |&m| m >= TAU_LINK))
             .max_by_key(|&(_, c)| c)
             .map(|(cid, _)| cid)
     }
@@ -556,6 +577,35 @@ mod tests {
         // A new face squarely inside the blob should join cluster 7.
         let cid = idx.assign(&vec_near(16, 0, 3, 0.04));
         assert_eq!(cid, 7);
+    }
+
+    #[test]
+    fn incremental_complete_linkage_blocks_bridge() {
+        // A cluster that has spread — two near members on axis 0 plus a far member
+        // only ~0.45 to them — the shape single-linkage accretion produces. A new
+        // face links to the two near members by the 2-vote rule (mid-similarity, not
+        // a near-duplicate) but sits below TAU_LINK from the far member, so the
+        // cluster is not a clique against it. The complete-linkage guard must refuse
+        // the join — it starts its own cluster rather than grow a non-pure pile.
+        let dim = 16;
+        let mut m1 = vec![0.0f32; dim];
+        m1[0] = 1.0;
+        let mut m2 = vec![0.0f32; dim];
+        m2[0] = 1.0;
+        m2[1] = 0.05;
+        // Far member: 0.45 cosine to the axis-0 pair (rest of its mass on axis 5).
+        let mut m3 = vec![0.0f32; dim];
+        m3[0] = 0.45;
+        m3[5] = (1.0f32 - 0.45 * 0.45).sqrt();
+        let seed = vec![(1i64, normalized(&m1)), (1, normalized(&m2)), (1, normalized(&m3))];
+        let mut idx = ClusterIndex::load(seed);
+        // Candidate: ~0.6 to m1/m2 (two votes, but below TAU_DUP so it must pass the
+        // guard) and only ~0.27 to m3.
+        let mut cand = vec![0.0f32; dim];
+        cand[0] = 0.6;
+        cand[7] = 0.8;
+        let cid = idx.assign(&normalized(&cand));
+        assert_ne!(cid, 1, "a bridge face must not join a cluster it fails complete-linkage against");
     }
 
     #[test]
