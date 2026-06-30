@@ -663,6 +663,19 @@ pub fn pending_jobs(conn: &Connection) -> Result<Vec<Job>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// A page of STATUS_CLOUD photos with id > `after_id`, ordered by id. Used by
+/// the proactive cloud backfill to walk the library in order without re-queuing
+/// items already processed in this pass.
+pub fn cloud_jobs_after(conn: &Connection, after_id: i64, limit: i64) -> Result<Vec<Job>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM photos WHERE thumb_status = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![STATUS_CLOUD, after_id, limit], |r| {
+        Ok(Job { id: r.get(0)?, path: r.get(1)? })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// (total photos, thumbnails ready) — drives the header progress readout and
 /// lets a cold start render the grid immediately from cached state.
 pub fn stats(conn: &Connection) -> Result<(i64, i64)> {

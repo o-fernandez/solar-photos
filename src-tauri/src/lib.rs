@@ -102,6 +102,46 @@ fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
     }
 }
 
+/// Quietly download every cloud-only photo in the background, working through the
+/// library in id order so the user doesn't have to scroll everywhere to trigger
+/// on-demand fetches. Uses the same cloud queue as the on-demand path — the
+/// `set_visible_range` handler promotes currently-visible photos to the priority
+/// lane so they always load before the backfill, regardless of queue depth.
+///
+/// Backfill photos stay STATUS_CLOUD in the DB until the worker finishes and
+/// sets STATUS_READY (no DOWNLOADING spinner — less noise for off-screen work).
+/// When the pass reaches the end it idles for 60 s then restarts from id 0,
+/// picking up any new cloud photos added by a background rescan.
+fn spawn_cloud_backfill(db_path: PathBuf, cloud_queue: Arc<ThumbQueue>) {
+    const BATCH: i64 = 50;
+    const BATCH_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+    const IDLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    std::thread::spawn(move || {
+        background_qos();
+        let mut after_id: i64 = 0;
+        loop {
+            let batch = match db::open(&db_path).and_then(|c| db::cloud_jobs_after(&c, after_id, BATCH)) {
+                Ok(b) => b,
+                Err(_) => {
+                    std::thread::sleep(IDLE_PAUSE);
+                    continue;
+                }
+            };
+            if batch.is_empty() {
+                // Reached the end of the library; reset and wait before checking again
+                // (a rescan may have added new cloud photos in the meantime).
+                after_id = 0;
+                std::thread::sleep(IDLE_PAUSE);
+            } else {
+                after_id = batch.last().map(|j| j.id).unwrap_or(after_id);
+                cloud_queue.enqueue(batch);
+                std::thread::sleep(BATCH_PAUSE);
+            }
+        }
+    });
+}
+
 /// Walk every root, mark what still exists, then prune what doesn't (deleted
 /// files, or files under a removed root) — including their cached thumbnails.
 /// This is the "second launch shows the truth" reconciliation (Principle 4). It
@@ -285,15 +325,15 @@ fn get_photo_detail(
 
 /// Tell the backend which photos are currently on screen. Two effects:
 ///   * local pending thumbnails for those photos jump the queue (Principle 3);
-///   * cloud-only photos among them are fetched on demand — we move them to
-///     DOWNLOADING and feed the cloud queue with exactly the visible set, so we
-///     download what the user is looking at and abandon what they scrolled past.
+///   * cloud-only photos among them are marked DOWNLOADING and promoted to the
+///     priority lane of the cloud queue, so visible cloud photos always load ahead
+///     of the background backfill working through the rest of the library.
 #[tauri::command]
 fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, ids: Vec<i64>) {
     // Prioritize visible local thumbnails (ignores ids not in the local queue).
     state.local_queue.set_priority(ids.clone());
 
-    // Figure out which visible photos are cloud-only and (re)feed the cloud lane.
+    // Figure out which visible photos are cloud-only.
     let conn = state.conn.lock().unwrap();
     let rows = match db::lookup(&conn, &ids) {
         Ok(r) => r,
@@ -303,8 +343,6 @@ fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
     let mut newly_downloading: Vec<i64> = Vec::new();
     for (id, status, path) in rows {
         if status == db::STATUS_CLOUD || status == db::STATUS_DOWNLOADING {
-            // Keep both freshly-cloud and already-downloading-but-still-visible
-            // photos queued; the queue dedupes anything already in flight.
             cloud_jobs.push(Job { id, path });
             if status == db::STATUS_CLOUD {
                 newly_downloading.push(id);
@@ -316,7 +354,12 @@ fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
     }
     drop(conn);
 
-    state.cloud_queue.replace_pending(cloud_jobs);
+    // Enqueue any not yet in the queue, then bump all visible cloud photos to
+    // the priority lane so they load before the background backfill.
+    // (Unlike replace_pending, this leaves backfill items in the normal lane.)
+    let cloud_ids: Vec<i64> = cloud_jobs.iter().map(|j| j.id).collect();
+    state.cloud_queue.enqueue(cloud_jobs);
+    state.cloud_queue.set_priority(cloud_ids);
     if !newly_downloading.is_empty() {
         let _ = app.emit("thumb-downloading", newly_downloading);
     }
@@ -1244,6 +1287,14 @@ pub fn run() {
             if needs_recluster {
                 run_recluster(app.handle().clone());
             }
+
+            // Proactively download every cloud-only photo in the background so the
+            // user doesn't have to scroll the whole library to trigger on-demand fetches.
+            // Visible photos are always prioritized over backfill (see set_visible_range).
+            spawn_cloud_backfill(
+                app.state::<AppState>().db_path.clone(),
+                app.state::<AppState>().cloud_queue.clone(),
+            );
 
             // Auto-sync on launch: reconcile every remembered root with disk in
             // the background, so a repeat launch shows the truth (Principle 4)
