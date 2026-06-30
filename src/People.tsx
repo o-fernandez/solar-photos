@@ -314,9 +314,11 @@ export default function People({
 
   return (
     <div className="people-scroll">
-      {reorganizing ? (
-        <div className="reorg-banner">Reorganizing people…</div>
-      ) : sweeping ? (
+      {sweeping ? (
+        // While the sweep is running the backend fires periodic re-clusters as the
+        // in-flight queue drains. Those flip `reorganizing` on and off, but they're an
+        // internal detail — keep one stable "Still finding people" banner across the
+        // whole sweep instead of ping-ponging to "Reorganizing…" on each one.
         <div className="reorg-banner people-banner">
           <span className="pb-title">Still finding people</span>
           <span className="pb-sub">
@@ -325,6 +327,8 @@ export default function People({
             groups the rest together for you.
           </span>
         </div>
+      ) : reorganizing ? (
+        <div className="reorg-banner">Reorganizing people…</div>
       ) : grow || suggestion ? (
         <div className="reorg-banner people-banner">
           <span className="pb-title">All faces scanned</span>
