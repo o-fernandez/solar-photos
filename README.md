@@ -5,10 +5,11 @@ No cloud, no account, no subscription — just your photos, on your machine, the
 way Picasa used to feel.
 
 <!--
-  ▲ ABOVE THE FOLD: replace this comment with a GIF of the thumbnail grid
-  scrolling smoothly through a large library. For a performance-and-feel
-  product, the GIF *is* the pitch — it shows what words can't. Drop it at
-  docs/media/grid-scroll.gif and uncomment:
+  ▲ ABOVE THE FOLD: replace this comment with a GIF that *is* the pitch — for a
+  performance-and-feel product it shows what words can't. Two strong candidates:
+  (1) the thumbnail grid scrolling smoothly through a large library, and
+  (2) the People tab filling in — faces grouping, a name applied, a "merge all"
+  reuniting someone. Drop it at docs/media/grid-scroll.gif and uncomment:
 
   ![Solar — scrolling a large library at 60fps](docs/media/grid-scroll.gif)
 -->
@@ -25,9 +26,9 @@ It's named for **güey** (*gway*), the Taíno word for the sun. A photograph is
 captured light; Solar is where your light lives — on your machine, in your
 hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
 
-> **Status:** v1 MVP — crosses the "daily use" floor. Add your folders, browse a
-> newest-first timeline of 100,000+ photos, open any one full-screen, and trust
-> that a relaunch shows the truth.
+> **Status:** v1 — well past the "daily use" floor. Add your folders, fly through
+> a newest-first timeline of 100,000+ photos, open any one full-screen, **find
+> and name the people in them** — and trust that a relaunch shows the truth.
 
 ## What it does
 
@@ -38,6 +39,14 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
   current month as you fly through it.
 - **60fps scrolling at 100k+ photos.** The grid is virtualized and streams in
   progressively without ever disturbing your scroll position.
+- **The people in your photos — found on your machine.** Solar detects faces and
+  groups each person into their own page as you browse. It's Picasa's face
+  tagging, reborn — except the recognition runs **entirely on your computer** and
+  never touches a cloud. No uploading your family to a server to get them sorted.
+- **Name once, and it sticks.** Name a person and Solar remembers them durably —
+  the name *and* the grouping survive every re-scan. A "merge all" nudge reunites
+  the rest of someone's photos in a click, and the more you confirm, the more it
+  pulls together. New people slide in with a gentle hello as they're found.
 - **Instant repeat launches.** Thumbnails are generated off the UI thread in a
   Rust backend and cached to disk, so the second launch shows your library
   immediately — no "loading your photos" wall.
@@ -47,8 +56,9 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
   iCloud "dataless" files) are indexed instantly as placeholders and downloaded
   **on demand** as you scroll to them — never a bulk download — then cached.
 - **A library you can trust.** Folders are remembered; every launch quietly
-  reconciles with disk (plus a manual **Rescan**), adding new files and pruning
-  deleted ones — and never deleting anything if a drive is unreachable.
+  reconciles with disk (plus a manual rescan in **Settings**), adding new files
+  and pruning deleted ones — and never deleting anything if a drive is
+  unreachable.
 
 <!--
   Drop real feature screenshots here once the grid feels great, e.g.:
@@ -62,6 +72,8 @@ Stating the limits is part of the promise. **Solar will never:**
 
 - Phone home, send telemetry, or require an account.
 - Upload your photos to a cloud or hold them for a subscription.
+- **Send your photos — or your faces — to a server to be analyzed.** People are
+  detected and grouped on your device, full stop.
 - Move or modify your originals, or lock them in a proprietary database.
 - Become a full RAW darkroom or a professional cataloging suite.
 
@@ -139,9 +151,12 @@ Drag `Solar.app` into `/Applications` (or open the `.dmg`). Then:
 | EXIF capture date | `src-tauri/src/meta.rs` | Reads DateTimeOriginal — only from local files (never forces a cloud download). |
 | Database | `src-tauri/src/db.rs` | SQLite (WAL). Source of truth: photos, roots, dates, thumbnail status. |
 | Thumbnail + preview pipeline | `src-tauri/src/thumbs.rs` | Priority queue + worker pools (local eager, cloud on-demand); orientation; HEIC via libheif. |
-| Wiring / commands / `thumb://` protocol | `src-tauri/src/lib.rs` | Also serves viewer previews and runs the auto-rescan. |
-| UI shell | `src/App.tsx` | Toolbar, progress, folders popover, cold-start render. |
+| Wiring / commands / `thumb://` protocol | `src-tauri/src/lib.rs` | Also serves viewer previews, runs the auto-rescan, and drives the face sweep. |
+| Face detection + embeddings | `src-tauri/src/faces.rs` | On-device YuNet detect + SFace embed on aligned crops. Nothing leaves the machine. |
+| People clustering + identities | `src-tauri/src/cluster.rs` | Purity-first clustering; durable identities that survive re-scans (must/cannot-link). |
+| UI shell | `src/App.tsx` | Minimal top bar, hairline progress, settings menu, new-person nudges, cold-start render. |
 | Virtualized grid + scrubber | `src/PhotoGrid.tsx` | `@tanstack/react-virtual`; fixed cells = no reflow; timeline scrubber. |
+| People | `src/People.tsx` | Person tiles, inline naming, merge suggestions, the "merge all" magnet. |
 | Viewer | `src/Lightbox.tsx` | Full-screen preview, keyboard nav, neighbor prefetch. |
 | Backend bridge | `src/api.ts` | Typed command + event wrappers. |
 
