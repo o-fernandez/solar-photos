@@ -91,6 +91,25 @@ pub fn init(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
          );",
     )?;
+    // Durable person records. Unlike cluster ids — which are reassigned from
+    // scratch on every re-cluster — an identity id is permanent, so it can carry
+    // the user's decisions (this is so-and-so; these groups are the same person)
+    // across re-clusters. A face's `identity_id` is the must-link: every face
+    // sharing one is forced into a single cluster no matter what the embeddings do.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS identities (
+            id   INTEGER PRIMARY KEY,
+            name TEXT
+         );
+         CREATE TABLE IF NOT EXISTS cannot_link (
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            PRIMARY KEY (a, b)
+         );",
+    )?;
+    // Migration for libraries created before identities existed.
+    let _ = conn.execute("ALTER TABLE faces ADD COLUMN identity_id INTEGER", []);
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_faces_identity ON faces(identity_id);")?;
     Ok(())
 }
 
@@ -277,10 +296,42 @@ pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM faces;
          DELETE FROM cluster_names;
+         DELETE FROM identities;
+         DELETE FROM cannot_link;
          UPDATE photos SET faces_scanned = 0;
          DELETE FROM app_meta WHERE key = 'reclustered_v1';",
     )?;
     Ok(())
+}
+
+/// The highest-confidence embeddings of an identity — a compact "anchor profile"
+/// the magnet matches other clusters against. Capped via `limit` because a few
+/// dozen good exemplars characterize a person as well as hundreds.
+pub fn identity_anchor_embeddings(
+    conn: &Connection,
+    identity_id: i64,
+    limit: i64,
+) -> Result<Vec<Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT embedding FROM faces WHERE identity_id = ?1 ORDER BY score DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![identity_id, limit], |r| {
+        let blob: Vec<u8> = r.get(0)?;
+        Ok(decode_embedding(&blob))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The clusters an identity's faces currently sit in, largest first. The first is
+/// the natural "into" target when absorbing look-alike groups.
+pub fn clusters_of_identity(conn: &Connection, identity_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT cluster_id, COUNT(*) c FROM faces
+         WHERE identity_id = ?1 AND cluster_id IS NOT NULL
+         GROUP BY cluster_id ORDER BY c DESC",
+    )?;
+    let rows = stmt.query_map([identity_id], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Read an app-level key/value flag (e.g. "have we run the one-time re-cluster").
@@ -339,29 +390,115 @@ pub fn cluster_names_all(conn: &Connection) -> Result<Vec<(i64, String)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Name (or rename) a cluster. Empty name clears it.
+/// Name (or rename) a cluster. Empty name clears it. Naming also confirms an
+/// identity: it binds every face in the cluster to one durable `identity_id` (so
+/// the name — and the grouping — survives the next re-cluster) and stores the name
+/// on that identity.
 pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()> {
-    if name.trim().is_empty() {
+    let name = name.trim();
+    if name.is_empty() {
         conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [cluster_id])?;
-    } else {
-        conn.execute(
-            "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
-             ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
-            rusqlite::params![cluster_id, name.trim()],
-        )?;
+        if let Some(id) = identity_of_cluster(conn, cluster_id)? {
+            conn.execute("UPDATE identities SET name = NULL WHERE id = ?1", [id])?;
+        }
+        return Ok(());
     }
+    conn.execute(
+        "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
+         ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
+        rusqlite::params![cluster_id, name],
+    )?;
+    let id = ensure_identity_for_cluster(conn, cluster_id)?;
+    conn.execute("UPDATE identities SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])?;
     Ok(())
 }
 
-/// Merge cluster `from` into `into`: reassign its faces and drop its name.
-/// The surviving cluster keeps `into`'s name.
+/// Merge cluster `from` into `into`: reassign its faces and drop its name. The
+/// surviving cluster keeps `into`'s name. The merge is also recorded durably: all
+/// faces end up under `into`'s identity, a must-link that the next re-cluster
+/// honors (so you never have to merge the same two people twice).
 pub fn merge_clusters(conn: &Connection, into: i64, from: i64) -> Result<()> {
     conn.execute(
         "UPDATE faces SET cluster_id = ?1 WHERE cluster_id = ?2",
         rusqlite::params![into, from],
     )?;
     conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [from])?;
+    // Fold any pre-existing identity on the `from` side into `into`'s identity, then
+    // bind every face of the (now combined) cluster to it.
+    let into_id = ensure_identity_for_cluster(conn, into)?;
+    conn.execute(
+        "UPDATE faces SET identity_id = ?1 WHERE cluster_id = ?2",
+        rusqlite::params![into_id, into],
+    )?;
     Ok(())
+}
+
+/// The identity bound to a cluster, if any (the one most of its faces carry).
+pub fn identity_of_cluster(conn: &Connection, cluster_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT identity_id FROM faces
+             WHERE cluster_id = ?1 AND identity_id IS NOT NULL
+             GROUP BY identity_id ORDER BY COUNT(*) DESC LIMIT 1",
+            [cluster_id],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+/// Get (or create) the identity for a cluster and bind every face in the cluster
+/// to it. Reuses an existing identity already present on the cluster so repeated
+/// naming/merging doesn't spawn duplicates.
+pub fn ensure_identity_for_cluster(conn: &Connection, cluster_id: i64) -> Result<i64> {
+    let id = match identity_of_cluster(conn, cluster_id)? {
+        Some(id) => id,
+        None => {
+            conn.execute("INSERT INTO identities (name) VALUES (NULL)", [])?;
+            conn.last_insert_rowid()
+        }
+    };
+    conn.execute(
+        "UPDATE faces SET identity_id = ?1 WHERE cluster_id = ?2",
+        rusqlite::params![id, cluster_id],
+    )?;
+    Ok(id)
+}
+
+/// (face_id, identity_id) for every face the user has bound to an identity — the
+/// must-link constraints a re-cluster must honor.
+pub fn face_identities(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, identity_id FROM faces WHERE identity_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (identity_id, name) for every identity that has been given a name.
+pub fn named_identities(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM identities WHERE name IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Record that two clusters are *not* the same person (from a declined merge),
+/// promoting each side to a durable identity so the barrier survives re-clusters.
+/// Stored as an unordered identity pair.
+pub fn add_cannot_link(conn: &Connection, into: i64, from: i64) -> Result<()> {
+    let a = ensure_identity_for_cluster(conn, into)?;
+    let b = ensure_identity_for_cluster(conn, from)?;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    conn.execute(
+        "INSERT OR IGNORE INTO cannot_link (a, b) VALUES (?1, ?2)",
+        rusqlite::params![lo, hi],
+    )?;
+    Ok(())
+}
+
+/// All declared "not the same" identity pairs (unordered, a < b).
+pub fn cannot_link_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT a, b FROM cannot_link")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Every photo containing this person, newest first — the same ordering as the

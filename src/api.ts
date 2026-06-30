@@ -178,6 +178,42 @@ export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
   return invoke("get_merge_suggestions");
 }
 
+export interface IdentityGrowth {
+  identity_id: number;
+  name: string;
+  /** The cluster everything folds into (the person's largest current cluster). */
+  into: number;
+  /** Example faces of the confirmed person. */
+  anchor_faces: number[];
+  /** The look-alike clusters offered for absorption. */
+  candidate_clusters: number[];
+  /** Example faces drawn from those candidates. */
+  candidate_faces: number[];
+  /** Total photos across the candidate clusters. */
+  photos: number;
+}
+
+/** Per confirmed person: the over-split fragments the magnet is confident are the
+ *  same person, ready to fold in with one click. */
+export function getIdentityGrowth(): Promise<IdentityGrowth[]> {
+  return invoke("get_identity_growth");
+}
+
+/** Fold a batch of look-alike clusters into a confirmed person (durable). */
+export function absorbClusters(into: number, clusters: number[]): Promise<void> {
+  return invoke("absorb_clusters", { into, clusters });
+}
+
+/** "Not the same": record a durable cannot-link so the pair is never re-suggested. */
+export function rejectMerge(into: number, from: number): Promise<void> {
+  return invoke("reject_merge", { into, from });
+}
+
+/** Wipe all face data and re-scan from scratch (for testing the experience clean). */
+export function resetFaceRecognition(): Promise<void> {
+  return invoke("reset_face_recognition");
+}
+
 /** Rebuild all clusters from scratch (purity-biased) in the background. */
 export function recluster(): Promise<void> {
   return invoke("recluster");

@@ -8,20 +8,26 @@
 import { useCallback, useEffect, useState } from "react";
 import PersonView from "./PersonView";
 import {
+  absorbClusters,
   faceCropUrl,
   getClusters,
+  getIdentityGrowth,
   getMergeSuggestions,
   mergeClusters,
   nameCluster,
   onClusterProgress,
+  rejectMerge,
   type Cluster,
+  type IdentityGrowth,
   type MergeSuggestion,
 } from "./api";
 
 export default function People() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [suggestions, setSuggestions] = useState<MergeSuggestion[]>([]);
+  const [growth, setGrowth] = useState<IdentityGrowth[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const [dismissedGrowth, setDismissedGrowth] = useState<Set<number>>(new Set());
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   // The person whose page is open, in place of the people-grid (null = grid).
@@ -32,6 +38,7 @@ export default function People() {
   const reload = useCallback(() => {
     getClusters().then(setClusters).catch(() => {});
     getMergeSuggestions().then(setSuggestions).catch(() => {});
+    getIdentityGrowth().then(setGrowth).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -68,10 +75,22 @@ export default function People() {
       .catch(() => {});
   };
   const decline = (s: MergeSuggestion) => {
+    // Persist a cannot-link so it never returns (not just this session), then hide it.
+    rejectMerge(s.into, s.from).catch(() => {});
     setDismissed((d) => new Set(d).add(`${s.into}-${s.from}`));
   };
 
+  const doAbsorb = (g: IdentityGrowth) => {
+    absorbClusters(g.into, g.candidate_clusters)
+      .then(reload)
+      .catch(() => {});
+  };
+  const declineGrowth = (g: IdentityGrowth) => {
+    setDismissedGrowth((d) => new Set(d).add(g.identity_id));
+  };
+
   const suggestion = suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
+  const grow = growth.find((g) => !dismissedGrowth.has(g.identity_id) && g.candidate_clusters.length > 0);
 
   // A person's page replaces the grid; returning reloads so counts reflect any
   // "not this person" corrections and renames made there.
@@ -103,6 +122,35 @@ export default function People() {
     <div className="people-scroll">
       {reorganizing && (
         <div className="reorg-banner">Reorganizing people…</div>
+      )}
+      {grow && (
+        <div className="merge-card grow-card">
+          <div className="merge-faces">
+            <div className="mside">
+              {grow.anchor_faces.map((id) => (
+                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+              ))}
+            </div>
+            <span className="mplus">+</span>
+            <div className="mside">
+              {grow.candidate_faces.map((id) => (
+                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+              ))}
+            </div>
+          </div>
+          <div className="merge-text">
+            {grow.candidate_clusters.length.toLocaleString()} more{" "}
+            {grow.candidate_clusters.length === 1 ? "group" : "groups"} (
+            {grow.photos.toLocaleString()} {grow.photos === 1 ? "photo" : "photos"}) look like{" "}
+            <b>{grow.name}</b> — merge them all?
+          </div>
+          <button className="pick-btn" onClick={() => doAbsorb(grow)}>
+            Merge all
+          </button>
+          <button className="ghost-btn" onClick={() => declineGrowth(grow)}>
+            Not now
+          </button>
+        </div>
       )}
       {suggestion && (
         <div className="merge-card">

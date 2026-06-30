@@ -50,7 +50,14 @@ pub struct FaceModels {
 }
 
 fn build(path: &Path) -> Result<Session> {
+    // Cap each session to a single intra-op thread. Parallelism already comes from
+    // the FACE_WORKERS-sized pool (one model set per worker), so the ORT default of
+    // ~one thread *per core per session* massively oversubscribes the CPU — 6 workers
+    // × 2 models × ~10 threads ≈ 120+ inference threads, which pegs every core and
+    // starves the UI (violating PRINCIPLES #1/#3). One thread per session keeps the
+    // total near the worker count and leaves the foreground responsive.
     Ok(Session::builder()?
+        .with_intra_threads(1)?
         .with_execution_providers([CoreMLExecutionProvider::default().build()])?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .commit_from_file(path)?)

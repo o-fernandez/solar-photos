@@ -142,13 +142,14 @@ body,
   display: flex;
   align-items: center;
 }
-/* Overlap the strip of example faces so several fit without crowding the card. */
+/* A slight overlap keeps the strip compact; small enough not to occlude the
+   faces you're actually judging. */
 .mside .mface:not(:first-child) {
-  margin-left: -10px;
+  margin-left: -6px;
 }
 .mface {
-  width: 44px;
-  height: 44px;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
   object-fit: cover;
   border: 2px solid #eaf1fb;
@@ -161,6 +162,18 @@ body,
   flex: 1;
   font-size: 14px;
   color: #185fa5;
+}
+/* The batch "merge all the rest of this person" card — a distinct, inviting tint
+   to mark it as the high-leverage action (one click reunites a whole person). */
+.grow-card {
+  background: #e7f6ec;
+}
+.grow-card .mface {
+  border-color: #e7f6ec;
+}
+.grow-card .merge-text,
+.grow-card .mplus {
+  color: #1c7a45;
 }
 
 .people-grid {
@@ -677,6 +690,19 @@ body,
   }
   .merge-card {
     background: #26303a;
+  }
+  .mface {
+    border-color: #26303a;
+  }
+  .grow-card {
+    background: #20342a;
+  }
+  .grow-card .mface {
+    border-color: #20342a;
+  }
+  .grow-card .merge-text,
+  .grow-card .mplus {
+    color: #6fce97;
   }
   .merge-text,
   .mplus {

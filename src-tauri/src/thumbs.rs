@@ -192,6 +192,9 @@ pub fn spawn_workers<F>(
         let cache_dir = cache_dir.clone();
         let notify = notify.clone();
         std::thread::spawn(move || {
+            // Yield to the UI: decoding full-res images must never out-prioritize
+            // the foreground (PRINCIPLES #3).
+            crate::background_qos();
             // A worker's DB connection is only used to record outcomes.
             let conn = match db::open(&db_path) {
                 Ok(c) => c,

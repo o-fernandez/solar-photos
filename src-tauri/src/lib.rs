@@ -70,6 +70,29 @@ fn now_gen() -> i64 {
         .unwrap_or(0)
 }
 
+/// Drop the calling thread — and every thread it later spawns, including ONNX
+/// Runtime's inference pool — to UTILITY QoS on macOS. The webview/UI runs at a
+/// higher QoS, so the scheduler always lets the foreground preempt indexing: the
+/// background pools still soak up idle cores, but never at the UI's expense. This
+/// is how the heavy decode + face work honors "foreground always wins"
+/// (PRINCIPLES #1/#3) instead of pegging every core and freezing the window.
+pub(crate) fn background_qos() {
+    #[cfg(target_os = "macos")]
+    {
+        // QOS_CLASS_UTILITY = 0x11. `pthread_set_qos_class_self_np` lives in
+        // libSystem, which is always linked, so no extra dependency is needed.
+        extern "C" {
+            fn pthread_set_qos_class_self_np(
+                qos_class: std::os::raw::c_uint,
+                relative_priority: std::os::raw::c_int,
+            ) -> std::os::raw::c_int;
+        }
+        unsafe {
+            pthread_set_qos_class_self_np(0x11, 0);
+        }
+    }
+}
+
 /// Remove a set of photos' cached files (thumbnail + preview) after they've been
 /// pruned or their root removed.
 fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
@@ -393,8 +416,15 @@ struct MergeSuggestion {
 #[tauri::command]
 fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
     let conn = state.conn.lock().unwrap();
+    // Stay silent until clustering has settled — no prompts off half-built clusters.
+    if !suggestions_ready(&conn, &state.reclustering) {
+        return Ok(Vec::new());
+    }
     let overview = db::clusters_overview(&conn).map_err(|e| e.to_string())?;
     let faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
+    // Declared "not the same" identity pairs — suggestions that name them are skipped.
+    let blocked: std::collections::HashSet<(i64, i64)> =
+        db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
     drop(conn);
 
     use std::collections::HashMap;
@@ -422,6 +452,16 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
             let (ca, cb) = (info[&e.a], info[&e.b]);
             if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
         };
+        // Skip a pair the user has already declared "not the same".
+        if let (Ok(Some(ia)), Ok(Some(ib))) = (
+            db::identity_of_cluster(&conn, big.cluster_id),
+            db::identity_of_cluster(&conn, small.cluster_id),
+        ) {
+            let key = if ia < ib { (ia, ib) } else { (ib, ia) };
+            if blocked.contains(&key) {
+                continue;
+            }
+        }
         out.push(MergeSuggestion {
             into: big.cluster_id,
             from: small.cluster_id,
@@ -432,6 +472,146 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
         });
     }
     Ok(out)
+}
+
+/// A batch offer from a confirmed person: "N more groups look like <name> — merge
+/// them all?" The leverage of naming once and folding in the long tail of that
+/// person's over-split fragments in a single click.
+#[derive(Clone, serde::Serialize)]
+struct IdentityGrowth {
+    identity_id: i64,
+    name: String,
+    /// The cluster everything folds into (the identity's largest current cluster).
+    into: i64,
+    /// Example faces of the confirmed person, for the card.
+    anchor_faces: Vec<i64>,
+    /// The look-alike clusters offered for absorption.
+    candidate_clusters: Vec<i64>,
+    /// Example faces drawn from those candidates, for the card.
+    candidate_faces: Vec<i64>,
+    /// Total photos across the candidate clusters.
+    photos: i64,
+}
+
+/// For each named person, find the over-split fragments the magnet is confident are
+/// the same person (see `cluster::identity_candidates`). Anchored to the confirmed
+/// identity and filtered by "not the same" — never free-chaining — so a single
+/// click can reunite a person scattered across dozens of clusters. Gated on a
+/// settled state, like the pairwise suggestions.
+#[tauri::command]
+fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
+    let conn = state.conn.lock().unwrap();
+    if !suggestions_ready(&conn, &state.reclustering) {
+        return Ok(Vec::new());
+    }
+    let named = db::named_identities(&conn).map_err(|e| e.to_string())?;
+    if named.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all_faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
+    let blocked: std::collections::HashSet<(i64, i64)> =
+        db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+
+    let mut out = Vec::new();
+    for (identity_id, name) in named {
+        let anchor = db::identity_anchor_embeddings(&conn, identity_id, 64).map_err(|e| e.to_string())?;
+        if anchor.is_empty() {
+            continue;
+        }
+        // The clusters this identity already occupies are excluded from the search;
+        // the largest is the fold-in target.
+        let own: Vec<i64> = db::clusters_of_identity(&conn, identity_id).map_err(|e| e.to_string())?;
+        let into = match own.first() {
+            Some(&c) => c,
+            None => continue,
+        };
+        let own_set: std::collections::HashSet<i64> = own.iter().cloned().collect();
+        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
+            .iter()
+            .filter(|(_, c, _)| !own_set.contains(c))
+            .cloned()
+            .collect();
+
+        let mut cands = cluster::identity_candidates(&anchor, &others);
+        // Strongest matches first, and drop any cluster the user said isn't this person.
+        cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
+        let mut candidate_clusters = Vec::new();
+        let mut candidate_faces = Vec::new();
+        let mut photos: i64 = 0;
+        for c in cands {
+            if let Ok(Some(other_id)) = db::identity_of_cluster(&conn, c.cluster_id) {
+                let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
+                if blocked.contains(&key) {
+                    continue;
+                }
+            }
+            candidate_clusters.push(c.cluster_id);
+            photos += c.size as i64;
+            if candidate_faces.len() < 4 {
+                if let Ok(mut f) = db::top_face_ids(&conn, c.cluster_id, 1) {
+                    candidate_faces.append(&mut f);
+                }
+            }
+        }
+        if candidate_clusters.is_empty() {
+            continue;
+        }
+        out.push(IdentityGrowth {
+            identity_id,
+            name,
+            into,
+            anchor_faces: db::top_face_ids(&conn, into, 4).unwrap_or_default(),
+            candidate_clusters,
+            candidate_faces,
+            photos,
+        });
+    }
+    // Most impactful person first.
+    out.sort_by(|a, b| b.photos.cmp(&a.photos));
+    Ok(out)
+}
+
+/// Fold a batch of look-alike clusters into a confirmed person in one action (the
+/// "merge all" button). Each absorb writes the durable must-link, so the whole
+/// person stays together through future re-clusters.
+#[tauri::command]
+fn absorb_clusters(
+    state: tauri::State<'_, AppState>,
+    into: i64,
+    clusters: Vec<i64>,
+) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    for from in clusters {
+        if from != into {
+            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// "Not the same" on a merge prompt: record a durable cannot-link so the pair is
+/// never suggested again (survives re-clusters, unlike a dismissed-in-memory card).
+#[tauri::command]
+fn reject_merge(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())
+}
+
+/// Wipe all face data — detections, clusters, names, identities, decisions — and
+/// re-arm the sweep so the whole library is analyzed from scratch. For testing the
+/// recognition experience end-to-end on a clean slate.
+#[tauri::command]
+fn reset_face_recognition(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    {
+        let conn = state.conn.lock().unwrap();
+        db::reset_faces_for_recompute(&conn).map_err(|e| e.to_string())?;
+    }
+    // Drop cached cover crops too; they point at now-deleted faces.
+    let _ = std::fs::remove_dir_all(&state.faces_dir);
+    let _ = std::fs::create_dir_all(&state.faces_dir);
+    let _ = app.emit("faces-progress", FaceProgress { scanned: 0, eligible: 0 });
+    Ok(())
 }
 
 /// Set once the one-time migration off the old greedy clustering has run.
@@ -448,6 +628,63 @@ struct ClusterProgress {
     fraction: f32,
 }
 
+/// Rewrite `assignments` (face → fresh cluster id) so every face sharing an
+/// `identity_id` lands in one cluster. Union-find over the new cluster ids: faces
+/// of the same identity union their clusters, then every face is remapped to its
+/// component root. Identities are disjoint, so this only ever *joins* groups the
+/// user confirmed — it never splits or crosses people.
+fn apply_must_links(face_identity: &[(i64, i64)], assignments: &mut [(i64, i64)]) {
+    use std::collections::HashMap;
+    let face_to_cluster: HashMap<i64, i64> = assignments.iter().cloned().collect();
+    let mut parent: HashMap<i64, i64> = HashMap::new();
+    fn find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
+        let mut r = x;
+        while let Some(&p) = parent.get(&r) {
+            if p == r {
+                break;
+            }
+            r = p;
+        }
+        r
+    }
+    let mut ident_first: HashMap<i64, i64> = HashMap::new();
+    for (face, ident) in face_identity {
+        let Some(&c) = face_to_cluster.get(face) else { continue };
+        parent.entry(c).or_insert(c);
+        match ident_first.get(ident) {
+            None => {
+                ident_first.insert(*ident, c);
+            }
+            Some(&first) => {
+                let (ra, rb) = (find(&mut parent, first), find(&mut parent, c));
+                if ra != rb {
+                    parent.insert(ra, rb);
+                }
+            }
+        }
+    }
+    if parent.is_empty() {
+        return;
+    }
+    for a in assignments.iter_mut() {
+        a.1 = find(&mut parent, a.1);
+    }
+}
+
+/// Whether the People view should surface merge prompts yet. We stay quiet while a
+/// re-cluster is running or while the face sweep is still catching up: suggestions
+/// computed on not-yet-consolidated clusters are the source of the "this group is
+/// four different people" misfires. Only settled, consolidated clusters get prompts.
+fn suggestions_ready(conn: &Connection, reclustering: &AtomicBool) -> bool {
+    if reclustering.load(Ordering::SeqCst) {
+        return false;
+    }
+    match db::face_progress(conn) {
+        Ok((scanned, eligible)) => eligible > 0 && scanned >= eligible,
+        _ => false,
+    }
+}
+
 /// Re-cluster every face from scratch, in the background (Principle 1: off the UI
 /// thread, no focus steal). Order-independent and purity-biased. Names are carried
 /// across by re-anchoring each to the new cluster holding the plurality of its old
@@ -462,6 +699,7 @@ fn run_recluster(app: AppHandle) {
     drop(state);
 
     std::thread::spawn(move || {
+        background_qos();
         use std::collections::HashMap;
         let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
         let result = (|| -> anyhow::Result<()> {
@@ -477,12 +715,17 @@ fn run_recluster(app: AppHandle) {
             // Throttle progress events to ~every 2% so we don't flood the channel.
             let app2 = app.clone();
             let mut last = 0.0f32;
-            let assignments = cluster::recluster(&faces, |f| {
+            let mut assignments = cluster::recluster(&faces, |f| {
                 if f - last >= 0.02 || f >= 1.0 {
                     last = f;
                     let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
                 }
             });
+            // Honor must-links: every face the user bound to the same identity (by
+            // naming or merging) is forced into one cluster, however the embeddings
+            // split it. This is what makes a confirmed merge durable — the re-cluster
+            // can no longer undo it.
+            apply_must_links(&db::face_identities(&conn)?, &mut assignments);
             db::set_face_clusters(&mut conn, &assignments)?;
 
             // Name preservation: for each old *named* cluster, find where the bulk
@@ -578,8 +821,9 @@ fn resolve_model(app: &AppHandle, name: &str) -> PathBuf {
 /// dominated by reading the (cloud-backed) original off ProtonDrive, which is
 /// I/O-latency-bound — overlapping several reads is the main lever on sweep
 /// throughput. CoreML serializes at the hardware level, so this is sized for
-/// I/O overlap, not CPU.
-const FACE_WORKERS: usize = 6;
+/// I/O overlap, not CPU. Kept modest (and UTILITY-QoS'd, see `background_qos`) so
+/// the pool overlaps reads without crowding the foreground off the CPU.
+const FACE_WORKERS: usize = 4;
 
 /// The background face sweep: a pool of `FACE_WORKERS` that decode + detect +
 /// embed in parallel, plus a single coordinator thread that hands out work and
@@ -619,6 +863,9 @@ fn spawn_face_workers(
         let yunet = yunet.clone();
         let sface = sface.clone();
         std::thread::spawn(move || {
+            // Set QoS before loading the models so ONNX Runtime's own inference
+            // threads inherit UTILITY QoS and yield to the UI (PRINCIPLES #3).
+            background_qos();
             let mut models = match faces::FaceModels::load(&yunet, &sface) {
                 Ok(m) => m,
                 Err(e) => {
@@ -652,6 +899,7 @@ fn spawn_face_workers(
 
     // Coordinator: claims work, feeds the pool, and serially clusters + saves.
     std::thread::spawn(move || {
+        background_qos();
         let mut conn = match db::open(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -730,6 +978,96 @@ fn spawn_face_workers(
     });
 }
 
+/// Serve one `thumb://` request: a cached grid thumbnail (`/<id>`), a viewer
+/// preview (`/preview/<id>`), or a cover-face crop (`/face/<id>`). On a cache miss
+/// this **decodes a full-resolution original** (preview / face crop), which is far
+/// too heavy to run on the webview's main thread — a burst of requests (e.g. opening
+/// People, which asks for a crop per person) would freeze the UI. It is therefore
+/// always invoked off-thread by the asynchronous protocol handler below.
+fn serve_thumb(app: &AppHandle, full: &str) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::Response;
+    let ok = |bytes: Vec<u8>| {
+        Response::builder()
+            .header("Content-Type", "image/jpeg")
+            .header("Cache-Control", "no-cache")
+            .body(bytes)
+            .unwrap()
+    };
+    let not_found = || Response::builder().status(404).body(Vec::new()).unwrap();
+
+    let is_preview = full.starts_with("preview/");
+    let is_face = full.starts_with("face/");
+    let id: Option<i64> = full.rsplit('/').next().and_then(|s| s.parse().ok());
+    let id = match id {
+        Some(id) => id,
+        None => return not_found(),
+    };
+
+    let state = app.state::<AppState>();
+
+    // Cover face for the People screen: a crisp crop from the original, generated
+    // on first request and cached forever.
+    if is_face {
+        let out = faces::face_crop_path(&state.faces_dir, id);
+        if let Ok(bytes) = std::fs::read(&out) {
+            return ok(bytes);
+        }
+        let (photo_id, x1, y1, x2, y2) = {
+            let conn = state.conn.lock().unwrap();
+            match db::face_box(&conn, id).ok().flatten() {
+                Some(b) => b,
+                None => return not_found(),
+            }
+        };
+        let original = {
+            let conn = state.conn.lock().unwrap();
+            db::path_for_id(&conn, photo_id).ok().flatten()
+        };
+        let img = match original.and_then(|p| thumbs::load_oriented(std::path::Path::new(&p)).ok()) {
+            Some(i) => i.to_rgb8(),
+            None => return not_found(),
+        };
+        return match faces::crop_face_jpeg(&img, (x1, y1, x2, y2)) {
+            Ok(bytes) => {
+                if let Some(parent) = out.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&out, &bytes);
+                ok(bytes)
+            }
+            Err(_) => not_found(),
+        };
+    }
+
+    if !is_preview {
+        let path = thumbs::thumb_path(&state.cache_dir, id);
+        return match std::fs::read(&path) {
+            Ok(bytes) => ok(bytes),
+            Err(_) => not_found(),
+        };
+    }
+
+    let out = thumbs::preview_path(&state.preview_dir, id);
+    if let Ok(bytes) = std::fs::read(&out) {
+        return ok(bytes);
+    }
+    let original = {
+        let conn = state.conn.lock().unwrap();
+        db::path_for_id(&conn, id).ok().flatten()
+    };
+    let original = match original {
+        Some(p) => p,
+        None => return not_found(),
+    };
+    match thumbs::generate_preview(&out, &original) {
+        Ok(bytes) => ok(bytes),
+        Err(e) => {
+            eprintln!("preview failed for {original}: {e}");
+            not_found()
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -742,94 +1080,18 @@ pub fn run() {
         // The preview is generated on demand the first time it's requested
         // (decoded, EXIF-oriented, downscaled) and cached forever; for a
         // cloud-only original that first read triggers the on-demand download.
-        .register_uri_scheme_protocol("thumb", |ctx, request| {
-            use tauri::http::Response;
-
-            let app = ctx.app_handle();
-            let ok = |bytes: Vec<u8>| {
-                Response::builder()
-                    .header("Content-Type", "image/jpeg")
-                    .header("Cache-Control", "no-cache")
-                    .body(bytes)
-                    .unwrap()
-            };
-            let not_found = || Response::builder().status(404).body(Vec::new()).unwrap();
-
+        // Asynchronous so the (potentially full-res-decoding) handler runs on a
+        // blocking-pool thread, never the webview's main thread. A synchronous
+        // handler here froze the UI ("App Not Responding") whenever a screen asked
+        // for many uncached images at once — opening People decodes a face crop per
+        // person. Off-thread, the event loop stays free (PRINCIPLES #1).
+        .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
             // Path is `/<id>`, `/preview/<id>`, or `/face/<face_id>`.
             let full = request.uri().path().trim_matches('/').to_string();
-            let is_preview = full.starts_with("preview/");
-            let is_face = full.starts_with("face/");
-            let id: Option<i64> = full.rsplit('/').next().and_then(|s| s.parse().ok());
-            let id = match id {
-                Some(id) => id,
-                None => return not_found(),
-            };
-
-            let state = app.state::<AppState>();
-
-            // Cover face for the People screen: a crisp crop from the original,
-            // generated on first request and cached forever.
-            if is_face {
-                let out = faces::face_crop_path(&state.faces_dir, id);
-                if let Ok(bytes) = std::fs::read(&out) {
-                    return ok(bytes);
-                }
-                let (photo_id, x1, y1, x2, y2) = {
-                    let conn = state.conn.lock().unwrap();
-                    match db::face_box(&conn, id).ok().flatten() {
-                        Some(b) => b,
-                        None => return not_found(),
-                    }
-                };
-                let original = {
-                    let conn = state.conn.lock().unwrap();
-                    db::path_for_id(&conn, photo_id).ok().flatten()
-                };
-                let img = match original
-                    .and_then(|p| thumbs::load_oriented(std::path::Path::new(&p)).ok())
-                {
-                    Some(i) => i.to_rgb8(),
-                    None => return not_found(),
-                };
-                return match faces::crop_face_jpeg(&img, (x1, y1, x2, y2)) {
-                    Ok(bytes) => {
-                        if let Some(parent) = out.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(&out, &bytes);
-                        ok(bytes)
-                    }
-                    Err(_) => not_found(),
-                };
-            }
-
-            if !is_preview {
-                let path = thumbs::thumb_path(&state.cache_dir, id);
-                return match std::fs::read(&path) {
-                    Ok(bytes) => ok(bytes),
-                    Err(_) => not_found(),
-                };
-            }
-
-            let out = thumbs::preview_path(&state.preview_dir, id);
-            if let Ok(bytes) = std::fs::read(&out) {
-                return ok(bytes);
-            }
-            let original = {
-                let conn = state.conn.lock().unwrap();
-                db::path_for_id(&conn, id).ok().flatten()
-            };
-            let original = match original {
-                Some(p) => p,
-                None => return not_found(),
-            };
-            match thumbs::generate_preview(&out, &original) {
-                Ok(bytes) => ok(bytes),
-                Err(e) => {
-                    eprintln!("preview failed for {original}: {e}");
-                    not_found()
-                }
-            }
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(serve_thumb(&app, &full));
+            });
         })
         .setup(|app| {
             // All cached state lives under the OS app-data directory — never
@@ -871,12 +1133,15 @@ pub fn run() {
             // re-fetched when next visible).
             db::set_status_many_where_downloading(&conn)?;
 
-            // Local pool: one worker per core minus one, so the machine (and UI)
-            // stays responsive while indexing. At least one.
+            // Local pool: thumbnail decoding is CPU-bound, so we cap it at roughly
+            // half the cores and leave the rest for the foreground (the workers are
+            // also UTILITY-QoS'd, see `background_qos`). Together with the face pool
+            // this keeps total background decode well under the core count, so the
+            // UI never gets starved the way 1-per-core did.
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2);
-            let local_workers = cores.saturating_sub(1).max(1);
+            let local_workers = (cores / 2).max(2);
 
             let local_queue = ThumbQueue::new();
             let cloud_queue = ThumbQueue::new();
@@ -1001,6 +1266,10 @@ pub fn run() {
             name_cluster,
             merge_clusters,
             get_merge_suggestions,
+            get_identity_growth,
+            absorb_clusters,
+            reject_merge,
+            reset_face_recognition,
             recluster,
             cluster_debug,
             get_person_photos,

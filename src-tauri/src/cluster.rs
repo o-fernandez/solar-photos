@@ -303,6 +303,72 @@ pub fn merge_evidence(faces: &[(i64, i64, Vec<f32>)]) -> Vec<PairEvidence> {
         .collect()
 }
 
+/// A cluster the magnet judges to be the same person as a confirmed identity:
+/// how many of its faces match the anchor, the cluster's size, and the strongest
+/// match. `matched == size` means the whole group is confidently that person.
+pub struct GrowthCandidate {
+    pub cluster_id: i64,
+    pub size: usize,
+    pub max_sim: f32,
+}
+
+/// Anchored confidence propagation — the engine behind "you confirmed Omar, here
+/// are 40 more groups that are also Omar." Given a confirmed identity's `anchor`
+/// face profile and every *other* clustered face, return the clusters whose faces
+/// confidently match the anchor.
+///
+/// This is safe to reach where unsupervised clustering dares not, for two reasons:
+/// the anchor is **human-confirmed** (not a drifting centroid), and matching is to
+/// the anchor only — never chained cluster→cluster — so it can't fuse strangers the
+/// way transitive merging would. With these embeddings, different people sit far
+/// below [`TAU_LINK`], so a cluster whose faces clear it against Omar's profile is
+/// Omar. We require a *majority* of the cluster to match, so a single stray face
+/// can't drag a mixed group in.
+pub fn identity_candidates(
+    anchor: &[Vec<f32>],
+    others: &[(i64, i64, Vec<f32>)],
+) -> Vec<GrowthCandidate> {
+    if anchor.is_empty() || others.is_empty() {
+        return Vec::new();
+    }
+    let dim = anchor[0].len();
+    let a = Array2::from_shape_vec(
+        (anchor.len(), dim),
+        anchor.iter().flat_map(|e| normalized(e)).collect(),
+    )
+    .expect("uniform anchor length");
+    let o = Array2::from_shape_vec(
+        (others.len(), dim),
+        others.iter().flat_map(|(_, _, e)| normalized(e)).collect(),
+    )
+    .expect("uniform other length");
+    // best = each other face's strongest cosine to any anchor face.
+    let sims = o.dot(&a.t()); // (others x anchor)
+    use std::collections::HashMap;
+    // cluster_id -> (size, matched, max_sim)
+    let mut tally: HashMap<i64, (usize, usize, f32)> = HashMap::new();
+    for (i, (_, cid, _)) in others.iter().enumerate() {
+        let best = sims.row(i).iter().cloned().fold(f32::MIN, f32::max);
+        let e = tally.entry(*cid).or_insert((0, 0, 0.0));
+        e.0 += 1;
+        if best >= TAU_LINK {
+            e.1 += 1;
+            e.2 = e.2.max(best);
+        }
+    }
+    tally
+        .into_iter()
+        // A confident candidate: most of the cluster matches the anchor, with at
+        // least a couple of corroborating faces (or the whole of a tiny cluster).
+        .filter(|&(_, (size, matched, _))| matched * 2 >= size && matched >= 2.min(size).max(1))
+        .map(|(cluster_id, (size, _matched, max_sim))| GrowthCandidate {
+            cluster_id,
+            size,
+            max_sim,
+        })
+        .collect()
+}
+
 /// In-memory state for incremental assignment of newly-detected faces. Holds every
 /// already-clustered face's `(cluster_id, embedding)` so a new face can vote among
 /// its nearest neighbors. Rebuilt from the DB at startup, so a restart reproduces
@@ -490,5 +556,24 @@ mod tests {
         // A new face squarely inside the blob should join cluster 7.
         let cid = idx.assign(&vec_near(16, 0, 3, 0.04));
         assert_eq!(cid, 7);
+    }
+
+    #[test]
+    fn identity_magnet_pulls_same_person_not_strangers() {
+        // Anchor = a confirmed person on axis 0. Cluster 2 is the same person (axis
+        // 0) split off; cluster 3 is a stranger on axis 8. The magnet should offer
+        // cluster 2 and never cluster 3.
+        let dim = 16;
+        let anchor: Vec<Vec<f32>> = blob(dim, 0, 5);
+        let mut others: Vec<(i64, i64, Vec<f32>)> = Vec::new();
+        for (k, e) in blob(dim, 0, 4).into_iter().enumerate() {
+            others.push((k as i64, 2, e));
+        }
+        for (k, e) in blob(dim, 8, 4).into_iter().enumerate() {
+            others.push((100 + k as i64, 3, e));
+        }
+        let cands = identity_candidates(&anchor, &others);
+        assert!(cands.iter().any(|c| c.cluster_id == 2), "same person must be offered");
+        assert!(!cands.iter().any(|c| c.cluster_id == 3), "a stranger must never be offered");
     }
 }
