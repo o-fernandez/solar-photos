@@ -181,6 +181,20 @@ body,
   grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 18px;
 }
+/* The expander for the settled long-tail of tiny/singleton clusters. Quiet by
+   design — it's an escape hatch, not a call to action. */
+.more-toggle {
+  display: block;
+  margin: 22px auto 8px;
+  border: none;
+  background: none;
+  font-size: 13px;
+  color: #6a6a6a;
+  cursor: pointer;
+}
+.more-toggle:hover {
+  color: #1a1a1a;
+}
 .ptile {
   display: flex;
   flex-direction: column;
@@ -707,6 +721,12 @@ body,
   .merge-text,
   .mplus {
     color: #85b7eb;
+  }
+  .more-toggle {
+    color: #888;
+  }
+  .more-toggle:hover {
+    color: #ededed;
   }
   .pavatar {
     background: #2a2a2a;

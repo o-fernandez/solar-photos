@@ -5,22 +5,34 @@
 // fold over-split groups back together. Loads on mount (i.e. each time you open
 // the tab) and after every action, so it reflects the current clustering.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import PersonView from "./PersonView";
 import {
   absorbClusters,
   faceCropUrl,
   getClusters,
+  getFaceProgress,
   getIdentityGrowth,
   getMergeSuggestions,
   mergeClusters,
   nameCluster,
   onClusterProgress,
+  onFaceProgress,
   rejectMerge,
   type Cluster,
+  type FaceProgress,
   type IdentityGrowth,
   type MergeSuggestion,
 } from "./api";
+
+// While the library is still being scanned, the incremental assign path spawns a
+// swarm of 1–3-photo fragments that mostly vanish after consolidation — pure noise
+// to watch. So mid-sweep we show only people we're confident are real (named, or
+// already large) behind a progress readout, and reveal the full grid once settled.
+// Once settled, a gentler floor keeps singletons out of the main grid but reachable
+// in a "more" section (over-splitting leaves a real tail the magnet folds back in).
+const SWEEP_FLOOR = 8; // min photos for an *unnamed* cluster to show mid-sweep
+const SETTLED_FLOOR = 2; // below this, settled clusters move to the "more" section
 
 export default function People() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
@@ -34,6 +46,11 @@ export default function People() {
   const [selected, setSelected] = useState<Cluster | null>(null);
   // True while a background re-cluster is rebuilding people.
   const [reorganizing, setReorganizing] = useState(false);
+  // Sweep progress (null until first read); drives the "Finding people…" readout
+  // and decides whether we're still in the noisy mid-sweep phase.
+  const [faceProg, setFaceProg] = useState<FaceProgress | null>(null);
+  // Whether the settled "more" (small/singleton) section is expanded.
+  const [showMore, setShowMore] = useState(false);
 
   const reload = useCallback(() => {
     getClusters().then(setClusters).catch(() => {});
@@ -57,6 +74,44 @@ export default function People() {
       un.then((f) => f());
     };
   }, [reload]);
+
+  // Track sweep progress so the grid knows when the library has settled. We read
+  // once on mount, then follow the live stream. We deliberately do NOT reload the
+  // grid on every tick — only the *displayed* subset of the existing snapshot
+  // changes — so the tiles don't reflow as faces trickle in (Principle 2).
+  useEffect(() => {
+    getFaceProgress().then(setFaceProg).catch(() => {});
+    const un = onFaceProgress(setFaceProg);
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  // "Still working" = a re-cluster is running, or the sweep hasn't caught up. Same
+  // condition the backend uses to gate merge prompts (suggestions_ready).
+  const sweeping = !!faceProg && faceProg.eligible > 0 && faceProg.scanned < faceProg.eligible;
+  const inProgress = reorganizing || sweeping;
+  const sweepPct =
+    faceProg && faceProg.eligible > 0
+      ? Math.floor((faceProg.scanned / faceProg.eligible) * 100)
+      : 0;
+
+  // Named/confirmed people always show. Mid-sweep, unnamed clusters must clear a
+  // high bar (large = reliably real); the rest stays hidden behind the readout.
+  // Settled, the bar drops and the small remainder goes to an expandable section.
+  const { visible, tail } = useMemo(() => {
+    const isReal = (c: Cluster) => c.name != null;
+    if (inProgress) {
+      return {
+        visible: clusters.filter((c) => isReal(c) || c.count >= SWEEP_FLOOR),
+        tail: [] as Cluster[],
+      };
+    }
+    return {
+      visible: clusters.filter((c) => isReal(c) || c.count >= SETTLED_FLOOR),
+      tail: clusters.filter((c) => !isReal(c) && c.count < SETTLED_FLOOR),
+    };
+  }, [clusters, inProgress]);
 
   const startEdit = (c: Cluster) => {
     setEditing(c.cluster_id);
@@ -92,6 +147,42 @@ export default function People() {
   const suggestion = suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
   const grow = growth.find((g) => !dismissedGrowth.has(g.identity_id) && g.candidate_clusters.length > 0);
 
+  const renderTile = (c: Cluster) => (
+    <div className="ptile" key={c.cluster_id}>
+      <img
+        className="pavatar"
+        src={faceCropUrl(c.cover_face_id)}
+        alt={c.name ?? "Unnamed person"}
+        title={c.name ? `See ${c.name}` : "See this person"}
+        draggable={false}
+        onClick={() => setSelected(c)}
+      />
+      {editing === c.cluster_id ? (
+        <input
+          className="pname-input"
+          autoFocus
+          value={draft}
+          placeholder="Name"
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitEdit(c.cluster_id);
+            else if (e.key === "Escape") setEditing(null);
+          }}
+          onBlur={() => commitEdit(c.cluster_id)}
+        />
+      ) : c.name ? (
+        <button className="pname" onClick={() => startEdit(c)}>
+          {c.name}
+        </button>
+      ) : (
+        <button className="paddname" onClick={() => startEdit(c)}>
+          + Add name
+        </button>
+      )}
+      <div className="pcount">{c.count.toLocaleString()} {c.count === 1 ? "photo" : "photos"}</div>
+    </div>
+  );
+
   // A person's page replaces the grid; returning reloads so counts reflect any
   // "not this person" corrections and renames made there.
   if (selected) {
@@ -120,9 +211,14 @@ export default function People() {
 
   return (
     <div className="people-scroll">
-      {reorganizing && (
+      {reorganizing ? (
         <div className="reorg-banner">Reorganizing people…</div>
-      )}
+      ) : sweeping ? (
+        <div className="reorg-banner">
+          Finding people… {sweepPct}% — named people and large groups show now; the
+          rest appears once your library finishes scanning.
+        </div>
+      ) : null}
       {grow && (
         <div className="merge-card grow-card">
           <div className="merge-faces">
@@ -180,43 +276,24 @@ export default function People() {
         </div>
       )}
 
-      <div className="people-grid">
-        {clusters.map((c) => (
-          <div className="ptile" key={c.cluster_id}>
-            <img
-              className="pavatar"
-              src={faceCropUrl(c.cover_face_id)}
-              alt={c.name ?? "Unnamed person"}
-              title={c.name ? `See ${c.name}` : "See this person"}
-              draggable={false}
-              onClick={() => setSelected(c)}
-            />
-            {editing === c.cluster_id ? (
-              <input
-                className="pname-input"
-                autoFocus
-                value={draft}
-                placeholder="Name"
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitEdit(c.cluster_id);
-                  else if (e.key === "Escape") setEditing(null);
-                }}
-                onBlur={() => commitEdit(c.cluster_id)}
-              />
-            ) : c.name ? (
-              <button className="pname" onClick={() => startEdit(c)}>
-                {c.name}
-              </button>
-            ) : (
-              <button className="paddname" onClick={() => startEdit(c)}>
-                + Add name
-              </button>
-            )}
-            <div className="pcount">{c.count.toLocaleString()} {c.count === 1 ? "photo" : "photos"}</div>
-          </div>
-        ))}
-      </div>
+      {visible.length > 0 ? (
+        <div className="people-grid">{visible.map(renderTile)}</div>
+      ) : sweeping ? (
+        <p className="muted">
+          Still finding people — named people and large groups will appear here as
+          your library is scanned.
+        </p>
+      ) : null}
+
+      {tail.length > 0 && (
+        <>
+          <button className="more-toggle" onClick={() => setShowMore((s) => !s)}>
+            {showMore ? "Hide" : "More"} — {tail.length.toLocaleString()} small{" "}
+            {tail.length === 1 ? "group" : "groups"}
+          </button>
+          {showMore && <div className="people-grid">{tail.map(renderTile)}</div>}
+        </>
+      )}
     </div>
   );
 }
