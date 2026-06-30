@@ -320,7 +320,17 @@ export default function People({
         <div className="reorg-banner people-banner">
           <span className="pb-title">Still finding people</span>
           <span className="pb-sub">
-            The ones we’re sure of are here — more arrive as your library finishes scanning.
+            You’ll see the same person in a few separate groups while scanning — that’s
+            expected. Name a few favorites now if you like; when scanning finishes, Solar
+            groups the rest together for you.
+          </span>
+        </div>
+      ) : grow || suggestion ? (
+        <div className="reorg-banner people-banner">
+          <span className="pb-title">All faces scanned</span>
+          <span className="pb-sub">
+            Name a few people and accept the suggestions below — similar groups fold in
+            automatically.
           </span>
         </div>
       ) : null}

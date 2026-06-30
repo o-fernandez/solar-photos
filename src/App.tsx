@@ -25,6 +25,10 @@ const TOAST_LINGER_MS = 12_000;
 // A new person must reach this many photos before we nudge — matches People's
 // mid-sweep floor, so we only celebrate clusters we're confident are real.
 const NEW_PERSON_FLOOR = 8;
+// During a fast sweep many same-person fragments cross the floor in a row; nudging
+// on each one is noise (and pushes premature labeling). Celebrate at most one new
+// person per window so the toast stays an occasional delight, not a task queue.
+const TOAST_COOLDOWN_MS = 45_000;
 
 function App() {
   const [total, setTotal] = useState(0);
@@ -49,6 +53,7 @@ function App() {
   const announcedRef = useRef<Set<number>>(new Set());
   const seededRef = useRef(false);
   const lastPeopleCheckRef = useRef(0);
+  const lastToastRef = useRef(0);
 
   const refreshRoots = useCallback(() => {
     listRoots().then(setRoots).catch(() => {});
@@ -99,7 +104,8 @@ function App() {
           }
           const fresh = candidates.filter((c) => !seen.has(c.cluster_id));
           fresh.forEach((c) => seen.add(c.cluster_id));
-          if (fresh.length > 0) {
+          if (fresh.length > 0 && now - lastToastRef.current >= TOAST_COOLDOWN_MS) {
+            lastToastRef.current = now;
             setNewPerson(fresh.reduce((a, b) => (b.count > a.count ? b : a)));
           }
         })
@@ -343,7 +349,9 @@ function App() {
           <div className="toast-body">
             <div className="toast-title">New person found</div>
             <div className="toast-sub">
-              {newPerson.count.toLocaleString()} photos · name them if you like
+              {faceEligible > 0 && faceScanned < faceEligible
+                ? `${newPerson.count.toLocaleString()} photos so far`
+                : `${newPerson.count.toLocaleString()} photos · name them if you like`}
             </div>
           </div>
           <button className="toast-name" onClick={nameNewPerson}>
