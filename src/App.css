@@ -511,6 +511,60 @@ body,
   border-radius: 6px;
   padding: 3px 6px;
 }
+/* Name field + merge-into-existing-person suggestions (combobox). */
+.pname-combo {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.name-suggest {
+  position: absolute;
+  top: 100%;
+  margin: 5px 0 0;
+  z-index: 30;
+  list-style: none;
+  padding: 4px;
+  min-width: 190px;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 9px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.13);
+}
+.name-suggest-head {
+  font-size: 11px;
+  color: #999;
+  padding: 4px 8px 6px;
+}
+.name-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.name-suggest-item:hover {
+  background: #eef4fc;
+}
+.ns-face {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #ececec;
+  flex: 0 0 auto;
+}
+.ns-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #1a1a1a;
+}
+.ns-count {
+  font-size: 12px;
+  color: #999;
+  margin-left: auto;
+}
 .pcount {
   font-size: 12px;
   color: #999;
@@ -1080,6 +1134,24 @@ body,
     background: #2c2c2c;
     border-color: #444;
     color: #ededed;
+  }
+  .name-suggest {
+    background: #242424;
+    border-color: #3a3a3a;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+  }
+  .name-suggest-head,
+  .ns-count {
+    color: #888;
+  }
+  .name-suggest-item:hover {
+    background: #2f3a49;
+  }
+  .ns-name {
+    color: #ededed;
+  }
+  .ns-face {
+    background: #2a2a2a;
   }
   .pavatar:hover {
     box-shadow: 0 0 0 3px #2f4a6e;

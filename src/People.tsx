@@ -1,9 +1,14 @@
 // The People screen (Principle 5: the app clusters, you confirm in batches).
 //
 // Shows each detected person as a cover-face tile with a count, biggest first.
-// Name a person inline; accept/decline "same person?" merge suggestions that
-// fold over-split groups back together. Loads on mount (i.e. each time you open
-// the tab) and after every action, so it reflects the current clustering.
+// Name a person inline — the field suggests existing people as you type, and
+// naming a group the same as someone (picked from the list, or an exact match)
+// folds it into that person instead of making a duplicate, keeping each name
+// unique. Naming then arms the "N more groups look like <name>" growth card,
+// which pulls in the remaining look-alikes in one batch. Also accept/decline
+// "same person?" merge suggestions that fold over-split groups back together.
+// Loads on mount (i.e. each time you open the tab) and after every action, so
+// it reflects the current clustering.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PersonView from "./PersonView";
@@ -152,11 +157,50 @@ export default function People({
     setEditing(c.cluster_id);
     setDraft(c.name ?? "");
   };
-  const commitEdit = (clusterId: number) => {
-    nameCluster(clusterId, draft.trim())
+
+  // The named people whose name contains what you're typing (excluding the one
+  // you're editing) — the merge-into-an-existing-person suggestions. Biggest first.
+  const nameMatches = (self: Cluster): Cluster[] => {
+    const q = draft.trim().toLowerCase();
+    if (!q) return [];
+    return clusters
+      .filter((c) => c.cluster_id !== self.cluster_id && c.name && c.name.toLowerCase().includes(q))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+  };
+  // The existing person whose name is *exactly* what you typed (case-insensitive) —
+  // the signal that naming should merge rather than create a duplicate tile.
+  const exactNameMatch = (self: Cluster, name: string): Cluster | undefined => {
+    const q = name.trim().toLowerCase();
+    if (!q) return undefined;
+    return clusters.find(
+      (c) => c.cluster_id !== self.cluster_id && c.name != null && c.name.toLowerCase() === q,
+    );
+  };
+
+  // Fold this group into an existing person (chosen from the suggestions, or typed
+  // as an exact name match). The named person survives; the growth card then offers
+  // to pull in any remaining look-alikes (Direction B's batch fold).
+  const mergeInto = (self: Cluster, target: Cluster) => {
+    setEditing(null);
+    mergeClusters(target.cluster_id, self.cluster_id)
       .then(reload)
       .catch(() => {});
+  };
+
+  // Enter/blur on the name field: an exact match to an existing person merges; any
+  // other text names (or, when empty, clears) this group.
+  const commitEdit = (self: Cluster) => {
+    const name = draft.trim();
     setEditing(null);
+    const match = name ? exactNameMatch(self, name) : undefined;
+    if (match) {
+      mergeClusters(match.cluster_id, self.cluster_id).then(reload).catch(() => {});
+      return;
+    }
+    if (name || self.name) {
+      nameCluster(self.cluster_id, name).then(reload).catch(() => {});
+    }
   };
 
   const doMerge = (s: MergeSuggestion) => {
@@ -193,18 +237,42 @@ export default function People({
         onClick={() => setSelected(c)}
       />
       {editing === c.cluster_id ? (
-        <input
-          className="pname-input"
-          autoFocus
-          value={draft}
-          placeholder="Name"
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commitEdit(c.cluster_id);
-            else if (e.key === "Escape") setEditing(null);
-          }}
-          onBlur={() => commitEdit(c.cluster_id)}
-        />
+        <div className="pname-combo">
+          <input
+            className="pname-input"
+            autoFocus
+            value={draft}
+            placeholder="Name"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitEdit(c);
+              else if (e.key === "Escape") setEditing(null);
+            }}
+            onBlur={() => commitEdit(c)}
+          />
+          {(() => {
+            const matches = nameMatches(c);
+            if (matches.length === 0) return null;
+            // preventDefault keeps the input from blurring (and commit-naming the
+            // group) before a suggestion click runs its merge.
+            return (
+              <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
+                <li className="name-suggest-head">Add to an existing person</li>
+                {matches.map((m) => (
+                  <li
+                    key={m.cluster_id}
+                    className="name-suggest-item"
+                    onClick={() => mergeInto(c, m)}
+                  >
+                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                    <span className="ns-name">{m.name}</span>
+                    <span className="ns-count">{m.count.toLocaleString()}</span>
+                  </li>
+                ))}
+              </ul>
+            );
+          })()}
+        </div>
       ) : c.name ? (
         <button className="pname" onClick={() => startEdit(c)}>
           {c.name}
