@@ -35,7 +35,15 @@ const SWEEP_FLOOR = 8; // min photos for an *unnamed* cluster to show mid-sweep
 const SETTLED_FLOOR = 2; // below this, settled clusters move to the "more" section
 const MID_SWEEP_REFRESH_MS = 20_000; // how often to re-pull the grid while scanning
 
-export default function People() {
+export default function People({
+  focusClusterId = null,
+  onFocusConsumed,
+}: {
+  // When set (e.g. from the new-person toast), jump to this person and open their
+  // name field. Consumed once, then cleared via onFocusConsumed.
+  focusClusterId?: number | null;
+  onFocusConsumed?: () => void;
+} = {}) {
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [suggestions, setSuggestions] = useState<MergeSuggestion[]>([]);
   const [growth, setGrowth] = useState<IdentityGrowth[]>([]);
@@ -133,6 +141,16 @@ export default function People() {
       tail: clusters.filter((c) => !isReal(c) && c.count < SETTLED_FLOOR),
     };
   }, [clusters, inProgress]);
+
+  // Arriving from the new-person toast: show the grid and open this person's name
+  // field straight away, then tell the parent we've consumed the request.
+  useEffect(() => {
+    if (focusClusterId == null) return;
+    setSelected(null);
+    setEditing(focusClusterId);
+    setDraft("");
+    onFocusConsumed?.();
+  }, [focusClusterId, onFocusConsumed]);
 
   const startEdit = (c: Cluster) => {
     setEditing(c.cluster_id);

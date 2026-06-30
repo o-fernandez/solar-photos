@@ -109,6 +109,222 @@ body,
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
 }
 
+/* --- Minimal top bar (mark · centered tabs · settings) --- */
+.topbar {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  background: #ffffff;
+  border-bottom: 1px solid #e3e3e3;
+  flex: 0 0 auto;
+}
+.tb-side {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.tb-right {
+  justify-content: flex-end;
+}
+.tb-tabs {
+  flex: 0 0 auto;
+}
+.tb-mark {
+  display: inline-flex;
+  align-items: center;
+}
+.tb-count {
+  font-size: 13px;
+  color: #888;
+  white-space: nowrap;
+}
+.tb-gear {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  background: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.tb-gear:hover,
+.tb-gear[aria-expanded="true"] {
+  background: #f5f5f5;
+  border-color: #e0e0e0;
+  color: #1a1a1a;
+}
+
+/* The single background-work indicator: a hairline under the bar. */
+.hairline {
+  height: 2px;
+  flex: 0 0 auto;
+  background: transparent;
+}
+.hairline-fill {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+.hairline-fill.thumbs {
+  background: #378add;
+}
+.hairline-fill.faces {
+  background: #f5a623;
+}
+
+/* --- Settings menu (behind the gear) --- */
+.settings {
+  position: relative;
+}
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+}
+.settings-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  min-width: 264px;
+  max-width: 420px;
+  background: #ffffff;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+}
+.menu-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 9px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: #1a1a1a;
+  cursor: pointer;
+  text-align: left;
+}
+.menu-item:hover:not(:disabled) {
+  background: #f5f5f5;
+}
+.menu-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.menu-ic {
+  flex: 0 0 auto;
+  width: 18px;
+  text-align: center;
+  color: #888;
+  font-size: 15px;
+}
+.menu-label {
+  display: flex;
+  flex-direction: column;
+}
+.menu-hint {
+  font-size: 11px;
+  color: #999;
+  margin-top: 1px;
+}
+.menu-sep {
+  height: 1px;
+  background: #eee;
+  margin: 5px 8px;
+}
+.menu-head {
+  font-size: 11px;
+  color: #999;
+  padding: 6px 10px 4px;
+}
+.empty-add {
+  margin-top: 8px;
+}
+
+/* --- New-person nudge (toast) --- */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 360px;
+  background: #ffffff;
+  border: 1px solid #e3e3e3;
+  border-radius: 14px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14);
+  animation: toast-in 0.32s ease;
+}
+.toast-face {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #ececec;
+  flex: 0 0 auto;
+}
+.toast-body {
+  flex: 1;
+  min-width: 0;
+}
+.toast-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+.toast-sub {
+  font-size: 12px;
+  color: #777;
+  margin-top: 1px;
+}
+.toast-name {
+  border: 1px solid #d0d0d0;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  background: #ffffff;
+  color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.toast-name:hover {
+  border-color: #f5a623;
+}
+.toast-x {
+  border: none;
+  background: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.toast-x:hover {
+  color: #1a1a1a;
+}
+
 /* People view */
 .people-scroll {
   flex: 1;
@@ -700,6 +916,61 @@ body,
   }
   .view-nav button.on {
     background: #444;
+    color: #ededed;
+  }
+  .topbar {
+    background: #232323;
+    border-bottom-color: #333;
+  }
+  .tb-count {
+    color: #999;
+  }
+  .tb-gear {
+    color: #bbb;
+  }
+  .tb-gear:hover,
+  .tb-gear[aria-expanded="true"] {
+    background: #333;
+    border-color: #444;
+    color: #ededed;
+  }
+  .settings-menu {
+    background: #2a2a2a;
+    border-color: #444;
+  }
+  .menu-item {
+    color: #ededed;
+  }
+  .menu-item:hover:not(:disabled) {
+    background: #333;
+  }
+  .menu-hint,
+  .menu-head {
+    color: #888;
+  }
+  .menu-sep {
+    background: #3a3a3a;
+  }
+  .toast {
+    background: #2a2a2a;
+    border-color: #444;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  }
+  .toast-sub {
+    color: #aaa;
+  }
+  .toast-name {
+    background: #2c2c2c;
+    color: #ededed;
+    border-color: #3a3a3a;
+  }
+  .toast-name:hover {
+    border-color: #f5a623;
+  }
+  .toast-x {
+    color: #bbb;
+  }
+  .toast-x:hover {
     color: #ededed;
   }
   .merge-card {
