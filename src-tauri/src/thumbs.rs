@@ -321,8 +321,10 @@ pub fn load_face_source(preview_dir: &Path, id: i64, original_path: &str) -> Res
 }
 
 /// Decode any supported format into an in-memory image, with EXIF orientation
-/// applied so nothing is ever sideways. HEIC/HEIF go through a platform-specific
-/// path; other formats are oriented via their EXIF tag.
+/// applied so nothing is ever sideways. Genuine HEIC/HEIF goes through a
+/// platform-specific path; everything else (including JPEG files that carry a
+/// .heic extension, which photo-management tools sometimes produce) goes through
+/// the `image` crate, which handles EXIF orientation correctly for each format.
 fn decode_oriented(path: &Path) -> Result<DynamicImage> {
     let ext = path
         .extension()
@@ -330,7 +332,7 @@ fn decode_oriented(path: &Path) -> Result<DynamicImage> {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
 
-    if ext == "heic" || ext == "heif" {
+    if (ext == "heic" || ext == "heif") && !has_jpeg_magic(path) {
         return decode_heic(path);
     }
 
@@ -339,6 +341,17 @@ fn decode_oriented(path: &Path) -> Result<DynamicImage> {
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
     Ok(img)
+}
+
+/// Returns true when the file starts with the JPEG magic bytes (FF D8).
+/// Used to detect JPEG files that carry a .heic extension.
+fn has_jpeg_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf).map(|_| ()))
+        .map(|_| buf == [0xFF, 0xD8])
+        .unwrap_or(false)
 }
 
 // ── macOS: decode HEIC via the ImageIO system framework ──────────────────────
