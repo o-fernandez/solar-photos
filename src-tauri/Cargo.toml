@@ -24,12 +24,16 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }   # bundled = no system sqlite needed
 jwalk = "0.8"                                             # fast parallel directory walk
 image = "0.25"                                            # decode/encode jpeg/png/webp
-libheif-rs = "1.0"                                        # HEIC/HEIF decode (links system libheif)
 sha2 = "0.10"                                             # cache-key hashing
 anyhow = "1"                                              # ergonomic error handling in workers
 kamadak-exif = "0.5"                                      # read EXIF capture date (the timeline spine)
 ort = { version = "=2.0.0-rc.10", features = ["coreml", "ndarray"] }  # ONNX Runtime: face detect + embed
 ndarray = "0.16"                                          # tensor construction for ONNX I/O
+
+# HEIC/HEIF decode: macOS uses the system ImageIO framework (raw FFI, no crate needed).
+# Windows/Linux fall back to the bundled libheif.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libheif-rs = "1.0"
 
 [profile.release]
 # Smaller, faster release binaries.

@@ -18,7 +18,7 @@
 //! * **Scale (P6).** Thumbnails are written as individual files bucketed into
 //!   subfolders of ~1000 each, so no directory ever holds 100k entries.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -321,8 +321,8 @@ pub fn load_face_source(preview_dir: &Path, id: i64, original_path: &str) -> Res
 }
 
 /// Decode any supported format into an in-memory image, with EXIF orientation
-/// applied so nothing is ever sideways. HEIC/HEIF go through libheif (which
-/// already honors rotation); other formats are oriented via their EXIF tag.
+/// applied so nothing is ever sideways. HEIC/HEIF go through a platform-specific
+/// path; other formats are oriented via their EXIF tag.
 fn decode_oriented(path: &Path) -> Result<DynamicImage> {
     let ext = path
         .extension()
@@ -341,9 +341,188 @@ fn decode_oriented(path: &Path) -> Result<DynamicImage> {
     Ok(img)
 }
 
+// ── macOS: decode HEIC via the ImageIO system framework ──────────────────────
+//
+// Raw FFI against CoreFoundation, ImageIO, and CoreGraphics — no extra crates.
+// The three frameworks are always available on macOS.
+//
+// Pipeline:
+//   file path → CFURL → CGImageSource → CGImage (full-res, unrotated)
+//   → draw into sRGB CGBitmapContext (P3→sRGB conversion is automatic)
+//   → copy ARGB bytes → strip alpha → RgbImage → apply EXIF orientation
+
+#[cfg(target_os = "macos")]
+mod macos_heic {
+    use anyhow::{anyhow, Result};
+    use image::{metadata::Orientation, DynamicImage, RgbImage};
+    use std::ffi::{c_void, CString};
+
+    // Opaque pointer types for CF/CG objects.
+    type CFTypeRef       = *const c_void;
+    type CFStringRef     = *const c_void;
+    type CFURLRef        = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CGImageSourceRef= *const c_void;
+    type CGImageRef      = *const c_void;
+    type CGColorSpaceRef = *const c_void;
+    type CGContextRef    = *const c_void;
+
+    // CGRect as used by CGContextDrawImage (origin + size, all f64 on 64-bit macOS).
+    #[repr(C)]
+    struct CGRect { x: f64, y: f64, width: f64, height: f64 }
+
+    // Bitmap format: kCGBitmapByteOrder32Big (4<<12) | kCGImageAlphaPremultipliedFirst (2)
+    // → [A, R, G, B] in memory per pixel.  Photos are opaque so premul == plain RGB.
+    const BITMAP_INFO: u32 = (4 << 12) | 2;
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const CF_URL_POSIX_PATH_STYLE: i32 = 0;
+    const CF_NUMBER_SINT32_TYPE:   i32 = 3;
+
+    #[allow(non_upper_case_globals)]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFAllocatorDefault: CFTypeRef;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFStringCreateWithCString(alloc: CFTypeRef, c_str: *const std::os::raw::c_char, encoding: u32) -> CFStringRef;
+        fn CFURLCreateWithFileSystemPath(alloc: CFTypeRef, path: CFStringRef, style: i32, is_dir: bool) -> CFURLRef;
+        fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFNumberGetValue(num: CFTypeRef, the_type: i32, value_ptr: *mut c_void) -> bool;
+    }
+
+    #[allow(non_upper_case_globals)]
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageSourceCreateWithURL(url: CFURLRef, options: CFDictionaryRef) -> CGImageSourceRef;
+        fn CGImageSourceCreateImageAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) -> CGImageRef;
+        fn CGImageSourceCopyPropertiesAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) -> CFDictionaryRef;
+        static kCGImagePropertyOrientation: CFStringRef;
+    }
+
+    #[allow(non_upper_case_globals)]
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGImageGetWidth(image: CGImageRef) -> usize;
+        fn CGImageGetHeight(image: CGImageRef) -> usize;
+        fn CGImageRelease(image: CGImageRef);
+        fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
+        fn CGColorSpaceRelease(space: CGColorSpaceRef);
+        fn CGBitmapContextCreate(
+            data: *mut c_void, width: usize, height: usize,
+            bits_per_component: usize, bytes_per_row: usize,
+            space: CGColorSpaceRef, bitmap_info: u32,
+        ) -> CGContextRef;
+        fn CGContextRelease(ctx: CGContextRef);
+        fn CGContextTranslateCTM(ctx: CGContextRef, tx: f64, ty: f64);
+        fn CGContextScaleCTM(ctx: CGContextRef, sx: f64, sy: f64);
+        fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
+        static kCGColorSpaceSRGB: CFStringRef;
+    }
+
+    pub fn decode(path: &std::path::Path) -> Result<DynamicImage> {
+        let path_str = path.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?;
+        let c_path = CString::new(path_str).map_err(|_| anyhow!("null byte in path"))?;
+        unsafe { decode_raw(&c_path, path_str) }
+    }
+
+    #[allow(non_upper_case_globals)]
+    unsafe fn decode_raw(c_path: &CString, path_str: &str) -> Result<DynamicImage> {
+        use std::ptr::null;
+
+        // 1. Build a CFURL from the file-system path.
+        let cf_str = CFStringCreateWithCString(kCFAllocatorDefault, c_path.as_ptr(), CF_STRING_ENCODING_UTF8);
+        if cf_str.is_null() { return Err(anyhow!("CFStringCreateWithCString failed")); }
+        let url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, cf_str, CF_URL_POSIX_PATH_STYLE, false);
+        CFRelease(cf_str);
+        if url.is_null() { return Err(anyhow!("CFURLCreateWithFileSystemPath failed")); }
+
+        // 2. Open the HEIC through ImageIO.
+        let src = CGImageSourceCreateWithURL(url, null());
+        CFRelease(url);
+        if src.is_null() { return Err(anyhow!("cannot open HEIC: {path_str}")); }
+
+        // 3. Read the EXIF orientation tag before we decode pixels (default 1 = upright).
+        let orientation: u32 = {
+            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, null());
+            let mut v: i32 = 1;
+            if !props.is_null() {
+                let val = CFDictionaryGetValue(props, kCGImagePropertyOrientation as CFTypeRef);
+                if !val.is_null() {
+                    CFNumberGetValue(val, CF_NUMBER_SINT32_TYPE, &mut v as *mut i32 as *mut c_void);
+                }
+                CFRelease(props);
+            }
+            v.clamp(1, 8) as u32
+        };
+
+        // 4. Decode the primary image at full resolution (no auto-rotation here).
+        let cg_img = CGImageSourceCreateImageAtIndex(src, 0, null());
+        CFRelease(src);
+        if cg_img.is_null() { return Err(anyhow!("HEIC decode failed: {path_str}")); }
+
+        let width  = CGImageGetWidth(cg_img);
+        let height = CGImageGetHeight(cg_img);
+        if width == 0 || height == 0 {
+            CGImageRelease(cg_img);
+            return Err(anyhow!("zero-size HEIC: {path_str}"));
+        }
+
+        // 5. Create an sRGB CGBitmapContext backed by a Vec<u8> we own.
+        //    Drawing a Display-P3 source into an sRGB context performs the
+        //    gamut conversion automatically — prevents oversaturation.
+        let srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if srgb.is_null() {
+            CGImageRelease(cg_img);
+            return Err(anyhow!("failed to create sRGB color space"));
+        }
+        let bytes_per_row = width * 4;
+        let mut buf = vec![0u8; bytes_per_row * height];
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr() as *mut c_void,
+            width, height, 8, bytes_per_row, srgb, BITMAP_INFO,
+        );
+        CGColorSpaceRelease(srgb);
+        if ctx.is_null() {
+            CGImageRelease(cg_img);
+            return Err(anyhow!("CGBitmapContextCreate failed"));
+        }
+
+        // 6. CG bitmap contexts origin is bottom-left; flip the CTM so that
+        //    row 0 of the drawn pixels maps to row 0 (top) of our buffer.
+        CGContextTranslateCTM(ctx, 0.0, height as f64);
+        CGContextScaleCTM(ctx, 1.0, -1.0);
+        CGContextDrawImage(ctx, CGRect { x: 0.0, y: 0.0, width: width as f64, height: height as f64 }, cg_img);
+        // Releasing the context does NOT free buf — we supplied the data pointer.
+        CGContextRelease(ctx);
+        CGImageRelease(cg_img);
+
+        // 7. buf holds [A,R,G,B] per pixel.  Extract RGB (alpha is always 255 for photos).
+        let rgb: Vec<u8> = buf.chunks_exact(4).flat_map(|p| [p[1], p[2], p[3]]).collect();
+        let rgb_img = RgbImage::from_raw(width as u32, height as u32, rgb)
+            .ok_or_else(|| anyhow!("buffer size mismatch"))?;
+        let mut img = DynamicImage::ImageRgb8(rgb_img);
+
+        // 8. Apply the EXIF orientation so the caller always receives an upright image.
+        img.apply_orientation(exif_to_orientation(orientation));
+        Ok(img)
+    }
+
+    fn exif_to_orientation(v: u32) -> Orientation {
+        Orientation::from_exif(v as u8).unwrap_or(Orientation::NoTransforms)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_heic(path: &Path) -> Result<DynamicImage> {
+    macos_heic::decode(path)
+}
+
+// ── non-macOS: fall back to bundled libheif ───────────────────────────────────
+
 /// Decode a HEIC/HEIF file using libheif and copy its interleaved RGB plane into
 /// an `image::RgbImage` (handling row stride, which is often wider than width).
+#[cfg(not(target_os = "macos"))]
 fn decode_heic(path: &Path) -> Result<DynamicImage> {
+    use anyhow::anyhow;
     use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
     let lib = LibHeif::new();
