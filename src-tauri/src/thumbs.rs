@@ -354,7 +354,7 @@ fn decode_oriented(path: &Path) -> Result<DynamicImage> {
 #[cfg(target_os = "macos")]
 mod macos_heic {
     use anyhow::{anyhow, Result};
-    use image::{metadata::Orientation, DynamicImage, RgbImage};
+    use image::{DynamicImage, RgbImage};
     use std::ffi::{c_void, CString};
 
     // Opaque pointer types for CF/CG objects.
@@ -376,26 +376,39 @@ mod macos_heic {
     const BITMAP_INFO: u32 = (4 << 12) | 2;
     const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const CF_URL_POSIX_PATH_STYLE: i32 = 0;
-    const CF_NUMBER_SINT32_TYPE:   i32 = 3;
 
     #[allow(non_upper_case_globals)]
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         static kCFAllocatorDefault: CFTypeRef;
+        static kCFBooleanTrue: CFTypeRef;
+        // kCFTypeDictionaryKey/ValueCallBacks are C structs; we only ever pass
+        // their address, so an opaque u8 placeholder is enough.
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
         fn CFRelease(cf: CFTypeRef);
         fn CFStringCreateWithCString(alloc: CFTypeRef, c_str: *const std::os::raw::c_char, encoding: u32) -> CFStringRef;
         fn CFURLCreateWithFileSystemPath(alloc: CFTypeRef, path: CFStringRef, style: i32, is_dir: bool) -> CFURLRef;
-        fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
-        fn CFNumberGetValue(num: CFTypeRef, the_type: i32, value_ptr: *mut c_void) -> bool;
+        fn CFDictionaryCreate(
+            alloc: CFTypeRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: isize,
+            key_callbacks: *const u8,
+            value_callbacks: *const u8,
+        ) -> CFDictionaryRef;
     }
 
     #[allow(non_upper_case_globals)]
     #[link(name = "ImageIO", kind = "framework")]
     extern "C" {
         fn CGImageSourceCreateWithURL(url: CFURLRef, options: CFDictionaryRef) -> CGImageSourceRef;
-        fn CGImageSourceCreateImageAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) -> CGImageRef;
-        fn CGImageSourceCopyPropertiesAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) -> CFDictionaryRef;
-        static kCGImagePropertyOrientation: CFStringRef;
+        // CreateThumbnail + WithTransform is the only API that consistently applies
+        // ALL HEIC orientation mechanisms (EXIF tag AND the container irot box).
+        // Without ThumbnailMaxPixelSize it decodes at the full image resolution.
+        fn CGImageSourceCreateThumbnailAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) -> CGImageRef;
+        static kCGImageSourceCreateThumbnailFromImageAlways: CFStringRef;
+        static kCGImageSourceCreateThumbnailWithTransform: CFStringRef;
     }
 
     #[allow(non_upper_case_globals)]
@@ -440,23 +453,33 @@ mod macos_heic {
         CFRelease(url);
         if src.is_null() { return Err(anyhow!("cannot open HEIC: {path_str}")); }
 
-        // 3. Read the EXIF orientation tag before we decode pixels (default 1 = upright).
-        let orientation: u32 = {
-            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, null());
-            let mut v: i32 = 1;
-            if !props.is_null() {
-                let val = CFDictionaryGetValue(props, kCGImagePropertyOrientation as CFTypeRef);
-                if !val.is_null() {
-                    CFNumberGetValue(val, CF_NUMBER_SINT32_TYPE, &mut v as *mut i32 as *mut c_void);
-                }
-                CFRelease(props);
-            }
-            v.clamp(1, 8) as u32
+        // 3. Build decode options:
+        //    - CreateThumbnailFromImageAlways: decode full image data, not an embedded thumb.
+        //    - CreateThumbnailWithTransform: let ImageIO apply ALL orientation info (EXIF tag
+        //      AND the HEIC container's irot box) exactly once.
+        //    Without ThumbnailMaxPixelSize the output is full-resolution.
+        let opts = {
+            let keys: [CFTypeRef; 2] = [
+                kCGImageSourceCreateThumbnailFromImageAlways as CFTypeRef,
+                kCGImageSourceCreateThumbnailWithTransform as CFTypeRef,
+            ];
+            let vals: [CFTypeRef; 2] = [kCFBooleanTrue, kCFBooleanTrue];
+            CFDictionaryCreate(
+                kCFAllocatorDefault,
+                keys.as_ptr(), vals.as_ptr(), 2,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
         };
+        if opts.is_null() {
+            CFRelease(src);
+            return Err(anyhow!("CFDictionaryCreate failed"));
+        }
 
-        // 4. Decode the primary image at full resolution (no auto-rotation here).
-        let cg_img = CGImageSourceCreateImageAtIndex(src, 0, null());
+        // 4. Decode: full-resolution, orientation already applied by ImageIO.
+        let cg_img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
         CFRelease(src);
+        CFRelease(opts);
         if cg_img.is_null() { return Err(anyhow!("HEIC decode failed: {path_str}")); }
 
         let width  = CGImageGetWidth(cg_img);
@@ -495,19 +518,11 @@ mod macos_heic {
         CGContextRelease(ctx);
         CGImageRelease(cg_img);
 
-        // 7. buf holds [A,R,G,B] per pixel.  Extract RGB (alpha is always 255 for photos).
+        // 7. buf holds [A,R,G,B] per pixel. Extract RGB (alpha is always 255 for photos).
         let rgb: Vec<u8> = buf.chunks_exact(4).flat_map(|p| [p[1], p[2], p[3]]).collect();
         let rgb_img = RgbImage::from_raw(width as u32, height as u32, rgb)
             .ok_or_else(|| anyhow!("buffer size mismatch"))?;
-        let mut img = DynamicImage::ImageRgb8(rgb_img);
-
-        // 8. Apply the EXIF orientation so the caller always receives an upright image.
-        img.apply_orientation(exif_to_orientation(orientation));
-        Ok(img)
-    }
-
-    fn exif_to_orientation(v: u32) -> Orientation {
-        Orientation::from_exif(v as u8).unwrap_or(Orientation::NoTransforms)
+        Ok(DynamicImage::ImageRgb8(rgb_img))
     }
 }
 
