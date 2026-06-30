@@ -16,6 +16,7 @@ import {
   getFacesInPhoto,
   getPhotoDetail,
   ignoreFaces,
+  mergeClusters,
   nameCluster,
   photoUrl,
   reassignFacesToCluster,
@@ -69,9 +70,12 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
 
   const [faces, setFaces] = useState<PhotoFace[]>([]);
   const [rect, setRect] = useState<ContentRect | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [openFace, setOpenFace] = useState<number | null>(null);
   const [people, setPeople] = useState<Cluster[]>([]);
-  const [undo, setUndo] = useState<{ tok: CorrectionUndo; label: string } | null>(null);
+  // A toast for the last correction. `onUndo` is null for actions we don't reverse
+  // (cluster merges, matching the People grid — re-split via the grid if needed).
+  const [undo, setUndo] = useState<{ label: string; onUndo: (() => void) | null } | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const undoTimer = useRef<number | undefined>(undefined);
@@ -137,6 +141,7 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     const img = imgRef.current;
     const stage = stageRef.current;
     if (!img || !stage) return;
+    setStageSize({ width: stage.clientWidth, height: stage.clientHeight });
     const cr = contentRectOf(img);
     if (!cr) return;
     const ir = img.getBoundingClientRect();
@@ -159,34 +164,69 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     if (id != null) getFacesInPhoto(id).then(setFaces).catch(() => {});
   }, [id]);
 
-  // Apply a correction to one face, refresh the overlay, and offer Undo.
+  const flashUndo = useCallback((label: string, onUndo: (() => void) | null) => {
+    setUndo({ label, onUndo });
+    if (undoTimer.current) window.clearTimeout(undoTimer.current);
+    undoTimer.current = window.setTimeout(() => setUndo(null), 6000);
+  }, []);
+  const afterChange = useCallback(() => {
+    refreshFaces();
+    onCorrection?.();
+  }, [refreshFaces, onCorrection]);
+
+  // A face-level correction (reassign / ignore) — reversible via its undo token.
   const applyToFace = useCallback(
     async (run: () => Promise<CorrectionUndo>, label: string) => {
       setOpenFace(null);
       try {
         const tok = await run();
-        setUndo({ tok, label });
-        if (undoTimer.current) window.clearTimeout(undoTimer.current);
-        undoTimer.current = window.setTimeout(() => setUndo(null), 6000);
-        refreshFaces();
-        onCorrection?.();
+        flashUndo(label, () => undoCorrection(tok).then(afterChange).catch(() => {}));
+        afterChange();
       } catch {
         /* leave the overlay as-is on failure */
       }
     },
-    [refreshFaces, onCorrection],
+    [flashUndo, afterChange],
+  );
+
+  // Cluster-level: name this person, or merge their group into an existing person —
+  // the unified "identify this unnamed face" flow (mirrors the People grid).
+  const nameThisPerson = useCallback(
+    async (face: PhotoFace, name: string) => {
+      setOpenFace(null);
+      if (face.cluster_id == null || !name) return;
+      const prev = face.name ?? "";
+      try {
+        await nameCluster(face.cluster_id, name);
+        flashUndo(`Named ${name}`, () =>
+          nameCluster(face.cluster_id!, prev).then(afterChange).catch(() => {}),
+        );
+        afterChange();
+      } catch {
+        /* no-op */
+      }
+    },
+    [flashUndo, afterChange],
+  );
+  const mergeThisPerson = useCallback(
+    async (face: PhotoFace, target: Cluster) => {
+      setOpenFace(null);
+      if (face.cluster_id == null) return;
+      try {
+        await mergeClusters(target.cluster_id, face.cluster_id);
+        flashUndo(`Merged into ${target.name}`, null); // a merge isn't cleanly reversible
+        afterChange();
+      } catch {
+        /* no-op */
+      }
+    },
+    [flashUndo, afterChange],
   );
 
   const doUndo = () => {
-    if (!undo) return;
-    const tok = undo.tok;
+    const fn = undo?.onUndo;
     setUndo(null);
-    undoCorrection(tok)
-      .then(() => {
-        refreshFaces();
-        onCorrection?.();
-      })
-      .catch(() => {});
+    fn?.();
   };
 
   const when = detail ? formatWhen(detail.timestamp) : "";
@@ -274,8 +314,9 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
                   <FaceMenu
                     face={f}
                     people={people}
-                    anchor={box}
-                    onName={(name) => applyToFace(() => nameClusterUndo(f, name), name ? `Named ${name}` : "Name cleared")}
+                    placement={menuPlacement(box, stageSize)}
+                    onNamePerson={(name) => nameThisPerson(f, name)}
+                    onMergePerson={(target) => mergeThisPerson(f, target)}
                     onReassignExisting={(target) =>
                       applyToFace(
                         () => reassignFacesToCluster([f.face_id], f.cluster_id!, target.cluster_id),
@@ -300,9 +341,11 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       {undo && (
         <div className="undo-toast">
           <span>{undo.label}</span>
-          <button className="undo-btn" onClick={doUndo}>
-            Undo
-          </button>
+          {undo.onUndo && (
+            <button className="undo-btn" onClick={doUndo}>
+              Undo
+            </button>
+          )}
         </div>
       )}
 
@@ -316,23 +359,31 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   );
 }
 
-// Naming a cluster doesn't itself return an undo token, but the menu funnels every
-// action through `applyToFace`'s undo path. We wrap it to satisfy that shape: a
-// name change is its own undo (re-applying the prior name), so we record nothing
-// reversible here and return an empty token. (Rename is rare and low-stakes; a full
-// name-history undo isn't worth the complexity.)
-async function nameClusterUndo(face: PhotoFace, name: string): Promise<CorrectionUndo> {
-  if (face.cluster_id != null) await nameCluster(face.cluster_id, name);
-  return { prior: [], new_cluster_id: null, added_cannot_link: null };
+// Where to anchor a face's menu so it stays on-screen: below the box by default,
+// flipped above when there isn't room, and clamped horizontally to the stage.
+type Placement = { left: number; top: number } | { left: number; bottom: number };
+const MENU_W = 232;
+const MENU_H = 300; // generous estimate incl. the matches list
+function menuPlacement(box: ContentRect, stage: { width: number; height: number }): Placement {
+  const left = Math.max(8, Math.min(box.left, stage.width - MENU_W - 8));
+  const below = stage.height - (box.top + box.height);
+  if (below >= MENU_H || below >= box.top) {
+    return { left, top: box.top + box.height + 6 };
+  }
+  return { left, bottom: stage.height - box.top + 6 };
 }
 
-// The popover for one face: name / rename, "this is someone else" (reassign to an
-// existing or new person), or ignore. Mirrors the person-page affordances.
+// The popover for one face. For an UNNAMED person it's a single combobox — type a
+// new name (names this person), or pick an existing person (merges into them) — so
+// the user never has to remember whether they've named someone before. For a NAMED
+// person the scopes differ (rename the person vs. move just this face), so those
+// stay as distinct actions.
 function FaceMenu({
   face,
   people,
-  anchor,
-  onName,
+  placement,
+  onNamePerson,
+  onMergePerson,
   onReassignExisting,
   onReassignNew,
   onIgnore,
@@ -340,46 +391,79 @@ function FaceMenu({
 }: {
   face: PhotoFace;
   people: Cluster[];
-  anchor: ContentRect;
-  onName: (name: string) => void;
+  placement: Placement;
+  onNamePerson: (name: string) => void;
+  onMergePerson: (target: Cluster) => void;
   onReassignExisting: (target: Cluster) => void;
   onReassignNew: (name?: string) => void;
   onIgnore: () => void;
   onClose: () => void;
 }) {
-  const [mode, setMode] = useState<"root" | "name" | "move">("root");
+  const unnamed = face.name == null;
+  // For an unnamed face we open straight into the combobox; for a named one we start
+  // at the action menu and drop into "rename" or "move just this face" on demand.
+  const [mode, setMode] = useState<"root" | "name" | "move">(unnamed ? "name" : "root");
   const [draft, setDraft] = useState("");
 
+  const q = draft.trim().toLowerCase();
   const matches = people
     .filter((c) => c.cluster_id !== face.cluster_id && c.name)
-    .filter((c) => (draft.trim() ? c.name!.toLowerCase().includes(draft.trim().toLowerCase()) : true))
+    .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
     .slice(0, 6);
-
-  // Anchor the menu just below the face box.
-  const style = { left: anchor.left, top: anchor.top + anchor.height + 6 };
+  const exact = q ? people.find((c) => c.name && c.name.toLowerCase() === q) : undefined;
 
   return (
-    <div className="face-menu" style={style} onClick={(e) => e.stopPropagation()}>
-      {mode === "root" && (
+    <div className="face-menu" style={placement} onClick={(e) => e.stopPropagation()}>
+      {/* Unnamed: one unified "name or pick a person" combobox. */}
+      {unnamed && (
+        <div className="fm-move">
+          <input
+            className="pname-input fm-input"
+            autoFocus
+            value={draft}
+            placeholder="Name, or pick a person"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") onClose();
+              else if (e.key === "Enter" && q) (exact ? onMergePerson(exact) : onNamePerson(draft.trim()));
+            }}
+          />
+          <ul className="fm-matches">
+            {matches.map((m) => (
+              <li key={m.cluster_id} className="fm-match" onClick={() => onMergePerson(m)}>
+                <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                <span className="ns-name">{m.name}</span>
+              </li>
+            ))}
+            {draft.trim() && !exact && (
+              <li className="fm-match fm-new" onClick={() => onNamePerson(draft.trim())}>
+                + Name “{draft.trim()}”
+              </li>
+            )}
+            <li className="fm-match danger" onClick={onIgnore}>
+              Ignore this face
+            </li>
+          </ul>
+        </div>
+      )}
+
+      {/* Named: rename the person, move just this face, or ignore. */}
+      {!unnamed && mode === "root" && (
         <>
-          <div className="fm-head">{face.name ?? "Unnamed person"}</div>
-          {face.cluster_id != null && (
-            <>
-              <button className="fm-item" onClick={() => { setDraft(face.name ?? ""); setMode("name"); }}>
-                {face.name ? "Rename" : "Add a name"}
-              </button>
-              <button className="fm-item" onClick={() => { setDraft(""); setMode("move"); }}>
-                This is someone else…
-              </button>
-            </>
-          )}
+          <div className="fm-head">{face.name}</div>
+          <button className="fm-item" onClick={() => { setDraft(face.name ?? ""); setMode("name"); }}>
+            Rename
+          </button>
+          <button className="fm-item" onClick={() => { setDraft(""); setMode("move"); }}>
+            This is someone else…
+          </button>
           <button className="fm-item danger" onClick={onIgnore}>
             Ignore this face
           </button>
         </>
       )}
 
-      {mode === "name" && (
+      {!unnamed && mode === "name" && (
         <input
           className="pname-input fm-input"
           autoFocus
@@ -387,14 +471,14 @@ function FaceMenu({
           placeholder="Name"
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") onName(draft.trim());
+            if (e.key === "Enter") onNamePerson(draft.trim());
             else if (e.key === "Escape") setMode("root");
           }}
-          onBlur={() => onName(draft.trim())}
+          onBlur={() => onNamePerson(draft.trim())}
         />
       )}
 
-      {mode === "move" && (
+      {!unnamed && mode === "move" && (
         <div className="fm-move">
           <input
             className="pname-input fm-input"

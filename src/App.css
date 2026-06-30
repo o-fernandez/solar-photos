@@ -1114,6 +1114,15 @@ body,
   border-top: 1px solid #eee;
   margin-top: 2px;
 }
+.fm-match.danger {
+  font-size: 13px;
+  color: #c0392b;
+  border-top: 1px solid #eee;
+  margin-top: 2px;
+}
+.fm-match.danger:hover {
+  background: #fdeceb;
+}
 .fm-close {
   position: absolute;
   top: 4px;
