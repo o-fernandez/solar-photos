@@ -181,20 +181,18 @@ function App() {
 
   // One indicator for all background work: thumbnails first (the grid needs them),
   // then face-scanning, then nothing. Drives the single hairline under the bar.
+  // The phase + counts live in the hover chip, so the line itself stays one calm,
+  // warm color (the meaning comes from the label, not from a color the user has
+  // to decode).
   const activity =
     total > 0 && ready < total
-      ? {
-          frac: ready / total,
-          kind: "thumbs" as const,
-          label: `Loading photos · ${ready.toLocaleString()} of ${total.toLocaleString()}`,
-        }
+      ? { frac: ready / total, phase: "Preparing photos", done: ready, of: total }
       : faceEligible > 0 && faceScanned < faceEligible
-        ? {
-            frac: faceScanned / faceEligible,
-            kind: "faces" as const,
-            label: `Finding people · ${faceScanned.toLocaleString()} of ${faceEligible.toLocaleString()}`,
-          }
+        ? { frac: faceScanned / faceEligible, phase: "Finding people", done: faceScanned, of: faceEligible }
         : null;
+  const activityLabel = activity
+    ? `${activity.phase} · ${activity.done.toLocaleString()} of ${activity.of.toLocaleString()} · ${Math.round(activity.frac * 100)}%`
+    : "";
 
   return (
     <div className="app">
@@ -294,14 +292,17 @@ function App() {
           </div>
         </div>
       </header>
-      <div className="hairline">
+      <div className={`hairline${activity ? " active" : ""}`}>
         {activity && (
-          <div
-            className={`hairline-fill ${activity.kind}`}
-            style={{ width: `${Math.round(activity.frac * 100)}%` }}
-            title={activity.label}
-            aria-label={activity.label}
-          />
+          <>
+            <div
+              className="hairline-fill"
+              style={{ width: `${Math.round(activity.frac * 100)}%` }}
+            />
+            <div className="hairline-tip" role="status">
+              {activityLabel}
+            </div>
+          </>
         )}
       </div>
 

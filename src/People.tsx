@@ -120,10 +120,6 @@ export default function People({
   // condition the backend uses to gate merge prompts (suggestions_ready).
   const sweeping = !!faceProg && faceProg.eligible > 0 && faceProg.scanned < faceProg.eligible;
   const inProgress = reorganizing || sweeping;
-  const sweepPct =
-    faceProg && faceProg.eligible > 0
-      ? Math.floor((faceProg.scanned / faceProg.eligible) * 100)
-      : 0;
 
   // Named/confirmed people always show. Mid-sweep, unnamed clusters must clear a
   // high bar (large = reliably real); the rest stays hidden behind the readout.
@@ -253,9 +249,11 @@ export default function People({
       {reorganizing ? (
         <div className="reorg-banner">Reorganizing people…</div>
       ) : sweeping ? (
-        <div className="reorg-banner">
-          Finding people… {sweepPct}% — named people and large groups show now; the
-          rest appears once your library finishes scanning.
+        <div className="reorg-banner people-banner">
+          <span className="pb-title">Still finding people</span>
+          <span className="pb-sub">
+            The ones we’re sure of are here — more arrive as your library finishes scanning.
+          </span>
         </div>
       ) : null}
       {grow && (
@@ -319,8 +317,7 @@ export default function People({
         <div className="people-grid">{visible.map(renderTile)}</div>
       ) : sweeping ? (
         <p className="muted">
-          Still finding people — named people and large groups will appear here as
-          your library is scanned.
+          Finding your people — the first will show up here as your library is scanned.
         </p>
       ) : null}
 
