@@ -5,7 +5,7 @@
 // fold over-split groups back together. Loads on mount (i.e. each time you open
 // the tab) and after every action, so it reflects the current clustering.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PersonView from "./PersonView";
 import {
   absorbClusters,
@@ -33,6 +33,7 @@ import {
 // in a "more" section (over-splitting leaves a real tail the magnet folds back in).
 const SWEEP_FLOOR = 8; // min photos for an *unnamed* cluster to show mid-sweep
 const SETTLED_FLOOR = 2; // below this, settled clusters move to the "more" section
+const MID_SWEEP_REFRESH_MS = 20_000; // how often to re-pull the grid while scanning
 
 export default function People() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
@@ -51,6 +52,11 @@ export default function People() {
   const [faceProg, setFaceProg] = useState<FaceProgress | null>(null);
   // Whether the settled "more" (small/singleton) section is expanded.
   const [showMore, setShowMore] = useState(false);
+  // Latest `editing` + last mid-sweep reload time, read inside the progress
+  // subscription without making it re-subscribe on every keystroke.
+  const editingRef = useRef<number | null>(editing);
+  editingRef.current = editing;
+  const lastReloadRef = useRef(0);
 
   const reload = useCallback(() => {
     getClusters().then(setClusters).catch(() => {});
@@ -75,17 +81,32 @@ export default function People() {
     };
   }, [reload]);
 
-  // Track sweep progress so the grid knows when the library has settled. We read
-  // once on mount, then follow the live stream. We deliberately do NOT reload the
-  // grid on every tick — only the *displayed* subset of the existing snapshot
-  // changes — so the tiles don't reflow as faces trickle in (Principle 2).
+  // Track sweep progress so the grid knows when the library has settled, and
+  // surface newly-qualified people as scanning proceeds instead of freezing the
+  // grid until 100%. We re-pull the grid at most once per MID_SWEEP_REFRESH_MS so
+  // the long tail of per-photo ticks doesn't reflow constantly (Principle 2) — and
+  // the `count >= SWEEP_FLOOR` floor keeps each refresh additive: only confident,
+  // real-sized clusters appear, never the singleton churn. Skipped while you're
+  // naming someone, so a refresh never yanks the input out from under you.
   useEffect(() => {
     getFaceProgress().then(setFaceProg).catch(() => {});
-    const un = onFaceProgress(setFaceProg);
+    const un = onFaceProgress((p) => {
+      setFaceProg(p);
+      const stillSweeping = p.eligible > 0 && p.scanned < p.eligible;
+      const now = Date.now();
+      if (
+        stillSweeping &&
+        editingRef.current === null &&
+        now - lastReloadRef.current > MID_SWEEP_REFRESH_MS
+      ) {
+        lastReloadRef.current = now;
+        reload();
+      }
+    });
     return () => {
       un.then((f) => f());
     };
-  }, []);
+  }, [reload]);
 
   // "Still working" = a re-cluster is running, or the sweep hasn't caught up. Same
   // condition the backend uses to gate merge prompts (suggestions_ready).
