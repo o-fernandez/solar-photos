@@ -98,10 +98,6 @@ rules that govern every feature — *the user's place is sacred* — live in
 
 - **Node.js** 18+ and npm
 - **Rust** (stable) — <https://rustup.rs>
-- **libheif** (for HEIC) and **pkg-config**, e.g. on macOS:
-  ```sh
-  brew install libheif pkg-config
-  ```
 
 ### Run it (development)
 
@@ -137,11 +133,6 @@ Drag `Solar.app` into `/Applications` (or open the `.dmg`). Then:
 - **Upgrading:** after code changes, `npm run tauri build` again and drag the new
   `Solar.app` over the old one.
 
-> **Portability caveat:** the app links Homebrew's `libheif` at
-> `/opt/homebrew/opt/libheif`. It runs fine on the machine you built it on, but
-> the `.app` is **not yet self-contained** — copied to a Mac without Homebrew +
-> libheif, HEIC support (and possibly launch) would fail. Bundling that dylib is
-> a packaging task to do before distributing to others.
 
 ## Architecture at a glance
 
@@ -150,7 +141,7 @@ Drag `Solar.app` into `/Applications` (or open the `.dmg`). Then:
 | Streaming folder scan | `src-tauri/src/scan.rs` | Metadata only (path/size/mtime); no decode. Detects cloud-only files. Fast at 100k. |
 | EXIF capture date | `src-tauri/src/meta.rs` | Reads DateTimeOriginal — only from local files (never forces a cloud download). |
 | Database | `src-tauri/src/db.rs` | SQLite (WAL). Source of truth: photos, roots, dates, thumbnail status. |
-| Thumbnail + preview pipeline | `src-tauri/src/thumbs.rs` | Priority queue + worker pools (local eager, cloud on-demand); orientation; HEIC via libheif. |
+| Thumbnail + preview pipeline | `src-tauri/src/thumbs.rs` | Priority queue + worker pools (local eager, cloud on-demand); orientation; HEIC via macOS ImageIO. |
 | Wiring / commands / `thumb://` protocol | `src-tauri/src/lib.rs` | Also serves viewer previews, runs the auto-rescan, and drives the face sweep. |
 | Face detection + embeddings | `src-tauri/src/faces.rs` | On-device YuNet detect + SFace embed on aligned crops. Nothing leaves the machine. |
 | People clustering + identities | `src-tauri/src/cluster.rs` | Purity-first clustering; durable identities that survive re-scans (must/cannot-link). |
