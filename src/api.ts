@@ -240,13 +240,78 @@ export function getPersonPhotos(clusterId: number): Promise<PhotoRow[]> {
   return invoke("get_person_photos", { clusterId });
 }
 
-/** "Not this person": detach their face(s) in one photo. Returns the affected
- *  face ids so the removal can be undone. */
-export function removePersonFace(photoId: number, clusterId: number): Promise<number[]> {
-  return invoke("remove_person_face", { photoId, clusterId });
+// --- Face corrections (reassign / ignore), shared by the person page and the
+// in-photo overlay. Every correction returns a CorrectionUndo for exact undo. ---
+
+/** A detected face within one photo, with the person it currently belongs to. */
+export interface PhotoFace {
+  face_id: number;
+  cluster_id: number | null;
+  name: string | null;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
 }
 
-/** Undo a "not this person": re-attach the given faces to the cluster. */
-export function restorePersonFaces(faceIds: number[], clusterId: number): Promise<void> {
-  return invoke("restore_person_faces", { faceIds, clusterId });
+/** A face's grouping before a correction — opaque to the UI, passed back to undo. */
+export interface FaceState {
+  face_id: number;
+  cluster_id: number | null;
+  identity_id: number | null;
+  ignored: boolean;
+}
+
+/** What a correction returns so it can be undone exactly. */
+export interface CorrectionUndo {
+  prior: FaceState[];
+  /** Set when the correction created a new person (so the UI can focus it). */
+  new_cluster_id: number | null;
+  added_cannot_link: [number, number] | null;
+}
+
+/** Faces detected in one photo (for the in-photo overlay), highest score first. */
+export function getFacesInPhoto(photoId: number): Promise<PhotoFace[]> {
+  return invoke("get_faces_in_photo", { photoId });
+}
+
+/** Resolve a person-page multi-selection (photo ids + the person's cluster) to
+ *  the face ids to act on. */
+export function faceIdsForPhotos(photoIds: number[], clusterId: number): Promise<number[]> {
+  return invoke("face_ids_for_photos", { photoIds, clusterId });
+}
+
+/** Reassign faces to an existing person (their cluster). Durable: must-links to the
+ *  target and cannot-links from the source so they never re-merge. */
+export function reassignFacesToCluster(
+  faceIds: number[],
+  sourceClusterId: number,
+  targetClusterId: number,
+): Promise<CorrectionUndo> {
+  return invoke("reassign_faces_to_cluster", { faceIds, sourceClusterId, targetClusterId });
+}
+
+/** Reassign faces to a brand-new person (optionally named). */
+export function reassignFacesToNewPerson(
+  faceIds: number[],
+  sourceClusterId: number,
+  name?: string,
+): Promise<CorrectionUndo> {
+  return invoke("reassign_faces_to_new_person", {
+    faceIds,
+    sourceClusterId,
+    name: name ?? null,
+  });
+}
+
+/** Ignore faces — drop them from People for good. */
+export function ignoreFaces(faceIds: number[]): Promise<CorrectionUndo> {
+  return invoke("ignore_faces", { faceIds });
+}
+
+/** Undo any correction with the token it returned. */
+export function undoCorrection(undo: CorrectionUndo): Promise<void> {
+  return invoke("undo_correction", {
+    undo: { prior: undo.prior, added_cannot_link: undo.added_cannot_link },
+  });
 }

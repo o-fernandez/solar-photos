@@ -144,12 +144,53 @@ fn embedding_matrix<T>(faces: &[(T, Vec<f32>)]) -> Array2<f32> {
     Array2::from_shape_vec((n, dim), data).expect("uniform embedding length")
 }
 
+/// Cannot-link constraints for a re-cluster: which face belongs to which durable
+/// identity, and which identity *pairs* the user has declared "not the same."
+/// Empty maps mean "no constraints" — the pure embedding clustering.
+#[derive(Default)]
+pub struct LinkConstraints {
+    /// `face_id -> identity_id` for every face the user has bound to an identity.
+    pub face_identity: std::collections::HashMap<i64, i64>,
+    /// Normalized `(lo, hi)` identity pairs that must never share a cluster.
+    pub cannot_link: std::collections::HashSet<(i64, i64)>,
+}
+
+impl LinkConstraints {
+    /// True iff joining two member sets — carrying identity sets `a` and `b` — is
+    /// allowed: no identity in `a` is cannot-linked with any identity in `b`. Both
+    /// sets are tiny (a cluster usually holds zero or one identity), so the nested
+    /// loop is cheap.
+    fn allows(&self, a: &std::collections::HashSet<i64>, b: &std::collections::HashSet<i64>) -> bool {
+        if self.cannot_link.is_empty() {
+            return true;
+        }
+        for &ia in a {
+            for &ib in b {
+                let key = if ia < ib { (ia, ib) } else { (ib, ia) };
+                if self.cannot_link.contains(&key) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 /// Re-cluster every face from scratch — order-independent, purity-biased.
 ///
 /// Input is `(face_id, embedding)`; output maps every input `face_id` to a new
 /// 1-based `cluster_id`. Pure (no DB, no globals) so it is unit-tested directly.
 /// `progress` reports a fraction in `[0, 1]` for the long kNN phase.
-pub fn recluster<F: FnMut(f32)>(faces: &[(i64, Vec<f32>)], mut progress: F) -> Vec<(i64, i64)> {
+///
+/// `constraints` carries the user's durable "not the same person" decisions: a
+/// merge that would put two cannot-linked identities in one cluster is refused,
+/// even when the embeddings would otherwise cluster them together (the only thing
+/// that keeps embedding-close strangers — e.g. two babies — apart for good).
+pub fn recluster<F: FnMut(f32)>(
+    faces: &[(i64, Vec<f32>)],
+    constraints: &LinkConstraints,
+    mut progress: F,
+) -> Vec<(i64, i64)> {
     let n = faces.len();
     if n == 0 {
         return Vec::new();
@@ -179,17 +220,34 @@ pub fn recluster<F: FnMut(f32)>(faces: &[(i64, Vec<f32>)], mut progress: F) -> V
 
     // Greedy complete-linkage agglomeration. `members[root]` is the face set of the
     // cluster rooted at `root`; two clusters merge only if all cross-pairs clear
-    // TAU_LINK, keeping every cluster a clique (pure by construction).
+    // TAU_LINK, keeping every cluster a clique (pure by construction). `ident_sets`
+    // tracks the durable identities present in each cluster so the cannot-link guard
+    // can refuse a merge that would co-locate two "not the same" people.
     let mut uf = UnionFind::new(n);
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    let mut ident_sets: Vec<std::collections::HashSet<i64>> = faces
+        .iter()
+        .map(|(fid, _)| {
+            let mut s = std::collections::HashSet::new();
+            if let Some(&id) = constraints.face_identity.get(fid) {
+                s.insert(id);
+            }
+            s
+        })
+        .collect();
     let total = edges.len().max(1);
     for (idx, &(_, a, b)) in edges.iter().enumerate() {
         let (ra, rb) = (uf.find(a), uf.find(b));
-        if ra != rb && complete_link(&mat, &members[ra], &members[rb]) {
+        if ra != rb
+            && constraints.allows(&ident_sets[ra], &ident_sets[rb])
+            && complete_link(&mat, &members[ra], &members[rb])
+        {
             // Fold the smaller set into the larger so root membership stays cheap.
             let (keep, gone) = if members[ra].len() >= members[rb].len() { (ra, rb) } else { (rb, ra) };
             let moved = std::mem::take(&mut members[gone]);
             members[keep].extend(moved);
+            let moved_idents = std::mem::take(&mut ident_sets[gone]);
+            ident_sets[keep].extend(moved_idents);
             uf.parent[gone] = keep;
         }
         if idx % 4096 == 0 {
@@ -485,7 +543,7 @@ mod tests {
         for (k, e) in blob(16, 8, 5).into_iter().enumerate() {
             faces.push((100 + k as i64, e));
         }
-        let a = recluster(&faces, |_| {});
+        let a = recluster(&faces, &LinkConstraints::default(), |_| {});
         // All of group A share one cluster; all of group B share another; distinct.
         let ca = cluster_of(&a, 0);
         let cb = cluster_of(&a, 100);
@@ -514,7 +572,7 @@ mod tests {
         bridge[8] = 0.72;
         faces.push((999, normalized(&bridge)));
 
-        let a = recluster(&faces, |_| {});
+        let a = recluster(&faces, &LinkConstraints::default(), |_| {});
         let ca = cluster_of(&a, 0);
         let cb = cluster_of(&a, 100);
         assert_ne!(ca, cb, "bridge must not chain the two blobs together");
@@ -532,8 +590,45 @@ mod tests {
         b[3] = 1.0;
         b[4] = 0.01;
         let faces = vec![(1i64, normalized(&a)), (2i64, normalized(&b))];
-        let asn = recluster(&faces, |_| {});
+        let asn = recluster(&faces, &LinkConstraints::default(), |_| {});
         assert_eq!(cluster_of(&asn, 1), cluster_of(&asn, 2));
+    }
+
+    #[test]
+    fn cannot_link_keeps_embedding_close_people_apart() {
+        // Two blobs on the SAME axis — embeddings so close that complete-linkage
+        // would normally fuse them into one cluster (the "two babies" case). Bound
+        // to different identities (1 and 2) with a cannot-link between them, they
+        // must stay in separate clusters; without the constraint they'd merge.
+        let dim = 16;
+        let mut faces = Vec::new();
+        for (k, e) in blob(dim, 0, 5).into_iter().enumerate() {
+            faces.push((k as i64, e)); // identity 1
+        }
+        for (k, e) in blob(dim, 0, 5).into_iter().enumerate() {
+            faces.push((100 + k as i64, e)); // identity 2
+        }
+
+        // Sanity: with no constraints these DO merge (proves the test is meaningful).
+        let free = recluster(&faces, &LinkConstraints::default(), |_| {});
+        assert_eq!(
+            cluster_of(&free, 0),
+            cluster_of(&free, 100),
+            "unconstrained, the two close blobs should merge — otherwise the test proves nothing",
+        );
+
+        let mut c = LinkConstraints::default();
+        for k in 0..5 {
+            c.face_identity.insert(k as i64, 1);
+            c.face_identity.insert(100 + k as i64, 2);
+        }
+        c.cannot_link.insert((1, 2));
+        let a = recluster(&faces, &c, |_| {});
+        assert_ne!(
+            cluster_of(&a, 0),
+            cluster_of(&a, 100),
+            "a cannot-link must keep the two identities in separate clusters",
+        );
     }
 
     #[test]

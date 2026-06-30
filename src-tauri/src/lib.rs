@@ -414,27 +414,129 @@ fn get_person_photos(
     db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
 }
 
-/// "Not this person": detach this person's face(s) in one photo. Returns the
-/// affected face ids so the frontend can offer an Undo.
+/// The faces detected in one photo, with the person each belongs to — backs the
+/// in-photo overlay (name / reassign / ignore per face).
 #[tauri::command]
-fn remove_person_face(
+fn get_faces_in_photo(
     state: tauri::State<'_, AppState>,
     photo_id: i64,
+) -> Result<Vec<db::PhotoFace>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::faces_in_photo(&conn, photo_id).map_err(|e| e.to_string())
+}
+
+/// Resolve a person-page multi-selection (photo ids + the person's cluster) to the
+/// actual face ids, so the frontend can hand them to reassign/ignore.
+#[tauri::command]
+fn face_ids_for_photos(
+    state: tauri::State<'_, AppState>,
+    photo_ids: Vec<i64>,
     cluster_id: i64,
 ) -> Result<Vec<i64>, String> {
     let conn = state.conn.lock().unwrap();
-    db::remove_person_face(&conn, photo_id, cluster_id).map_err(|e| e.to_string())
+    db::face_ids_in_photos_for_cluster(&conn, &photo_ids, cluster_id).map_err(|e| e.to_string())
 }
 
-/// Undo a "not this person": re-attach the given faces to the cluster.
+/// What a correction returns so it can be undone exactly: the faces' prior state,
+/// the new cluster id when a new person was created, and any cannot-link we added.
+#[derive(Clone, serde::Serialize)]
+struct CorrectionUndo {
+    prior: Vec<db::FaceState>,
+    new_cluster_id: Option<i64>,
+    added_cannot_link: Option<(i64, i64)>,
+}
+
+/// Reassign faces to an **existing** person (their cluster). Binds them to that
+/// person's identity (must-link) and records a cannot-link from the source person,
+/// so the move is durable and the two never re-merge (§4/§5 of the spec).
 #[tauri::command]
-fn restore_person_faces(
+fn reassign_faces_to_cluster(
     state: tauri::State<'_, AppState>,
     face_ids: Vec<i64>,
-    cluster_id: i64,
-) -> Result<(), String> {
+    source_cluster_id: i64,
+    target_cluster_id: i64,
+) -> Result<CorrectionUndo, String> {
+    let mut conn = state.conn.lock().unwrap();
+    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+    // Both sides become durable identities; record "not the same" between them.
+    let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
+    let target_id = db::ensure_identity_for_cluster(&conn, target_cluster_id).map_err(|e| e.to_string())?;
+    db::set_faces_person(&mut conn, &face_ids, target_cluster_id, target_id).map_err(|e| e.to_string())?;
+    let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
+    Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added })
+}
+
+/// Reassign faces to a **new** person (an optional name). Splits them into a fresh
+/// identity + cluster and cannot-links them from the source person.
+#[tauri::command]
+fn reassign_faces_to_new_person(
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+    source_cluster_id: i64,
+    name: Option<String>,
+) -> Result<CorrectionUndo, String> {
+    let mut conn = state.conn.lock().unwrap();
+    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+    let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
+    let new_cluster = db::next_cluster_id(&conn).map_err(|e| e.to_string())?;
+    // Mint the identity on the (empty) new cluster, then bind the faces to both —
+    // so the split person is a durable identity that survives the next re-cluster.
+    let new_id = db::ensure_identity_for_cluster(&conn, new_cluster).map_err(|e| e.to_string())?;
+    db::set_faces_person(&mut conn, &face_ids, new_cluster, new_id).map_err(|e| e.to_string())?;
+    if let Some(name) = name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        db::name_cluster(&conn, new_cluster, name).map_err(|e| e.to_string())?;
+    }
+    let added = record_cannot_link_if_new(&conn, source_id, new_id).map_err(|e| e.to_string())?;
+    Ok(CorrectionUndo { prior, new_cluster_id: Some(new_cluster), added_cannot_link: added })
+}
+
+/// Ignore faces (drop from People for good). Returns prior state for undo.
+#[tauri::command]
+fn ignore_faces(
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+) -> Result<CorrectionUndo, String> {
     let conn = state.conn.lock().unwrap();
-    db::restore_person_faces(&conn, &face_ids, cluster_id).map_err(|e| e.to_string())
+    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+    db::ignore_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
+    Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
+}
+
+/// Undo any correction: restore the faces' prior grouping and drop any cannot-link
+/// the correction added.
+#[tauri::command]
+fn undo_correction(
+    state: tauri::State<'_, AppState>,
+    undo: CorrectionUndoArg,
+) -> Result<(), String> {
+    let mut conn = state.conn.lock().unwrap();
+    db::restore_face_states(&mut conn, &undo.prior).map_err(|e| e.to_string())?;
+    if let Some((a, b)) = undo.added_cannot_link {
+        db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Inbound form of [`CorrectionUndo`] (the frontend hands back what a correction
+/// returned). `new_cluster_id` isn't needed to undo, so it's omitted.
+#[derive(serde::Deserialize)]
+struct CorrectionUndoArg {
+    prior: Vec<db::FaceState>,
+    added_cannot_link: Option<(i64, i64)>,
+}
+
+/// Record a cannot-link between two identities unless it already exists or they're
+/// the same identity. Returns the pair when newly added (so undo can remove it).
+fn record_cannot_link_if_new(
+    conn: &rusqlite::Connection,
+    a: i64,
+    b: i64,
+) -> anyhow::Result<Option<(i64, i64)>> {
+    if a == b || db::cannot_link_exists(conn, a, b)? {
+        return Ok(None);
+    }
+    db::add_cannot_link_ids(conn, a, b)?;
+    Ok(Some((a, b)))
 }
 
 /// A "same person?" suggestion: two clusters with several near-neighbor face pairs
@@ -755,10 +857,19 @@ fn run_recluster(app: AppHandle) {
             let old_names: HashMap<i64, String> = db::cluster_names_all(&conn)?.into_iter().collect();
             let old_fc = db::face_clusters(&conn)?;
 
+            // The user's durable "not the same person" decisions, enforced as hard
+            // constraints in the agglomeration: a merge that would co-locate two
+            // cannot-linked identities is refused, so embedding-close strangers
+            // (e.g. two babies) the user pulled apart never drift back together.
+            let constraints = cluster::LinkConstraints {
+                face_identity: db::face_identities(&conn)?.into_iter().collect(),
+                cannot_link: db::cannot_link_pairs(&conn)?.into_iter().collect(),
+            };
+
             // Throttle progress events to ~every 2% so we don't flood the channel.
             let app2 = app.clone();
             let mut last = 0.0f32;
-            let mut assignments = cluster::recluster(&faces, |f| {
+            let mut assignments = cluster::recluster(&faces, &constraints, |f| {
                 if f - last >= 0.02 || f >= 1.0 {
                     last = f;
                     let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
@@ -1324,8 +1435,12 @@ pub fn run() {
             recluster,
             cluster_debug,
             get_person_photos,
-            remove_person_face,
-            restore_person_faces
+            get_faces_in_photo,
+            face_ids_for_photos,
+            reassign_faces_to_cluster,
+            reassign_faces_to_new_person,
+            ignore_faces,
+            undo_correction
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

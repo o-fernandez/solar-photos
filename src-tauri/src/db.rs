@@ -110,6 +110,10 @@ pub fn init(conn: &Connection) -> Result<()> {
     // Migration for libraries created before identities existed.
     let _ = conn.execute("ALTER TABLE faces ADD COLUMN identity_id INTEGER", []);
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_faces_identity ON faces(identity_id);")?;
+    // `ignored` faces are excluded from People for good (a stranger, a poster, a
+    // reflection) — they keep cluster_id = NULL like a detach, but the flag marks
+    // the exclusion as intentional and permanent so the overlay never re-draws them.
+    let _ = conn.execute("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0", []);
     Ok(())
 }
 
@@ -486,6 +490,12 @@ pub fn named_identities(conn: &Connection) -> Result<Vec<(i64, String)>> {
 pub fn add_cannot_link(conn: &Connection, into: i64, from: i64) -> Result<()> {
     let a = ensure_identity_for_cluster(conn, into)?;
     let b = ensure_identity_for_cluster(conn, from)?;
+    add_cannot_link_ids(conn, a, b)
+}
+
+/// Record a cannot-link directly between two **identity** ids (a < b normalized).
+/// Used by reassign, where both identities already exist.
+pub fn add_cannot_link_ids(conn: &Connection, a: i64, b: i64) -> Result<()> {
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     conn.execute(
         "INSERT OR IGNORE INTO cannot_link (a, b) VALUES (?1, ?2)",
@@ -523,36 +533,190 @@ pub fn person_photos(conn: &Connection, cluster_id: i64) -> Result<Vec<PhotoRow>
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// "Not this person": detach this cluster's face(s) in one photo, which drops the
-/// photo from their set. Returns the affected face ids so the action can be undone.
-/// A NULL-cluster face is excluded from People and not re-clustered (the sweep only
-/// touches faces_scanned = 0), so the removal sticks short of a full rescan.
-pub fn remove_person_face(conn: &Connection, photo_id: i64, cluster_id: i64) -> Result<Vec<i64>> {
-    let ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM faces WHERE photo_id = ?1 AND cluster_id = ?2")?;
-        let rows = stmt.query_map(rusqlite::params![photo_id, cluster_id], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    conn.execute(
-        "UPDATE faces SET cluster_id = NULL WHERE photo_id = ?1 AND cluster_id = ?2",
-        rusqlite::params![photo_id, cluster_id],
-    )?;
-    Ok(ids)
+// ---------------------------------------------------------------------------
+// Face corrections — the shared primitive behind reassign / ignore, acting on a
+// set of face ids. The person page and the in-photo overlay differ only in how
+// they pick that set. Every correction touches `identity_id` (the durable
+// must-link), never just `cluster_id`, so it survives the next re-cluster.
+// ---------------------------------------------------------------------------
+
+/// A face within one photo, for the in-photo overlay: its id, bounding box, and
+/// the person it currently belongs to (cluster id + name, if named). Ignored
+/// faces are omitted — we excluded them on purpose, so we don't redraw them.
+#[derive(serde::Serialize)]
+pub struct PhotoFace {
+    pub face_id: i64,
+    pub cluster_id: Option<i64>,
+    pub name: Option<String>,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
 }
 
-/// Undo a "not this person": re-attach the given faces to the cluster.
-pub fn restore_person_faces(conn: &Connection, face_ids: &[i64], cluster_id: i64) -> Result<()> {
+pub fn faces_in_photo(conn: &Connection, photo_id: i64) -> Result<Vec<PhotoFace>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.cluster_id,
+                (SELECT name FROM cluster_names cn WHERE cn.cluster_id = f.cluster_id),
+                f.x1, f.y1, f.x2, f.y2
+         FROM faces f
+         WHERE f.photo_id = ?1 AND f.ignored = 0
+         ORDER BY f.score DESC",
+    )?;
+    let rows = stmt.query_map([photo_id], |r| {
+        Ok(PhotoFace {
+            face_id: r.get(0)?,
+            cluster_id: r.get(1)?,
+            name: r.get(2)?,
+            x1: r.get(3)?,
+            y1: r.get(4)?,
+            x2: r.get(5)?,
+            y2: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A face's grouping before a correction, captured so the action can be undone
+/// exactly — including whether it was ignored.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct FaceState {
+    pub face_id: i64,
+    pub cluster_id: Option<i64>,
+    pub identity_id: Option<i64>,
+    pub ignored: bool,
+}
+
+/// Build a SQL placeholder list (`?,?,…`) for an `IN (…)` clause.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+}
+
+/// Snapshot the current grouping of each face id, for undo.
+pub fn capture_face_states(conn: &Connection, face_ids: &[i64]) -> Result<Vec<FaceState>> {
+    if face_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id, cluster_id, identity_id, ignored FROM faces WHERE id IN ({})",
+        placeholders(face_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(face_ids.iter()), |r| {
+        Ok(FaceState {
+            face_id: r.get(0)?,
+            cluster_id: r.get(1)?,
+            identity_id: r.get(2)?,
+            ignored: r.get::<_, i64>(3)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Undo a correction: put each face back exactly where it was.
+pub fn restore_face_states(conn: &mut Connection, states: &[FaceState]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut up = tx.prepare(
+            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = ?3 WHERE id = ?4",
+        )?;
+        for s in states {
+            up.execute(rusqlite::params![s.cluster_id, s.identity_id, s.ignored as i64, s.face_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The face ids belonging to `cluster_id` within any of `photo_ids` — resolves a
+/// person-page multi-selection (one cell per photo) to the actual faces to act on.
+pub fn face_ids_in_photos_for_cluster(
+    conn: &Connection,
+    photo_ids: &[i64],
+    cluster_id: i64,
+) -> Result<Vec<i64>> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id FROM faces WHERE cluster_id = ?1 AND photo_id IN ({})",
+        placeholders(photo_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(photo_ids.len() + 1);
+    params.push(&cluster_id);
+    for id in photo_ids {
+        params.push(id);
+    }
+    let rows = stmt.query_map(params.as_slice(), |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Next free transient cluster id — for splitting faces off into a brand-new
+/// person before the next re-cluster re-numbers everything anyway.
+pub fn next_cluster_id(conn: &Connection) -> Result<i64> {
+    // MAX over an empty/all-NULL column yields a single NULL row, read as None.
+    let max: Option<i64> = conn.query_row("SELECT MAX(cluster_id) FROM faces", [], |r| r.get(0))?;
+    Ok(max.unwrap_or(0) + 1)
+}
+
+/// Move a set of faces onto a person: set their cluster and durable identity in
+/// one transaction (and clear any `ignored` flag). The identity binding is the
+/// must-link that makes the move survive re-clustering.
+pub fn set_faces_person(
+    conn: &mut Connection,
+    face_ids: &[i64],
+    cluster_id: i64,
+    identity_id: i64,
+) -> Result<()> {
     if face_ids.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat("?").take(face_ids.len()).collect::<Vec<_>>().join(",");
-    let sql = format!("UPDATE faces SET cluster_id = ? WHERE id IN ({placeholders})");
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(face_ids.len() + 1);
-    params.push(&cluster_id);
-    for id in face_ids {
-        params.push(id);
+    let tx = conn.transaction()?;
+    {
+        let mut up = tx.prepare(
+            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = 0 WHERE id = ?3",
+        )?;
+        for id in face_ids {
+            up.execute(rusqlite::params![cluster_id, identity_id, id])?;
+        }
     }
-    conn.execute(&sql, params.as_slice())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Ignore a set of faces: drop them from People for good. Cluster and identity go
+/// NULL and `ignored` is set, so they leave every grouping and the overlay.
+pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> Result<()> {
+    if face_ids.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE faces SET cluster_id = NULL, identity_id = NULL, ignored = 1 WHERE id IN ({})",
+        placeholders(face_ids.len())
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(face_ids.iter()))?;
+    Ok(())
+}
+
+/// Whether a cannot-link already exists for this (unordered) identity pair.
+pub fn cannot_link_exists(conn: &Connection, a: i64, b: i64) -> Result<bool> {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cannot_link WHERE a = ?1 AND b = ?2",
+        rusqlite::params![lo, hi],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Drop a cannot-link (undo of a reassign that recorded one).
+pub fn remove_cannot_link(conn: &Connection, a: i64, b: i64) -> Result<()> {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    conn.execute(
+        "DELETE FROM cannot_link WHERE a = ?1 AND b = ?2",
+        rusqlite::params![lo, hi],
+    )?;
     Ok(())
 }
 

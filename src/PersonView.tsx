@@ -16,18 +16,23 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
 import {
   faceCropUrl,
+  faceIdsForPhotos,
+  getClusters,
   getPersonPhotos,
+  ignoreFaces,
   nameCluster,
   onThumbReady,
-  removePersonFace,
-  restorePersonFaces,
+  reassignFacesToCluster,
+  reassignFacesToNewPerson,
   setVisibleRange,
   thumbUrl,
+  undoCorrection,
   STATUS_READY,
   STATUS_DOWNLOADING,
   STATUS_CLOUD,
   STATUS_FAILED,
   type Cluster,
+  type CorrectionUndo,
   type PhotoRow,
 } from "./api";
 
@@ -49,9 +54,12 @@ function monthYear(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", year: "numeric" });
 }
 
+// A just-applied correction the user can still take back: the rows we optimistically
+// pulled from the grid, plus the backend token that restores them exactly.
 interface PendingUndo {
-  row: PhotoRow;
-  faceIds: number[];
+  rows: PhotoRow[];
+  undo: CorrectionUndo;
+  label: string;
 }
 
 export default function PersonView({
@@ -68,6 +76,13 @@ export default function PersonView({
   const [name, setName] = useState(cluster.name);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [undo, setUndo] = useState<PendingUndo | null>(null);
+  // Photo ids the user has multi-selected for a bulk correction.
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  // Whether the "move to which person?" picker is open, and its typeahead text.
+  const [picking, setPicking] = useState(false);
+  const [pickQuery, setPickQuery] = useState("");
+  // The people to reassign into (named/large groups), loaded once.
+  const [people, setPeople] = useState<Cluster[]>([]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Thumbnail readiness, seeded from row status and kept live via onThumbReady.
@@ -92,23 +107,24 @@ export default function PersonView({
     [],
   );
 
-  // Load this person's photos once on mount (the whole set is known — no paging).
-  useEffect(() => {
-    let alive = true;
+  // Reload this person's photo set from the backend — after a correction made in
+  // the open photo (Lightbox) changes who's in it.
+  const reloadPhotos = useCallback(() => {
     getPersonPhotos(cluster.cluster_id)
       .then((r) => {
-        if (!alive) return;
         r.forEach((row) => {
           if (row.status === STATUS_READY) readyRef.current.add(row.id);
         });
         setRows(r);
         setLoaded(true);
       })
-      .catch(() => alive && setLoaded(true));
-    return () => {
-      alive = false;
-    };
+      .catch(() => setLoaded(true));
   }, [cluster.cluster_id]);
+
+  // Load this person's photos once on mount (the whole set is known — no paging).
+  useEffect(() => {
+    reloadPhotos();
+  }, [reloadPhotos]);
 
   // Fill cells whose thumbnails finish while the page is open.
   useEffect(() => {
@@ -176,30 +192,82 @@ export default function PersonView({
     setEditing(false);
   };
 
-  // "Not this person": detach their face(s) in that photo, optimistically remove
-  // the cell, and offer a single-level Undo.
+  // The people you can reassign a chunk *into* — every other person, biggest first.
+  // Loaded once; the picker filters it by the typeahead.
+  useEffect(() => {
+    getClusters().then(setPeople).catch(() => {});
+  }, []);
+
+  const toggleSelect = (photoId: number) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      next.has(photoId) ? next.delete(photoId) : next.add(photoId);
+      return next;
+    });
+  };
+  const clearSelection = () => {
+    setSelected(new Set());
+    setPicking(false);
+    setPickQuery("");
+  };
+
+  // Apply a correction to a set of photos: resolve their faces, optimistically pull
+  // the cells (P2 — one update, no reflow under the user), run the backend op, and
+  // offer one-level Undo. The selection clears either way.
   const undoTimer = useRef<number | undefined>(undefined);
-  const remove = (photo: PhotoRow) => {
-    setRows((rs) => rs.filter((r) => r.id !== photo.id));
-    removePersonFace(photo.id, cluster.cluster_id)
-      .then((faceIds) => {
-        setUndo({ row: photo, faceIds });
+  const applyCorrection = useCallback(
+    async (photoIds: number[], run: (faceIds: number[]) => Promise<CorrectionUndo>, label: string) => {
+      if (photoIds.length === 0) return;
+      const idSet = new Set(photoIds);
+      const removed = rowsRef.current.filter((r) => idSet.has(r.id));
+      setRows((rs) => rs.filter((r) => !idSet.has(r.id)));
+      clearSelection();
+      try {
+        const faceIds = await faceIdsForPhotos(photoIds, cluster.cluster_id);
+        const tok = await run(faceIds);
+        setUndo({ rows: removed, undo: tok, label });
         if (undoTimer.current) window.clearTimeout(undoTimer.current);
         undoTimer.current = window.setTimeout(() => setUndo(null), 6000);
-      })
-      .catch(() => {
-        // Restore the cell if the backend rejected the change.
-        setRows((rs) => insertSorted(rs, photo));
-      });
-  };
+      } catch {
+        setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
+      }
+    },
+    [cluster.cluster_id],
+  );
+
   const doUndo = () => {
     if (!undo) return;
-    const { row, faceIds } = undo;
+    const { rows: removed, undo: tok } = undo;
     setUndo(null);
-    restorePersonFaces(faceIds, cluster.cluster_id)
-      .then(() => setRows((rs) => insertSorted(rs, row)))
+    undoCorrection(tok)
+      .then(() => setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs)))
       .catch(() => {});
   };
+
+  const selectedIds = useMemo(() => [...selected], [selected]);
+  const moveToPerson = (target: Cluster) =>
+    applyCorrection(
+      selectedIds,
+      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, target.cluster_id),
+      `Moved to ${target.name}`,
+    );
+  const moveToNewPerson = (newName?: string) =>
+    applyCorrection(
+      selectedIds,
+      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName),
+      newName ? `Moved to ${newName}` : "Moved to a new person",
+    );
+  const ignoreSelected = () =>
+    applyCorrection(selectedIds, (fids) => ignoreFaces(fids), "Ignored");
+
+  // Named people other than the one we're viewing, filtered by the typeahead.
+  const pickMatches = useMemo(() => {
+    const q = pickQuery.trim().toLowerCase();
+    return people
+      .filter((c) => c.cluster_id !== cluster.cluster_id && c.name)
+      .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
+      .slice(0, 6);
+  }, [people, pickQuery, cluster.cluster_id]);
 
   const header = (
     <div className="person-header">
@@ -281,13 +349,17 @@ export default function PersonView({
                   const index = rowStart + c;
                   if (index >= total) break;
                   const photo = rows[index];
+                  const isSelected = selected.has(photo.id);
+                  const selecting = selected.size > 0;
                   cells.push(
                     <div
                       key={photo.id}
-                      className="cell person-cell"
+                      className={`cell person-cell${isSelected ? " selected" : ""}`}
                       role="button"
                       tabIndex={-1}
-                      onClick={() => setViewerIndex(index)}
+                      // Once a selection is underway, taps add/remove from it; otherwise
+                      // a tap opens the photo. The checkbox always toggles selection.
+                      onClick={() => (selecting ? toggleSelect(photo.id) : setViewerIndex(index))}
                       style={{
                         width: cellSize,
                         height: cellSize,
@@ -297,15 +369,16 @@ export default function PersonView({
                     >
                       {renderCellContent(photo)}
                       <button
-                        className="person-remove"
-                        title={name ? `Not ${name}` : "Not this person"}
-                        aria-label={name ? `Not ${name}` : "Not this person"}
+                        className={`person-select${isSelected ? " on" : ""}`}
+                        title={isSelected ? "Selected" : "Select"}
+                        aria-label={isSelected ? "Deselect photo" : "Select photo"}
+                        aria-pressed={isSelected}
                         onClick={(e) => {
                           e.stopPropagation();
-                          remove(photo);
+                          toggleSelect(photo.id);
                         }}
                       >
-                        ✕
+                        {isSelected ? "✓" : ""}
                       </button>
                     </div>,
                   );
@@ -332,9 +405,54 @@ export default function PersonView({
         </div>
       )}
 
+      {selected.size > 0 && (
+        <div className="select-bar">
+          <span className="sb-count">{selected.size} selected</span>
+          {picking ? (
+            <div className="sb-picker">
+              <input
+                className="pname-input"
+                autoFocus
+                value={pickQuery}
+                placeholder="Move to which person?"
+                onChange={(e) => setPickQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setPicking(false);
+                  else if (e.key === "Enter" && pickQuery.trim()) moveToNewPerson(pickQuery.trim());
+                }}
+              />
+              <ul className="sb-matches">
+                {pickMatches.map((m) => (
+                  <li key={m.cluster_id} className="sb-match" onClick={() => moveToPerson(m)}>
+                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                    <span className="ns-name">{m.name}</span>
+                    <span className="ns-count">{m.count.toLocaleString()}</span>
+                  </li>
+                ))}
+                <li className="sb-match sb-new" onClick={() => moveToNewPerson(pickQuery.trim() || undefined)}>
+                  + New person{pickQuery.trim() ? ` “${pickQuery.trim()}”` : ""}
+                </li>
+              </ul>
+            </div>
+          ) : (
+            <>
+              <button className="sb-btn" onClick={() => setPicking(true)}>
+                Move to…
+              </button>
+              <button className="sb-btn" onClick={ignoreSelected} title="Not a person — hide from People">
+                Not a person
+              </button>
+              <button className="sb-btn ghost" onClick={clearSelection}>
+                Cancel
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {undo && (
         <div className="undo-toast">
-          <span>Removed</span>
+          <span>{undo.label}</span>
           <button className="undo-btn" onClick={doUndo}>
             Undo
           </button>
@@ -342,7 +460,13 @@ export default function PersonView({
       )}
 
       {viewerIndex !== null && (
-        <Lightbox index={viewerIndex} total={total} resolveId={resolveId} onClose={() => setViewerIndex(null)} />
+        <Lightbox
+          index={viewerIndex}
+          total={total}
+          resolveId={resolveId}
+          onClose={() => setViewerIndex(null)}
+          onCorrection={reloadPhotos}
+        />
       )}
     </div>
   );
