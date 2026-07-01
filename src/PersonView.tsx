@@ -15,6 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
 import {
+  absorbClusters,
   faceCropUrl,
   faceIdsForPhotos,
   getClusters,
@@ -24,6 +25,7 @@ import {
   onThumbReady,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
+  rejectMerge,
   setVisibleRange,
   thumbUrl,
   undoCorrection,
@@ -33,6 +35,7 @@ import {
   STATUS_FAILED,
   type Cluster,
   type CorrectionUndo,
+  type GrowthCluster,
   type PhotoRow,
 } from "./api";
 
@@ -64,9 +67,13 @@ interface PendingUndo {
 
 export default function PersonView({
   cluster,
+  review,
   onBack,
 }: {
   cluster: Cluster;
+  // The less-certain look-alike groups the magnet thinks might also be this person —
+  // reviewed here, in context, one at a time. `into` is the cluster a "yes" folds into.
+  review?: { into: number; name: string; candidates: GrowthCluster[] };
   onBack: () => void;
 }) {
   const [rows, setRows] = useState<PhotoRow[]>([]);
@@ -190,6 +197,21 @@ export default function PersonView({
     nameCluster(cluster.cluster_id, value).catch(() => {});
     setName(value || null);
     setEditing(false);
+  };
+
+  // Review-tail decisions (the "N more might also be this person" band). "Yes" folds
+  // the group in and pulls its photos into this page; "no" writes a durable cannot-link
+  // so it never returns. Resolved chips hide in place; when the band empties it's gone.
+  const [reviewResolved, setReviewResolved] = useState<Set<number>>(new Set());
+  const reviewLeft = (review?.candidates ?? []).filter((c) => !reviewResolved.has(c.cluster_id));
+  const resolveReview = (c: GrowthCluster, keep: boolean) => {
+    if (!review) return;
+    setReviewResolved((s) => new Set(s).add(c.cluster_id));
+    (keep ? absorbClusters(review.into, [c.cluster_id]) : rejectMerge(review.into, c.cluster_id))
+      .then(() => {
+        if (keep) reloadPhotos();
+      })
+      .catch(() => {});
   };
 
   // The people you can reassign a chunk *into* — every other person, biggest first.
@@ -330,6 +352,45 @@ export default function PersonView({
   return (
     <div className="person-view">
       {header}
+
+      {reviewLeft.length > 0 && (
+        <div className="person-review">
+          <div className="pr-title">
+            {reviewLeft.length.toLocaleString()} {reviewLeft.length === 1 ? "group" : "groups"} might
+            also be <b>{name ?? review!.name}</b> — check each
+          </div>
+          <div className="pr-row">
+            {reviewLeft.map((c) => (
+              <div className="pr-chip" key={c.cluster_id}>
+                {c.face_id != null ? (
+                  <img className="pr-face" src={faceCropUrl(c.face_id)} alt="" draggable={false} />
+                ) : (
+                  <div className="pr-face pr-face-blank" />
+                )}
+                <div className="pr-count">{c.photos.toLocaleString()}</div>
+                <div className="pr-yn">
+                  <button
+                    className="pr-y"
+                    title={`Yes — add to ${name ?? review!.name}`}
+                    aria-label={`Yes, this is ${name ?? review!.name}`}
+                    onClick={() => resolveReview(c, true)}
+                  >
+                    ✓
+                  </button>
+                  <button
+                    className="pr-n"
+                    title="Not the same person"
+                    aria-label="Not the same person"
+                    onClick={() => resolveReview(c, false)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {loaded && total === 0 ? (
         <div className="empty">
