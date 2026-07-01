@@ -620,9 +620,22 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
     Ok(out)
 }
 
-/// A batch offer from a confirmed person: "N more groups look like <name> — merge
-/// them all?" The leverage of naming once and folding in the long tail of that
-/// person's over-split fragments in a single click.
+/// A single less-certain growth candidate, reviewed on its own in the card's tail.
+/// Carries its own example face and photo count so it renders as one yes/no chip.
+#[derive(Clone, serde::Serialize)]
+struct GrowthCluster {
+    cluster_id: i64,
+    face_id: Option<i64>,
+    photos: i64,
+    similarity: f32,
+}
+
+/// A batch offer from a confirmed person, split by confidence. The `strong` matches
+/// ("N groups are a strong match for <name>") fold in with one bulk click; the
+/// less-certain `maybe` tail is reviewed one face at a time. That tail is exactly
+/// where infants land — the model barely separates babies, so their look-alike
+/// groups clear the linkage floor but not the strong bar — which is why the whole
+/// point of the split is to keep a human glance on the risky few, not the safe many.
 #[derive(Clone, serde::Serialize)]
 struct IdentityGrowth {
     identity_id: i64,
@@ -631,11 +644,15 @@ struct IdentityGrowth {
     into: i64,
     /// Example faces of the confirmed person, for the card.
     anchor_faces: Vec<i64>,
-    /// The look-alike clusters offered for absorption.
-    candidate_clusters: Vec<i64>,
-    /// Example faces drawn from those candidates, for the card.
-    candidate_faces: Vec<i64>,
-    /// Total photos across the candidate clusters.
+    /// Strong matches, offered as a single bulk merge.
+    strong_clusters: Vec<i64>,
+    /// Example faces drawn from the strong matches, for the card strip.
+    strong_faces: Vec<i64>,
+    /// Total photos across the strong matches.
+    strong_photos: i64,
+    /// The less-certain tail, each reviewed individually.
+    maybe: Vec<GrowthCluster>,
+    /// Total photos across strong + maybe (ranks the most impactful person first).
     photos: i64,
 }
 
@@ -644,6 +661,16 @@ struct IdentityGrowth {
 /// identity and filtered by "not the same" — never free-chaining — so a single
 /// click can reunite a person scattered across dozens of clusters. Gated on a
 /// settled state, like the pairwise suggestions.
+///
+/// Because each identity's magnet is computed independently, the *same* look-alike
+/// cluster can clear the bar against two different anchors — most visibly with
+/// infants, whose embeddings the model barely separates (two babies both matching
+/// each other's parent's anchor). Blanket "Merge all" would then silently hand that
+/// cluster to whichever card was clicked first, writing a durable must-link. So we
+/// run a two-pass conflict guard: gather every identity's candidates, then drop any
+/// cluster claimed by more than one identity from *all* growth cards. Those
+/// ambiguous groups aren't lost — they stay reachable through the reviewable
+/// pairwise "same person?" path, where you decide one at a time.
 #[tauri::command]
 fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
     let conn = state.conn.lock().unwrap();
@@ -658,7 +685,17 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
     let blocked: std::collections::HashSet<(i64, i64)> =
         db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
 
-    let mut out = Vec::new();
+    // Pass 1: gather each identity's candidate clusters (already filtered by
+    // "not the same"), and tally how many distinct identities claim each cluster.
+    use std::collections::HashMap;
+    struct Pending {
+        identity_id: i64,
+        name: String,
+        into: i64,
+        candidates: Vec<(i64, i64, f32)>, // strongest-first (cluster_id, size, max_sim)
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut claims: HashMap<i64, u32> = HashMap::new(); // cluster_id -> # identities claiming it
     for (identity_id, name) in named {
         let anchor = db::identity_anchor_embeddings(&conn, identity_id, 64).map_err(|e| e.to_string())?;
         if anchor.is_empty() {
@@ -681,9 +718,7 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
         let mut cands = cluster::identity_candidates(&anchor, &others);
         // Strongest matches first, and drop any cluster the user said isn't this person.
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
-        let mut candidate_clusters = Vec::new();
-        let mut candidate_faces = Vec::new();
-        let mut photos: i64 = 0;
+        let mut candidates = Vec::new();
         for c in cands {
             if let Ok(Some(other_id)) = db::identity_of_cluster(&conn, c.cluster_id) {
                 let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
@@ -691,24 +726,60 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
                     continue;
                 }
             }
-            candidate_clusters.push(c.cluster_id);
-            photos += c.size as i64;
-            if candidate_faces.len() < 4 {
-                if let Ok(mut f) = db::top_face_ids(&conn, c.cluster_id, 1) {
-                    candidate_faces.append(&mut f);
+            *claims.entry(c.cluster_id).or_insert(0) += 1;
+            candidates.push((c.cluster_id, c.size as i64, c.max_sim));
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        pending.push(Pending { identity_id, name, into, candidates });
+    }
+
+    // Pass 2: build the cards, excluding any cluster claimed by 2+ identities, and
+    // split the survivors by confidence. Above STRONG the match is folded in by the
+    // bulk button; below it (but still past the linkage floor `identity_candidates`
+    // enforced) the cluster goes to the reviewable tail, capped so the chip row
+    // stays glanceable. Candidates arrive strongest-first, so `strong` fills before
+    // `maybe` and the tail is already ordered closest-match-first.
+    const STRONG: f32 = 0.6;
+    const MAX_MAYBE: usize = 12;
+    let mut out = Vec::new();
+    for p in pending {
+        let mut strong_clusters = Vec::new();
+        let mut strong_faces = Vec::new();
+        let mut strong_photos: i64 = 0;
+        let mut maybe: Vec<GrowthCluster> = Vec::new();
+        let mut photos: i64 = 0;
+        for (cid, size, sim) in p.candidates {
+            if claims.get(&cid).copied().unwrap_or(0) > 1 {
+                continue; // ambiguous — leave it to the pairwise path
+            }
+            photos += size;
+            if sim >= STRONG {
+                strong_clusters.push(cid);
+                strong_photos += size;
+                if strong_faces.len() < 4 {
+                    if let Ok(mut f) = db::top_face_ids(&conn, cid, 1) {
+                        strong_faces.append(&mut f);
+                    }
                 }
+            } else if maybe.len() < MAX_MAYBE {
+                let face_id = db::top_face_ids(&conn, cid, 1).ok().and_then(|v| v.into_iter().next());
+                maybe.push(GrowthCluster { cluster_id: cid, face_id, photos: size, similarity: sim });
             }
         }
-        if candidate_clusters.is_empty() {
+        if strong_clusters.is_empty() && maybe.is_empty() {
             continue;
         }
         out.push(IdentityGrowth {
-            identity_id,
-            name,
-            into,
-            anchor_faces: db::top_face_ids(&conn, into, 4).unwrap_or_default(),
-            candidate_clusters,
-            candidate_faces,
+            identity_id: p.identity_id,
+            name: p.name,
+            into: p.into,
+            anchor_faces: db::top_face_ids(&conn, p.into, 4).unwrap_or_default(),
+            strong_clusters,
+            strong_faces,
+            strong_photos,
+            maybe,
             photos,
         });
     }

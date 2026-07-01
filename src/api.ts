@@ -178,6 +178,14 @@ export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
   return invoke("get_merge_suggestions");
 }
 
+/** One less-certain growth candidate — reviewed on its own as a yes/no chip. */
+export interface GrowthCluster {
+  cluster_id: number;
+  face_id: number | null;
+  photos: number;
+  similarity: number;
+}
+
 export interface IdentityGrowth {
   identity_id: number;
   name: string;
@@ -185,11 +193,15 @@ export interface IdentityGrowth {
   into: number;
   /** Example faces of the confirmed person. */
   anchor_faces: number[];
-  /** The look-alike clusters offered for absorption. */
-  candidate_clusters: number[];
-  /** Example faces drawn from those candidates. */
-  candidate_faces: number[];
-  /** Total photos across the candidate clusters. */
+  /** Strong matches, folded in as one bulk merge. */
+  strong_clusters: number[];
+  /** Example faces drawn from the strong matches. */
+  strong_faces: number[];
+  /** Total photos across the strong matches. */
+  strong_photos: number;
+  /** The less-certain tail, reviewed one at a time. */
+  maybe: GrowthCluster[];
+  /** Total photos across strong + maybe (for ranking people). */
   photos: number;
 }
 

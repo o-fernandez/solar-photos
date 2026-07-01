@@ -394,6 +394,7 @@ body,
   display: flex;
   flex-direction: column;
   gap: 1px;
+  position: relative;
 }
 .pb-title {
   font-weight: 500;
@@ -452,6 +453,128 @@ body,
 .grow-card .merge-text,
 .grow-card .mplus {
   color: #1c7a45;
+}
+/* The confidence-split growth card stacks a strong-match row over a review tail,
+   so it lays out as a column rather than the single centered row of a plain card. */
+.grow-split {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+.grow-strong {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+/* A hairline in the card's own green marks where the sure batch ends and the
+   less-certain, one-at-a-time tail begins. */
+.grow-maybe {
+  border-top: 1px solid #cbe6d4;
+  padding-top: 10px;
+}
+.grow-divider {
+  font-size: 12px;
+  color: #3d6b50;
+  margin-bottom: 10px;
+}
+.maybe-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.maybe-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.mface-blank {
+  display: inline-block;
+}
+.maybe-count {
+  font-size: 11px;
+  color: #3d6b50;
+}
+.yn {
+  display: flex;
+  gap: 4px;
+}
+.yn button {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid #cfcfcf;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.yn-y {
+  color: #1c7a45;
+  border-color: #bcd8c6 !important;
+}
+.yn-y:hover {
+  background: #e7f6ec;
+}
+.yn-n {
+  color: #a32d2d;
+  border-color: #e6bcbc !important;
+}
+.yn-n:hover {
+  background: #fbecec;
+}
+.grow-maybe-dismiss {
+  margin-top: 10px;
+}
+/* Deferred-tail footnote: the quiet "set aside — rechecked after this merge" line the
+   card shows when a confident batch dominates, in place of the inline review chips. */
+.grow-defer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #cbe6d4;
+  font-size: 12px;
+  color: #3d6b50;
+}
+.grow-defer-icon {
+  color: #6a9a7c;
+}
+.grow-defer-text {
+  flex: 1;
+}
+.grow-defer-text b {
+  font-weight: 500;
+}
+.grow-defer-link {
+  background: transparent;
+  border: none;
+  color: #1c7a45;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+.grow-defer-link:hover {
+  text-decoration: underline;
+}
+/* Small dismiss affordance on the one-time onboarding banner. */
+.banner-x {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  background: transparent;
+  border: none;
+  color: #4a78b0;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 1;
+}
+.banner-x:hover {
+  color: #185fa5;
 }
 
 .people-grid {

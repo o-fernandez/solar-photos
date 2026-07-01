@@ -26,6 +26,7 @@ import {
   rejectMerge,
   type Cluster,
   type FaceProgress,
+  type GrowthCluster,
   type IdentityGrowth,
   type MergeSuggestion,
 } from "./api";
@@ -54,6 +55,22 @@ export default function People({
   const [growth, setGrowth] = useState<IdentityGrowth[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [dismissedGrowth, setDismissedGrowth] = useState<Set<number>>(new Set());
+  // Maybe-tail chips the user has already judged (by cluster id), hidden in place so
+  // the row doesn't reflow mid-review. Cleared on every reload (the refetch no longer
+  // returns them, so a lingering id would only ever be stale).
+  const [resolvedMaybes, setResolvedMaybes] = useState<Set<number>>(new Set());
+  // When a strong-dominant growth card has its less-certain tail deferred behind a
+  // footnote, "Review now" pins it open for that identity so the chips show inline.
+  const [reviewOpenFor, setReviewOpenFor] = useState<number | null>(null);
+  // The onboarding banner is a first-run explainer: retire it for good once the user
+  // has acted on a suggestion (merged or named someone), so it stops being chrome.
+  const [hintDone, setHintDone] = useState<boolean>(
+    () => localStorage.getItem("solar.suggestHintDone") === "1",
+  );
+  const markHintDone = () => {
+    localStorage.setItem("solar.suggestHintDone", "1");
+    setHintDone(true);
+  };
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   // The person whose page is open, in place of the people-grid (null = grid).
@@ -75,6 +92,8 @@ export default function People({
     getClusters().then(setClusters).catch(() => {});
     getMergeSuggestions().then(setSuggestions).catch(() => {});
     getIdentityGrowth().then(setGrowth).catch(() => {});
+    setResolvedMaybes(new Set());
+    setReviewOpenFor(null);
   }, []);
 
   useEffect(() => {
@@ -199,15 +218,18 @@ export default function People({
     setEditing(null);
     const match = name ? exactNameMatch(self, name) : undefined;
     if (match) {
+      markHintDone();
       mergeClusters(match.cluster_id, self.cluster_id).then(reload).catch(() => {});
       return;
     }
     if (name || self.name) {
+      if (name) markHintDone();
       nameCluster(self.cluster_id, name).then(reload).catch(() => {});
     }
   };
 
   const doMerge = (s: MergeSuggestion) => {
+    markHintDone();
     mergeClusters(s.into, s.from)
       .then(reload)
       .catch(() => {});
@@ -218,17 +240,60 @@ export default function People({
     setDismissed((d) => new Set(d).add(`${s.into}-${s.from}`));
   };
 
-  const doAbsorb = (g: IdentityGrowth) => {
-    absorbClusters(g.into, g.candidate_clusters)
+  // Bulk-fold every strong match into the person in one action, then reload so the
+  // grid counts (and any remaining review tail) reflect it.
+  const mergeStrong = (g: IdentityGrowth) => {
+    markHintDone();
+    absorbClusters(g.into, g.strong_clusters)
       .then(reload)
       .catch(() => {});
+  };
+  // A single review-tail decision: "yes" folds that one group into the person, "no"
+  // records a durable cannot-link so it never returns. The chip hides in place; when
+  // the tail empties (and there's no bulk button left to anchor the card) we reload
+  // so the person's count catches up.
+  const resolveMaybe = (g: IdentityGrowth, c: GrowthCluster, keep: boolean) => {
+    markHintDone();
+    (keep ? absorbClusters(g.into, [c.cluster_id]) : rejectMerge(g.into, c.cluster_id)).catch(
+      () => {},
+    );
+    const nextResolved = new Set(resolvedMaybes).add(c.cluster_id);
+    setResolvedMaybes(nextResolved);
+    const tailLeft = g.maybe.some((m) => !nextResolved.has(m.cluster_id));
+    if (!tailLeft && g.strong_clusters.length === 0) reload();
   };
   const declineGrowth = (g: IdentityGrowth) => {
     setDismissedGrowth((d) => new Set(d).add(g.identity_id));
   };
 
-  const suggestion = suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
-  const grow = growth.find((g) => !dismissedGrowth.has(g.identity_id) && g.candidate_clusters.length > 0);
+  // Both the growth ("N more look like <name>") and pairwise ("same person?")
+  // tracks unlock on the same "scan finished" gate, so without care they stack into
+  // a wall of prompts. Show only one at a time: the named-anchor growth card takes
+  // precedence (higher precision, clears more backlog per click), and the pairwise
+  // suggestion fills in only when there's no growth to offer. The other track isn't
+  // lost — it resurfaces on the next reload once this card is acted on.
+  const grow = growth.find(
+    (g) =>
+      !dismissedGrowth.has(g.identity_id) &&
+      (g.strong_clusters.length > 0 || g.maybe.some((c) => !resolvedMaybes.has(c.cluster_id))),
+  );
+  // The still-unreviewed tail for the active card.
+  const growMaybe = grow ? grow.maybe.filter((c) => !resolvedMaybes.has(c.cluster_id)) : [];
+  // Adaptive layout: when a confident batch clearly outweighs the uncertain tail, the
+  // tail is deferred behind a footnote ("set aside — rechecked after this merge") so
+  // the card is one clean action; the sure ones sharpen the anchor, then the tail
+  // re-scores on reload. When the uncertain groups outnumber the sure (or there's no
+  // sure batch), reviewing them *is* the task, so the chips show inline. "Review now"
+  // pins the tail open even in the dominant case.
+  const strongDominant =
+    !!grow && grow.strong_clusters.length > 0 && growMaybe.length > 0 &&
+    grow.strong_clusters.length >= growMaybe.length;
+  const reviewOpen = !!grow && reviewOpenFor === grow.identity_id;
+  const showChips = growMaybe.length > 0 && (!strongDominant || reviewOpen);
+  const showDeferFootnote = strongDominant && !reviewOpen;
+  const suggestion = grow
+    ? undefined
+    : suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
 
   const renderTile = (c: Cluster) => (
     <div className="ptile" key={c.cluster_id}>
@@ -333,8 +398,11 @@ export default function People({
         </div>
       ) : reorganizing ? (
         <div className="reorg-banner">Reorganizing people…</div>
-      ) : grow || suggestion ? (
+      ) : !hintDone && (grow || suggestion) ? (
         <div className="reorg-banner people-banner">
+          <button className="banner-x" aria-label="Dismiss" title="Dismiss" onClick={markHintDone}>
+            ✕
+          </button>
           <span className="pb-title">All faces scanned</span>
           <span className="pb-sub">
             Name a few people and accept the suggestions below — similar groups fold in
@@ -343,32 +411,120 @@ export default function People({
         </div>
       ) : null}
       {grow && (
-        <div className="merge-card grow-card">
-          <div className="merge-faces">
-            <div className="mside">
-              {grow.anchor_faces.map((id) => (
-                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
-              ))}
+        <div className="merge-card grow-card grow-split">
+          {grow.strong_clusters.length > 0 && (
+            <div className="grow-strong">
+              <div className="merge-faces">
+                <div className="mside">
+                  {grow.anchor_faces.map((id) => (
+                    <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+                  ))}
+                </div>
+                <span className="mplus">+</span>
+                <div className="mside">
+                  {grow.strong_faces.map((id) => (
+                    <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
+                  ))}
+                </div>
+              </div>
+              <div className="merge-text">
+                {growMaybe.length > 0 ? (
+                  <>
+                    <b>
+                      {grow.strong_clusters.length.toLocaleString()}{" "}
+                      {grow.strong_clusters.length === 1 ? "group" : "groups"}
+                    </b>{" "}
+                    {grow.strong_clusters.length === 1 ? "is a strong match" : "are a strong match"} for{" "}
+                    <b>{grow.name}</b> ({grow.strong_photos.toLocaleString()}{" "}
+                    {grow.strong_photos === 1 ? "photo" : "photos"}).
+                  </>
+                ) : (
+                  <>
+                    {grow.strong_clusters.length.toLocaleString()}{" "}
+                    {grow.strong_clusters.length === 1 ? "group" : "groups"} (
+                    {grow.strong_photos.toLocaleString()}{" "}
+                    {grow.strong_photos === 1 ? "photo" : "photos"}) look like <b>{grow.name}</b> —
+                    merge them all?
+                  </>
+                )}
+              </div>
+              <button className="pick-btn" onClick={() => mergeStrong(grow)}>
+                {growMaybe.length > 0
+                  ? `Merge ${grow.strong_clusters.length.toLocaleString()}`
+                  : "Merge all"}
+              </button>
+              <button className="ghost-btn" onClick={() => declineGrowth(grow)}>
+                Not now
+              </button>
             </div>
-            <span className="mplus">+</span>
-            <div className="mside">
-              {grow.candidate_faces.map((id) => (
-                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
-              ))}
+          )}
+          {showDeferFootnote && grow.strong_clusters.length > 0 && (
+            // Confident batch dominates: park the uncertain tail behind a one-line note
+            // rather than making it compete with the bulk action. Merging first sharpens
+            // the anchor, then the tail re-scores on reload — many resolve themselves.
+            <div className="grow-defer">
+              <span className="grow-defer-icon" aria-hidden="true">
+                ⏸
+              </span>
+              <span className="grow-defer-text">
+                {growMaybe.length.toLocaleString()} less-certain{" "}
+                {growMaybe.length === 1 ? "group" : "groups"} set aside — rechecked after this merge
+                sharpens <b>{grow.name}</b>.
+              </span>
+              <button className="grow-defer-link" onClick={() => setReviewOpenFor(grow.identity_id)}>
+                Review now
+              </button>
             </div>
-          </div>
-          <div className="merge-text">
-            {grow.candidate_clusters.length.toLocaleString()} more{" "}
-            {grow.candidate_clusters.length === 1 ? "group" : "groups"} (
-            {grow.photos.toLocaleString()} {grow.photos === 1 ? "photo" : "photos"}) look like{" "}
-            <b>{grow.name}</b> — merge them all?
-          </div>
-          <button className="pick-btn" onClick={() => doAbsorb(grow)}>
-            Merge all
-          </button>
-          <button className="ghost-btn" onClick={() => declineGrowth(grow)}>
-            Not now
-          </button>
+          )}
+          {showChips && (
+            <div className="grow-maybe">
+              <div className="grow-divider">
+                {growMaybe.length.toLocaleString()}{" "}
+                {growMaybe.length === 1 ? "group looks" : "groups look"} similar but less certain —
+                check each
+              </div>
+              <div className="maybe-row">
+                {growMaybe.map((c: GrowthCluster) => (
+                  <div className="maybe-chip" key={c.cluster_id}>
+                    {c.face_id != null ? (
+                      <img
+                        className="mface"
+                        src={faceCropUrl(c.face_id)}
+                        alt=""
+                        draggable={false}
+                      />
+                    ) : (
+                      <div className="mface mface-blank" />
+                    )}
+                    <div className="maybe-count">{c.photos.toLocaleString()}</div>
+                    <div className="yn">
+                      <button
+                        className="yn-y"
+                        title={`Yes — this is ${grow.name}`}
+                        aria-label={`Yes, this is ${grow.name}`}
+                        onClick={() => resolveMaybe(grow, c, true)}
+                      >
+                        ✓
+                      </button>
+                      <button
+                        className="yn-n"
+                        title="Not the same person"
+                        aria-label="Not the same person"
+                        onClick={() => resolveMaybe(grow, c, false)}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {grow.strong_clusters.length === 0 && (
+                <button className="ghost-btn grow-maybe-dismiss" onClick={() => declineGrowth(grow)}>
+                  Not now
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
       {suggestion && (
