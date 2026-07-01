@@ -393,15 +393,38 @@ fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>
 }
 
 #[tauri::command]
-fn name_cluster(state: tauri::State<'_, AppState>, cluster_id: i64, name: String) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())
+fn name_cluster(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    cluster_id: i64,
+    name: String,
+) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().unwrap();
+        db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
+    }
+    // Confirming a person is exactly when their scattered fragments become foldable —
+    // reunite them in the background (no-op if empty or the library is still scanning).
+    if !name.trim().is_empty() {
+        run_auto_fold(app);
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn merge_clusters(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())
+fn merge_clusters(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    into: i64,
+    from: i64,
+) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().unwrap();
+        db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+    }
+    // The merge grew this person's anchor — fold in anything newly confident.
+    run_auto_fold(app);
+    Ok(())
 }
 
 /// Every photo containing this person, newest first (same ordering as the
@@ -793,16 +816,21 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
 /// person stays together through future re-clusters.
 #[tauri::command]
 fn absorb_clusters(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     into: i64,
     clusters: Vec<i64>,
 ) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    for from in clusters {
-        if from != into {
-            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+    {
+        let conn = state.conn.lock().unwrap();
+        for from in clusters {
+            if from != into {
+                db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+            }
         }
     }
+    // Bulk-merging enlarged the anchor — fold in anything that now clears the bar too.
+    run_auto_fold(app);
     Ok(())
 }
 
@@ -902,6 +930,119 @@ fn suggestions_ready(conn: &Connection, reclustering: &AtomicBool) -> bool {
     }
 }
 
+/// Fold every cluster that confidently matches a *confirmed* identity's anchor into
+/// that identity — the automatic reunification behind "you named them, so we gather
+/// their scattered fragments for you." This is safe where unsupervised clustering
+/// isn't, for the same reasons the growth prompt relied on: every match is to a
+/// human-confirmed anchor (never chained cluster→cluster), covers a majority of the
+/// candidate cluster, is conflict-guarded (a fragment two confirmed people both match
+/// — two babies — is left untouched, never guessed), and touches only *unclaimed*
+/// fragments (anything already bound to another identity is left alone). Runs only on
+/// a settled library, where anchors are complete. Returns how many clusters folded in.
+///
+/// This is what turns "merge dozens of 1-photo clusters by hand" into "already done":
+/// naming a person, or the sweep settling, reunites their scattered fragments with no
+/// clicks. The manual review path remains only for the genuinely ambiguous residual.
+fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
+    use std::collections::{HashMap, HashSet};
+    // Mid-sweep anchors are incomplete and would misfire — wait until scanning settles.
+    match db::face_progress(conn) {
+        Ok((scanned, eligible)) if eligible > 0 && scanned >= eligible => {}
+        _ => return Ok(0),
+    }
+    let named = db::named_identities(conn)?;
+    if named.is_empty() {
+        return Ok(0);
+    }
+    let all_faces = db::face_cluster_embeddings(conn)?;
+
+    // Pass 1: each identity's confident candidate clusters, plus a tally of how many
+    // distinct identities claim each — the conflict guard's raw material.
+    struct Pending {
+        into: i64,
+        candidates: Vec<i64>,
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut claims: HashMap<i64, u32> = HashMap::new();
+    for (identity_id, _name) in &named {
+        let anchor = db::identity_anchor_embeddings(conn, *identity_id, 64)?;
+        if anchor.is_empty() {
+            continue;
+        }
+        // The identity's own clusters are excluded from the search; the largest is the
+        // fold-in target.
+        let own = db::clusters_of_identity(conn, *identity_id)?;
+        let into = match own.first() {
+            Some(&c) => c,
+            None => continue,
+        };
+        let own_set: HashSet<i64> = own.iter().cloned().collect();
+        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
+            .iter()
+            .filter(|(_, c, _)| !own_set.contains(c))
+            .cloned()
+            .collect();
+        let mut candidates = Vec::new();
+        for c in cluster::identity_candidates(&anchor, &others) {
+            // Only reunite *unclaimed* fragments — never pull a cluster that already
+            // belongs to a different identity (named or not). That subsumes cannot-link
+            // and can never auto-merge two confirmed people.
+            if let Ok(Some(other)) = db::identity_of_cluster(conn, c.cluster_id) {
+                if other != *identity_id {
+                    continue;
+                }
+            }
+            *claims.entry(c.cluster_id).or_insert(0) += 1;
+            candidates.push(c.cluster_id);
+        }
+        if !candidates.is_empty() {
+            pending.push(Pending { into, candidates });
+        }
+    }
+
+    // Pass 2: fold in only the clusters a single identity claims. A fragment two people
+    // both match is ambiguous — leave it for the pairwise review path, don't guess.
+    let mut folded = 0usize;
+    for p in pending {
+        for cid in p.candidates {
+            if cid == p.into || claims.get(&cid).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            db::merge_clusters(conn, p.into, cid)?;
+            folded += 1;
+        }
+    }
+    Ok(folded)
+}
+
+/// Run [`auto_fold_confident`] in the background (Principle 1: off the UI thread),
+/// then signal the People view to refresh via `cluster-progress`. Cheap next to a
+/// full re-cluster — just anchor matching and merges — so it's fine to fire after
+/// every naming/merge. Shares the re-cluster guard, so it never overlaps one.
+fn run_auto_fold(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.reclustering.swap(true, Ordering::SeqCst) {
+        return; // a re-cluster or fold is already running
+    }
+    let db_path = state.db_path.clone();
+    let reclustering = state.reclustering.clone();
+    drop(state);
+
+    std::thread::spawn(move || {
+        background_qos();
+        let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
+        let folded = (|| -> anyhow::Result<usize> {
+            let conn = db::open(&db_path)?;
+            auto_fold_confident(&conn)
+        })();
+        if let Err(e) = folded {
+            eprintln!("auto-fold failed: {e}");
+        }
+        let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
+        reclustering.store(false, Ordering::SeqCst);
+    });
+}
+
 /// Re-cluster every face from scratch, in the background (Principle 1: off the UI
 /// thread, no focus steal). Order-independent and purity-biased. Names are carried
 /// across by re-anchoring each to the new cluster holding the plurality of its old
@@ -976,6 +1117,9 @@ fn run_recluster(app: AppHandle) {
             }
             let names: Vec<(i64, String)> = winner.into_iter().map(|(c, (n, _))| (c, n)).collect();
             db::replace_cluster_names(&mut conn, &names)?;
+            // Now that clusters and names are settled, reunite each confirmed person's
+            // scattered look-alike fragments automatically (see `auto_fold_confident`).
+            let _ = auto_fold_confident(&conn)?;
             db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
             Ok(())
         })();
@@ -1472,6 +1616,11 @@ pub fn run() {
             // pass and rely on the incremental path + periodic consolidation.
             if needs_recluster {
                 run_recluster(app.handle().clone());
+            } else {
+                // Settled library from a prior session: reunite any look-alike fragments
+                // that belong to already-confirmed people (the fold a fresh install now
+                // does on naming). No-op if the library is still scanning or empty.
+                run_auto_fold(app.handle().clone());
             }
 
             // Proactively download every cloud-only photo in the background so the
