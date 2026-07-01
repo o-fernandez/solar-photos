@@ -129,16 +129,20 @@ export default function People({
   // Named/confirmed people always show. Mid-sweep, unnamed clusters must clear a
   // high bar (large = reliably real); the rest stays hidden behind the readout.
   // Settled, the bar drops and the small remainder goes to an expandable section.
+  // Within the visible grid, named people come first, then unnamed — each block
+  // ordered biggest-first (backend already sorts by count, so this stays stable).
   const { visible, tail } = useMemo(() => {
     const isReal = (c: Cluster) => c.name != null;
+    const namedFirst = (a: Cluster, b: Cluster) =>
+      (a.name != null ? 0 : 1) - (b.name != null ? 0 : 1) || b.count - a.count;
     if (inProgress) {
       return {
-        visible: clusters.filter((c) => isReal(c) || c.count >= SWEEP_FLOOR),
+        visible: clusters.filter((c) => isReal(c) || c.count >= SWEEP_FLOOR).sort(namedFirst),
         tail: [] as Cluster[],
       };
     }
     return {
-      visible: clusters.filter((c) => isReal(c) || c.count >= SETTLED_FLOOR),
+      visible: clusters.filter((c) => isReal(c) || c.count >= SETTLED_FLOOR).sort(namedFirst),
       tail: clusters.filter((c) => !isReal(c) && c.count < SETTLED_FLOOR),
     };
   }, [clusters, inProgress]);
