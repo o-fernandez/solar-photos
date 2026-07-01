@@ -219,11 +219,15 @@ impl FaceModels {
     pub fn process(&mut self, img: &RgbImage) -> Result<Vec<DetectedFace>> {
         let (ow, oh) = img.dimensions();
         let (ow, oh) = (ow as f32, oh as f32);
+        let t = std::time::Instant::now();
         let cands = self.detect(img)?;
+        crate::prof::record(crate::prof::Stage::Detect, t.elapsed());
         let mut out = Vec::with_capacity(cands.len());
         for c in cands {
             let aligned = align(img, &c.lm); // alignment uses pixel landmarks
+            let t = std::time::Instant::now();
             let embedding = self.embed(&aligned)?;
+            crate::prof::record(crate::prof::Stage::Embed, t.elapsed());
             out.push(DetectedFace {
                 x1: c.x1 / ow,
                 y1: c.y1 / oh,

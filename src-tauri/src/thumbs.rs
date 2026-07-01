@@ -180,6 +180,7 @@ pub fn spawn_workers<F>(
     queue: Arc<ThumbQueue>,
     db_path: PathBuf,
     cache_dir: PathBuf,
+    preview_dir: PathBuf,
     fail_status: i64,
     extract_date: bool,
     notify: F,
@@ -190,6 +191,7 @@ pub fn spawn_workers<F>(
         let queue = queue.clone();
         let db_path = db_path.clone();
         let cache_dir = cache_dir.clone();
+        let preview_dir = preview_dir.clone();
         let notify = notify.clone();
         std::thread::spawn(move || {
             // Yield to the UI: decoding full-res images must never out-prioritize
@@ -204,7 +206,7 @@ pub fn spawn_workers<F>(
                 }
             };
             while let Some(job) = queue.take() {
-                let status = match generate(&cache_dir, &job) {
+                let status = match generate(&cache_dir, &preview_dir, &job) {
                     Ok(()) => STATUS_READY,
                     Err(e) => {
                         eprintln!("thumbnail failed for {}: {e}", job.path);
@@ -238,8 +240,25 @@ fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Decode one original, downscale it, and write the cached JPEG thumbnail.
-fn generate(cache_dir: &Path, job: &Job) -> Result<()> {
+/// Downscale a decoded original to a viewer preview, never upscaling a small
+/// original. Shared by the thumbnail pass, on-demand preview generation, and the
+/// face sweep's fallback so "what a preview is" lives in one place.
+fn to_preview(img: &DynamicImage) -> DynamicImage {
+    if img.width() > PREVIEW_EDGE || img.height() > PREVIEW_EDGE {
+        img.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
+    } else {
+        img.clone()
+    }
+}
+
+/// Decode one original **once** and derive both cached artifacts from it: the grid
+/// thumbnail and the viewer preview. Deriving the preview here (rather than lazily)
+/// means the original — often an expensive HEIC or a cold cloud fetch — is never
+/// decoded a second time: the viewer and the background face sweep both read the
+/// cached preview instead of re-materializing the original. The extra work added
+/// to this pass is only a downscale + JPEG encode of pixels already in memory,
+/// which is cheap next to the decode it saves downstream.
+fn generate(cache_dir: &Path, preview_dir: &Path, job: &Job) -> Result<()> {
     let img = decode_oriented(Path::new(&job.path))?;
     // `thumbnail` is an optimized downscaler that preserves aspect ratio and
     // fits the image within THUMB_EDGE × THUMB_EDGE.
@@ -251,6 +270,21 @@ fn generate(cache_dir: &Path, job: &Job) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&out, &buf)?;
+
+    // Cache the preview from the same decoded image. Best-effort: a preview write
+    // failure must never fail the thumbnail (the grid is what the user sees now).
+    // Skip if one already exists so re-processing a photo doesn't re-encode it.
+    let pv = preview_path(preview_dir, job.id);
+    if !pv.exists() {
+        let t = std::time::Instant::now();
+        if let Ok(pbuf) = encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY) {
+            if let Some(parent) = pv.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pv, &pbuf);
+        }
+        crate::prof::record(crate::prof::Stage::Preview, t.elapsed());
+    }
     Ok(())
 }
 
@@ -260,13 +294,7 @@ fn generate(cache_dir: &Path, job: &Job) -> Result<()> {
 /// photo (and to prefetch its neighbors). Cached forever after first view.
 pub fn generate_preview(out: &Path, original_path: &str) -> Result<Vec<u8>> {
     let img = decode_oriented(Path::new(original_path))?;
-    // Only downscale; never upscale a small original.
-    let preview = if img.width() > PREVIEW_EDGE || img.height() > PREVIEW_EDGE {
-        img.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
-    } else {
-        img
-    };
-    let buf = encode_jpeg(&preview.to_rgb8(), PREVIEW_QUALITY)?;
+    let buf = encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY)?;
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -304,12 +332,7 @@ pub fn load_face_source(preview_dir: &Path, id: i64, original_path: &str) -> Res
     // One read of the original (cold cloud fetch); cache a preview so the next
     // pass — and the viewer — stay local.
     let img = decode_oriented(Path::new(original_path))?;
-    let preview = if img.width() > PREVIEW_EDGE || img.height() > PREVIEW_EDGE {
-        img.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
-    } else {
-        img
-    };
-    let rgb = preview.to_rgb8();
+    let rgb = to_preview(&img).to_rgb8();
     // Best-effort cache; a write failure shouldn't sink the face work.
     if let Ok(buf) = encode_jpeg(&rgb, PREVIEW_QUALITY) {
         if let Some(parent) = pv.parent() {
@@ -326,6 +349,15 @@ pub fn load_face_source(preview_dir: &Path, id: i64, original_path: &str) -> Res
 /// .heic extension, which photo-management tools sometimes produce) goes through
 /// the `image` crate, which handles EXIF orientation correctly for each format.
 fn decode_oriented(path: &Path) -> Result<DynamicImage> {
+    let t = std::time::Instant::now();
+    let img = decode_oriented_inner(path);
+    if img.is_ok() {
+        crate::prof::record(crate::prof::Stage::Decode, t.elapsed());
+    }
+    img
+}
+
+fn decode_oriented_inner(path: &Path) -> Result<DynamicImage> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

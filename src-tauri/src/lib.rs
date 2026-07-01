@@ -20,6 +20,7 @@ mod cluster;
 mod db;
 mod faces;
 mod meta;
+mod prof;
 mod scan;
 mod thumbs;
 
@@ -1248,6 +1249,7 @@ pub fn run() {
             });
         })
         .setup(|app| {
+            prof::init();
             // All cached state lives under the OS app-data directory — never
             // inside the user's photo folders (their originals stay pristine).
             let data_dir = app.path().app_data_dir()?;
@@ -1317,6 +1319,7 @@ pub fn run() {
                 local_queue.clone(),
                 db_path.clone(),
                 cache_dir.clone(),
+                preview_dir.clone(),
                 db::STATUS_FAILED,
                 false,
                 notify.clone(),
@@ -1326,6 +1329,7 @@ pub fn run() {
                 cloud_queue.clone(),
                 db_path.clone(),
                 cache_dir.clone(),
+                preview_dir.clone(),
                 db::STATUS_CLOUD,
                 true,
                 notify,

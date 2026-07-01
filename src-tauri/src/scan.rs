@@ -88,7 +88,12 @@ where
     let mut conn = db::open(db_path)?;
     let mut total: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
 
-    let mut walk = WalkDir::new(root).skip_hidden(false).into_iter();
+    // Skip hidden files and directories (dot-prefixed). Real photo libraries don't
+    // hide their photos, but sync tools drag in a lot of dot-junk that otherwise
+    // passes the extension check and wastes a decode (often a cloud download) each:
+    // Android `.thumbnails/` caches, app blobs under `.gs*/`, and `.trashed-*.jpg`
+    // tombstones. Pruning descent into hidden dirs also keeps the walk cheap.
+    let mut walk = WalkDir::new(root).skip_hidden(true).into_iter();
 
     loop {
         // Gather up to BATCH supported files (metadata only — no downloads).
