@@ -540,10 +540,21 @@ pub fn cluster_has_foreign_confirmed(
     Ok(n > 0)
 }
 
-/// Mark a cluster's faces as user-confirmed (exemplars + must-links). Used before an
-/// absorb/merge so the vouched-for faces become sticky, not auto-ejectable.
-pub fn confirm_cluster_faces(conn: &Connection, cluster_id: i64) -> Result<()> {
-    conn.execute("UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1", [cluster_id])?;
+/// Mark a cluster's faces as user-confirmed (exemplars + must-links) under the
+/// identity they're being vouched as: unclaimed faces and that identity's own.
+/// A face bound to a *different* identity is untouched — confirming it here would
+/// mint bogus exemplars for the other person. Used before absorbs/merges/rejects
+/// so the vouched-for faces become sticky, not auto-ejectable.
+pub fn confirm_cluster_faces(
+    conn: &Connection,
+    cluster_id: i64,
+    identity: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE faces SET confirmed = 1
+         WHERE cluster_id = ?1 AND (identity_id IS NULL OR identity_id IS ?2)",
+        rusqlite::params![cluster_id, identity],
+    )?;
     Ok(())
 }
 

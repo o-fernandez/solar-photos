@@ -448,10 +448,18 @@ fn merge_clusters(
     ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
-        // A user merge vouches for the moved faces — confirm them (sticky exemplars).
-        db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
+        // A user merge vouches for BOTH sides as one person — confirm both (sticky
+        // exemplars + must-links). Confirming only `from` let the next re-cluster
+        // split an unnamed `into`'s free faces right back off, and the same "same
+        // person?" card returned — the "didn't my answer register?" bug.
+        let into_identity =
+            db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
+        let from_identity = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, into, Some(into_identity)).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, from, from_identity).map_err(|e| e.to_string())?;
         db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
     }
+    prune_suggestion_cache(&state, &[into, from]);
     // The merge added exemplars — re-cluster + re-fold competitively (self-heal).
     schedule_recluster(app);
     Ok(())
@@ -1445,6 +1453,8 @@ fn absorb_clusters(
     expected_generation: Option<i64>,
 ) -> Result<(), String> {
     ensure_generation(&state, expected_generation)?;
+    let mut touched = clusters.clone();
+    touched.push(into);
     {
         let conn = state.conn.lock().unwrap();
         let into_identity = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
@@ -1460,10 +1470,11 @@ fn absorb_clusters(
                 continue;
             }
             // The user vouched for each absorbed group — confirm before folding in.
-            db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
+            db::confirm_cluster_faces(&conn, from, into_identity).map_err(|e| e.to_string())?;
             db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
         }
     }
+    prune_suggestion_cache(&state, &touched);
     // Bulk-merging added exemplars — re-cluster + re-fold competitively (self-heal).
     schedule_recluster(app);
     Ok(())
@@ -1471,6 +1482,11 @@ fn absorb_clusters(
 
 /// "Not the same" on a merge prompt: record a durable cannot-link so the pair is
 /// never suggested again (survives re-clusters, unlike a dismissed-in-memory card).
+/// Both sides become durable *competitors* — their faces are confirmed under their
+/// (possibly unnamed) identities. Without that, the minted identity bindings were
+/// unconfirmed, `clear_unconfirmed_identities` wiped them on the very next pass,
+/// the cannot-link no longer matched either cluster, and the same "same person?"
+/// card came straight back — rejections between unnamed groups never stuck.
 #[tauri::command]
 fn reject_merge(
     state: tauri::State<'_, AppState>,
@@ -1479,8 +1495,16 @@ fn reject_merge(
     expected_generation: Option<i64>,
 ) -> Result<(), String> {
     ensure_generation(&state, expected_generation)?;
-    let conn = state.conn.lock().unwrap();
-    db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())
+    {
+        let conn = state.conn.lock().unwrap();
+        db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())?;
+        let ia = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
+        let ib = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, into, ia).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, from, ib).map_err(|e| e.to_string())?;
+    }
+    prune_suggestion_cache(&state, &[into, from]);
+    Ok(())
 }
 
 /// "Not <person>" on a review candidate: instead of a weak, per-group cannot-link, make
@@ -1502,8 +1526,12 @@ fn not_this_person(
         // Mint identities for both sides + cannot-link, then confirm the rejected group
         // so it's a durable, competing exemplar (not wiped as a tentative machine label).
         db::add_cannot_link(&conn, person_cluster_id, other_cluster_id).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, other_cluster_id).map_err(|e| e.to_string())?;
+        let other_identity =
+            db::identity_of_cluster(&conn, other_cluster_id).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, other_cluster_id, other_identity)
+            .map_err(|e| e.to_string())?;
     }
+    prune_suggestion_cache(&state, &[person_cluster_id, other_cluster_id]);
     schedule_recluster(app);
     Ok(())
 }
@@ -1532,18 +1560,35 @@ fn resolve_same_photo(
                 .map(|(_, a, b)| (a, b))
                 .collect();
             db::add_same_photo_ok(&conn, &pairs).map_err(|e| e.to_string())?;
-            let into_identity = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
-            if db::cluster_has_foreign_confirmed(&conn, from, into_identity)
-                .map_err(|e| e.to_string())?
+            if db::cluster_has_foreign_confirmed(
+                &conn,
+                from,
+                db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
             {
                 return Err("that group holds another person's confirmed faces".into());
             }
-            db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
+            // Confirm both sides so the merge survives re-clustering (see
+            // merge_clusters), then fold.
+            let into_identity =
+                db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
+            db::confirm_cluster_faces(&conn, into, Some(into_identity))
+                .map_err(|e| e.to_string())?;
+            db::confirm_cluster_faces(&conn, from, db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
         } else {
+            // Two look-alikes: durable cannot-link, both sides durable competitors
+            // (same rationale as reject_merge — unconfirmed bindings evaporate).
             db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())?;
+            let ia = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
+            let ib = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
+            db::confirm_cluster_faces(&conn, into, ia).map_err(|e| e.to_string())?;
+            db::confirm_cluster_faces(&conn, from, ib).map_err(|e| e.to_string())?;
         }
     }
+    prune_suggestion_cache(&state, &[into, from]);
     schedule_recluster(app);
     Ok(())
 }
@@ -1725,6 +1770,45 @@ fn build_review_queue(
 /// (durably: absorbing writes confirmed must-links). The payload carries the
 /// generation it was computed at; on mismatch we refuse and the frontend refreshes.
 /// `None` (paths not fed by suggestions, e.g. the name typeahead) is not checked.
+/// Drop cached suggestions touching any of these clusters, immediately after a user
+/// decision lands. The full cache only refreshes when the (debounced) clustering
+/// pass completes seconds later; until then the stale cards would re-offer
+/// decisions the user already made — closing and reopening Review showed the same
+/// "merge all?" again, reading as "my answer didn't register." Over-pruning is
+/// safe: anything still relevant is regenerated by the next pass.
+fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
+    use std::collections::HashSet;
+    let set: HashSet<i64> = clusters.iter().copied().collect();
+    let touches = |item: &ReviewItem| -> bool {
+        match item {
+            ReviewItem::StrongBatch { into, groups, .. } => {
+                set.contains(into) || groups.iter().any(|g| set.contains(&g.cluster_id))
+            }
+            ReviewItem::Maybe { into, group, .. } => {
+                set.contains(into) || set.contains(&group.cluster_id)
+            }
+            ReviewItem::WhoIsThis { cluster_id, candidates, .. } => {
+                set.contains(cluster_id) || candidates.iter().any(|c| set.contains(&c.into))
+            }
+            ReviewItem::Pairwise { into, from, .. }
+            | ReviewItem::SamePhotoTwin { into, from, .. } => {
+                set.contains(into) || set.contains(from)
+            }
+        }
+    };
+    let mut cache = state.suggestion_cache.lock().unwrap();
+    cache.queue.retain(|i| !touches(i));
+    cache.merges.retain(|m| !(set.contains(&m.into) || set.contains(&m.from)));
+    for g in cache.growth.iter_mut() {
+        g.strong_groups.retain(|x| !set.contains(&x.cluster_id));
+        g.strong_clusters.retain(|c| !set.contains(c));
+        g.maybe.retain(|x| !set.contains(&x.cluster_id));
+    }
+    cache
+        .growth
+        .retain(|g| !set.contains(&g.into) && !(g.strong_clusters.is_empty() && g.maybe.is_empty()));
+}
+
 fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), String> {
     match expected {
         Some(g) if g != state.cluster_gen.load(Ordering::SeqCst) => {
