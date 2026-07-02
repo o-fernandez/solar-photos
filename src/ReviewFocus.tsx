@@ -19,7 +19,9 @@ import {
   mergeClusters,
   nameCluster,
   notThisPerson,
+  photoUrl,
   rejectMerge,
+  resolveSamePhoto,
   type Cluster,
   type ReviewItem,
   type ReviewQueue,
@@ -118,6 +120,9 @@ export default function ReviewFocus({
       } else if (item.kind === "pairwise") {
         if (k === "y") act(() => mergeClusters(item.into, item.from, generation), item.photos);
         else if (k === "n") act(() => rejectMerge(item.into, item.from, generation), item.photos);
+      } else if (item.kind === "same_photo_twin") {
+        if (k === "y") act(() => resolveSamePhoto(item.into, item.from, true, generation), item.photos);
+        else if (k === "n") act(() => resolveSamePhoto(item.into, item.from, false, generation), item.photos);
       } else if (item.kind === "strong_batch") {
         if (k === "y") {
           const rest = item.groups.filter((g) => !chipDone.has(g.cluster_id));
@@ -253,6 +258,37 @@ export default function ReviewFocus({
               <button className="sb-btn ghost" onClick={advance}>Not sure {keyHint("→")}</button>
             </div>
           )}
+        </>
+      );
+    }
+    if (item.kind === "same_photo_twin") {
+      return (
+        <>
+          <img className="rf-photo" src={photoUrl(item.photo_id)} alt="" draggable={false} />
+          <div className="rf-faces">
+            <img className="rf-face small" src={faceCropUrl(item.face_a)} alt="" draggable={false} />
+            <img className="rf-face small" src={faceCropUrl(item.face_b)} alt="" draggable={false} />
+          </div>
+          <p className="rf-q">These two are in this one photo — same person?</p>
+          <p className="rf-sub">
+            A collage, mirror, or photo-of-a-photo shows one person twice; twins or
+            look-alike siblings are two people.
+          </p>
+          <div className="rf-actions">
+            <button
+              className="sb-btn"
+              onClick={() => act(() => resolveSamePhoto(item.into, item.from, true, generation), item.photos)}
+            >
+              Same person {keyHint("Y")}
+            </button>
+            <button
+              className="sb-btn"
+              onClick={() => act(() => resolveSamePhoto(item.into, item.from, false, generation), item.photos)}
+            >
+              Two people {keyHint("N")}
+            </button>
+            <button className="sb-btn ghost" onClick={advance}>Skip {keyHint("→")}</button>
+          </div>
         </>
       );
     }

@@ -271,6 +271,18 @@ export type ReviewItem =
       into_name: string | null;
       into_faces: number[];
       from_faces: number[];
+    }
+  | {
+      kind: "same_photo_twin";
+      photos: number;
+      into: number;
+      from: number;
+      into_name: string | null;
+      /** The shared photo and the co-occurring face from each side. */
+      photo_id: number;
+      face_a: number;
+      face_b: number;
+      similarity: number;
     };
 
 export interface ReviewQueue {
@@ -287,6 +299,23 @@ export function getReviewQueue(): Promise<ReviewQueue> {
 /** The current clustering generation, for guarding actions on loaded cluster ids. */
 export function getClusterGeneration(): Promise<number> {
   return invoke("get_cluster_generation");
+}
+
+/** Resolve a same-photo contradiction: `samePerson` = it's a collage/mirror
+ *  (record durable per-pair exceptions + merge); otherwise they're two
+ *  look-alikes — durable cannot-link so they never re-merge. */
+export function resolveSamePhoto(
+  into: number,
+  from: number,
+  samePerson: boolean,
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("resolve_same_photo", {
+    into,
+    from,
+    samePerson,
+    expectedGeneration: expectedGeneration ?? null,
+  });
 }
 
 /** Fold a batch of look-alike clusters into a confirmed person (durable). */

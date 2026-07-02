@@ -110,6 +110,18 @@ pub fn init(conn: &Connection) -> Result<()> {
     // Migration for libraries created before identities existed.
     let _ = conn.execute("ALTER TABLE faces ADD COLUMN identity_id INTEGER", []);
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_faces_identity ON faces(identity_id);")?;
+    // User-confirmed exceptions to the same-photo rule: face-id pairs that share a
+    // photo but ARE one person — a collage, a mirror, a photo-booth strip. Granted
+    // from the review question ("same photo — same person?"), per pair, so one
+    // collage never weakens the twins-stay-apart rule anywhere else. Photo-level
+    // truth (like embeddings), so "start people over" deliberately keeps these.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS same_photo_ok (
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            PRIMARY KEY (a, b)
+         );",
+    )?;
     // `ignored` faces are excluded from People for good (a stranger, a poster, a
     // reflection) — they keep cluster_id = NULL like a detach, but the flag marks
     // the exclusion as intentional and permanent so the overlay never re-draws them.
@@ -265,6 +277,43 @@ pub fn confirmed_identity_photos(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// The user-confirmed same-photo exceptions (collages/mirrors), as normalized pairs.
+pub fn same_photo_ok_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT a, b FROM same_photo_ok")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Record same-photo exceptions for a set of face pairs (normalized, idempotent).
+pub fn add_same_photo_ok(conn: &Connection, pairs: &[(i64, i64)]) -> Result<()> {
+    let mut ins = conn
+        .prepare("INSERT OR IGNORE INTO same_photo_ok (a, b) VALUES (?1, ?2)")?;
+    for &(x, y) in pairs {
+        let (a, b) = if x < y { (x, y) } else { (y, x) };
+        ins.execute(rusqlite::params![a, b])?;
+    }
+    Ok(())
+}
+
+/// Face pairs across two clusters that share a photo: `(photo_id, face_in_a,
+/// face_in_b)`. These are the pairs the same-photo rule blocks — and the ones a
+/// "same person (collage)" answer marks as exceptions.
+pub fn cooccurring_face_pairs(
+    conn: &Connection,
+    cluster_a: i64,
+    cluster_b: i64,
+) -> Result<Vec<(i64, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f1.photo_id, f1.id, f2.id FROM faces f1
+         JOIN faces f2 ON f2.photo_id = f1.photo_id
+         WHERE f1.cluster_id = ?1 AND f2.cluster_id = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cluster_a, cluster_b], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// (face_id, embedding) for every face that still belongs to a cluster — the input
 /// to a full [`crate::cluster::recluster`]. We deliberately skip NULL-cluster faces:
 /// those were detached by "not this person" and must stay out (a re-cluster must not
@@ -349,6 +398,7 @@ pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
          DELETE FROM cluster_names;
          DELETE FROM identities;
          DELETE FROM cannot_link;
+         DELETE FROM same_photo_ok;
          UPDATE photos SET faces_scanned = 0;
          DELETE FROM app_meta WHERE key = 'reclustered_v1';",
     )?;
@@ -1274,5 +1324,28 @@ mod tests {
         assert!(!cluster_has_foreign_confirmed(&conn, 10, Some(2)).unwrap());
         // Cluster 30 has no confirmed faces at all.
         assert!(!cluster_has_foreign_confirmed(&conn, 30, Some(1)).unwrap());
+    }
+
+    /// The same-photo exception round-trip: the pairs the rule blocks are exactly
+    /// the ones a "same person (collage)" answer whitelists.
+    #[test]
+    fn same_photo_exception_roundtrip() {
+        let conn = test_conn();
+        // Photo 9 holds face 1 (cluster 10) and face 2 (cluster 20) — a collage
+        // split. Photo 8 holds an unrelated pair in the same clusters.
+        conn.execute("UPDATE faces SET photo_id = photo_id", []).unwrap(); // no-op guard
+        conn.execute(
+            "INSERT INTO faces (id, photo_id, x1, y1, x2, y2, score, embedding, cluster_id)
+             VALUES (1, 9, 0,0,1,1, 0.9, x'00', 10), (2, 9, 2,2,3,3, 0.9, x'00', 20),
+                    (3, 8, 0,0,1,1, 0.9, x'00', 10), (4, 7, 0,0,1,1, 0.9, x'00', 20)",
+            [],
+        )
+        .unwrap();
+        let pairs = cooccurring_face_pairs(&conn, 10, 20).unwrap();
+        assert_eq!(pairs, vec![(9, 1, 2)], "only the shared-photo pair is blocked");
+        add_same_photo_ok(&conn, &pairs.iter().map(|&(_, a, b)| (a, b)).collect::<Vec<_>>())
+            .unwrap();
+        add_same_photo_ok(&conn, &[(2, 1)]).unwrap(); // reversed + duplicate: idempotent
+        assert_eq!(same_photo_ok_pairs(&conn).unwrap(), vec![(1, 2)]);
     }
 }

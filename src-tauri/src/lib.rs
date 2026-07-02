@@ -484,13 +484,17 @@ fn box_iou(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
 const DOUBLE_DETECTION_IOU: f32 = 0.4;
 
 /// Same-photo constraint data for clustering: `face -> photo` (multi-face photos
-/// only — singletons can't conflict) and the double-detection exception pairs.
+/// only — singletons can't conflict) and the exception pairs — double detections
+/// (by IoU) plus the user's "same person (collage/mirror)" answers.
 fn photo_constraints(
     conn: &Connection,
 ) -> anyhow::Result<(std::collections::HashMap<i64, i64>, std::collections::HashSet<(i64, i64)>)> {
     let rows = db::multi_face_boxes(conn)?; // ordered by photo_id
     let mut photo_of = std::collections::HashMap::new();
-    let mut ok = std::collections::HashSet::new();
+    let mut ok: std::collections::HashSet<(i64, i64)> = db::same_photo_ok_pairs(conn)?
+        .into_iter()
+        .map(|(x, y)| if x < y { (x, y) } else { (y, x) })
+        .collect();
     let mut i = 0;
     while i < rows.len() {
         let mut j = i;
@@ -926,13 +930,25 @@ struct MergeSuggestion {
 /// so the most worthwhile, most confident merges come first. The larger cluster
 /// is the "into" side, so merging folds the small group into the person.
 ///
+/// Two co-occurring clusters must look at least this alike before we raise the
+/// same-photo contradiction as a question — below it they're just two people in
+/// one frame (the normal case), not a suspected collage.
+const SAME_PHOTO_ASK_MIN: f32 = 0.7;
+
 /// Heavy (a kNN pass over every clustered face) — runs only from the background
 /// cache refresh at the end of a clustering pass, never from a UI command. Empty
 /// until the sweep has settled: no prompts off half-built clusters.
-fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSuggestion>> {
+///
+/// Also returns the same-photo contradictions (see [`ReviewItem::SamePhotoTwin`]):
+/// pairs the co-occurrence rule blocks even though the faces look like one person.
+/// Dropping them silently quarantined collage fragments forever; asking resolves
+/// them in one glance at the shared photo.
+fn compute_merge_suggestions(
+    conn: &Connection,
+) -> anyhow::Result<(Vec<MergeSuggestion>, Vec<ReviewItem>)> {
     match db::face_progress(conn)? {
         (scanned, eligible) if eligible > 0 && scanned >= eligible => {}
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), Vec::new())),
     }
     let overview = db::clusters_overview(conn)?;
     let faces = db::face_cluster_embeddings(conn)?;
@@ -975,10 +991,9 @@ fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSugge
     };
 
     let mut out = Vec::with_capacity(ranked.len());
+    let mut twins: Vec<ReviewItem> = Vec::new();
+    let mut twin_photos_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (e, _) in ranked {
-        if share_photo(e.a, e.b) {
-            continue;
-        }
         let (big, small) = {
             let (ca, cb) = (info[&e.a], info[&e.b]);
             if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
@@ -993,6 +1008,32 @@ fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSugge
                 continue;
             }
         }
+        if share_photo(e.a, e.b) {
+            // The contradiction case: co-occurring, yet strong same-person evidence.
+            // Never auto-merge (could be twins) — ask, showing the shared photo.
+            // One question per photo: a collage split into N fragments would raise
+            // a card per fragment pair; the first answer re-clusters and re-derives.
+            if e.max_sim >= SAME_PHOTO_ASK_MIN {
+                if let Ok(pairs) = db::cooccurring_face_pairs(conn, big.cluster_id, small.cluster_id)
+                {
+                    if let Some(&(photo_id, fa, fb)) = pairs.first() {
+                        if twin_photos_seen.insert(photo_id) {
+                            twins.push(ReviewItem::SamePhotoTwin {
+                                photos: small.count,
+                                into: big.cluster_id,
+                                from: small.cluster_id,
+                                into_name: big.name.clone(),
+                                photo_id,
+                                face_a: fa,
+                                face_b: fb,
+                                similarity: e.max_sim,
+                            });
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         out.push(MergeSuggestion {
             into: big.cluster_id,
             from: small.cluster_id,
@@ -1004,7 +1045,7 @@ fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSugge
             generation: 0, // stamped by refresh_suggestion_cache
         });
     }
-    Ok(out)
+    Ok((out, twins))
 }
 
 /// The cached "same person?" suggestions from the last clustering pass. Instant —
@@ -1084,6 +1125,21 @@ enum ReviewItem {
         into_name: Option<String>,
         into_faces: Vec<i64>,
         from_faces: Vec<i64>,
+    },
+    /// The same-photo contradiction: two clusters look like one person (strong
+    /// cross-similarity) but share a photo — one person twice (collage, mirror,
+    /// booth strip) or two look-alikes (twins)? Undecidable from embeddings; the
+    /// human sees the shared photo and decides in a glance.
+    SamePhotoTwin {
+        photos: i64,
+        into: i64,
+        from: i64,
+        into_name: Option<String>,
+        /// The shared photo, and the co-occurring face from each side.
+        photo_id: i64,
+        face_a: i64,
+        face_b: i64,
+        similarity: f32,
     },
 }
 
@@ -1452,6 +1508,46 @@ fn not_this_person(
     Ok(())
 }
 
+/// Resolve a same-photo contradiction (see [`ReviewItem::SamePhotoTwin`]).
+/// `same_person = true`: it's a collage/mirror — record durable per-pair exceptions
+/// for every co-occurring face pair between the two clusters, then confirm + merge
+/// (the exceptions are what let the next re-cluster keep them together).
+/// `same_person = false`: they're two look-alikes (twins) — durable cannot-link.
+#[tauri::command]
+fn resolve_same_photo(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    into: i64,
+    from: i64,
+    same_person: bool,
+    expected_generation: Option<i64>,
+) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
+    {
+        let conn = state.conn.lock().unwrap();
+        if same_person {
+            let pairs: Vec<(i64, i64)> = db::cooccurring_face_pairs(&conn, into, from)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(_, a, b)| (a, b))
+                .collect();
+            db::add_same_photo_ok(&conn, &pairs).map_err(|e| e.to_string())?;
+            let into_identity = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
+            if db::cluster_has_foreign_confirmed(&conn, from, into_identity)
+                .map_err(|e| e.to_string())?
+            {
+                return Err("that group holds another person's confirmed faces".into());
+            }
+            db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
+            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+        } else {
+            db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())?;
+        }
+    }
+    schedule_recluster(app);
+    Ok(())
+}
+
 /// Wipe all face data — detections, clusters, names, identities, decisions — and
 /// re-arm the sweep so the whole library is analyzed from scratch. For testing the
 /// recognition experience end-to-end on a clean slate.
@@ -1556,7 +1652,7 @@ fn apply_must_links(face_identity: &[(i64, i64)], assignments: &mut [(i64, i64)]
 fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     let state = app.state::<AppState>();
     let generation = state.cluster_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let mut merges = compute_merge_suggestions(conn).unwrap_or_default();
+    let (mut merges, twins) = compute_merge_suggestions(conn).unwrap_or_default();
     let (mut growth, who) = compute_identity_growth(conn).unwrap_or_default();
     for s in &mut merges {
         s.generation = generation;
@@ -1564,7 +1660,9 @@ fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     for g in &mut growth {
         g.generation = generation;
     }
-    let queue = build_review_queue(&merges, &growth, who);
+    let mut special = who;
+    special.extend(twins);
+    let queue = build_review_queue(&merges, &growth, special);
     *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth, queue };
 }
 
@@ -1613,7 +1711,8 @@ fn build_review_queue(
         ReviewItem::StrongBatch { photos, .. }
         | ReviewItem::Maybe { photos, .. }
         | ReviewItem::WhoIsThis { photos, .. }
-        | ReviewItem::Pairwise { photos, .. } => *photos,
+        | ReviewItem::Pairwise { photos, .. }
+        | ReviewItem::SamePhotoTwin { photos, .. } => *photos,
     };
     items.sort_by(|a, b| photos_of(b).cmp(&photos_of(a)));
     items.truncate(MAX_QUEUE);
@@ -2502,6 +2601,7 @@ pub fn run() {
             get_identity_growth,
             get_review_queue,
             get_cluster_generation,
+            resolve_same_photo,
             absorb_clusters,
             reject_merge,
             not_this_person,

@@ -1805,3 +1805,14 @@ body,
   text-align: center;
   padding: 8px 0 4px;
 }
+/* The shared photo on a same-photo contradiction card — large enough to
+   recognize a collage/mirror at a glance. */
+.rf-photo {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  margin: 0 auto 10px;
+  border-radius: 10px;
+  object-fit: contain;
+  background: #f2f2f2;
+}

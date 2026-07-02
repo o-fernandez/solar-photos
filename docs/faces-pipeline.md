@@ -94,6 +94,16 @@ Enforced everywhere:
   = one face detected twice). Same rule in the incremental `ClusterIndex::assign`.
 - **Auto-fold / growth / pairwise suggestions**: a candidate that co-occurs with the
   identity's confirmed photos (or with the other cluster) is vetoed (`cooccurs`).
+- **The collage escape hatch** (same person twice in one image — collage, mirror,
+  booth strip): never guessed by similarity (identical twins can look near-duplicate
+  too). When the pairwise engine finds *strong* same-person evidence
+  (≥ `SAME_PHOTO_ASK_MIN`) between co-occurring clusters — the contradiction — it
+  raises a `SamePhotoTwin` review card showing the **shared photo**; a human tells a
+  collage from twins in one glance. "Same person" writes durable per-face-pair
+  exceptions to `same_photo_ok` (photo-level truth: kept across "start people over",
+  wiped only by full re-detection) and merges; "two people" writes the cannot-link.
+  Without this, collage fragments were silently quarantined from every automatic
+  reunion path forever.
 
 ## The review queue + focus mode
 
