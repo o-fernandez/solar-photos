@@ -4,15 +4,8 @@
 No cloud, no account, no subscription — just your photos, on your machine, the
 way Picasa used to feel.
 
-<!--
-  ▲ ABOVE THE FOLD: replace this comment with a GIF that *is* the pitch — for a
-  performance-and-feel product it shows what words can't. Two strong candidates:
-  (1) the thumbnail grid scrolling smoothly through a large library, and
-  (2) the People tab filling in — faces grouping, a name applied, a "merge all"
-  reuniting someone. Drop it at docs/media/grid-scroll.gif and uncomment:
-
-  ![Solar — scrolling a large library at 60fps](docs/media/grid-scroll.gif)
--->
+![Solar — faces grouped and named on-device](docs/media/people_demo.png)
+<sub>Screenshots use a throwaway demo library of stock/AI-generated photos, not real photos — Solar never phones home either way.</sub>
 
 ---
 
@@ -60,11 +53,7 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
   and pruning deleted ones — and never deleting anything if a drive is
   unreachable.
 
-<!--
-  Drop real feature screenshots here once the grid feels great, e.g.:
-  ![Face clustering](docs/media/faces.png)
-  ![The timeline grid](docs/media/grid.png)
--->
+![The newest-first timeline grid](docs/media/timeline_demo.png)
 
 ## What it will never do
 
