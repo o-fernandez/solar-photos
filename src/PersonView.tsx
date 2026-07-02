@@ -16,12 +16,16 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
 import {
   absorbClusters,
+  detachFaces,
   faceCropUrl,
   faceIdsForPhotos,
   getClusters,
+  getPersonLooks,
   getPersonPhotos,
   ignoreFaces,
+  mergeClusters,
   nameCluster,
+  notThisPerson,
   onThumbReady,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
@@ -36,6 +40,7 @@ import {
   type Cluster,
   type CorrectionUndo,
   type GrowthCluster,
+  type PersonLook,
   type PhotoRow,
 } from "./api";
 
@@ -78,6 +83,12 @@ export default function PersonView({
 }) {
   const [rows, setRows] = useState<PhotoRow[]>([]);
   const [loaded, setLoaded] = useState(false);
+  // This person's "looks" (appearance sub-clusters) and which one filters the grid.
+  const [looks, setLooks] = useState<PersonLook[]>([]);
+  const [selectedLook, setSelectedLook] = useState<number | null>(null);
+  // Whether the selected look's "move to which person?" picker is open, and its text.
+  const [lookPicking, setLookPicking] = useState(false);
+  const [lookPickQuery, setLookPickQuery] = useState("");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [name, setName] = useState(cluster.name);
@@ -106,13 +117,26 @@ export default function PersonView({
     });
   }, []);
 
-  // resolveId reads the latest rows without re-subscribing the viewer.
-  const rowsRef = useRef<PhotoRow[]>(rows);
-  rowsRef.current = rows;
+  // The grid shows the whole person, or just the selected look. Filtering is
+  // client-side (we already hold every photo), so a look switch is instant.
+  const shown = useMemo(() => {
+    if (selectedLook == null || !looks[selectedLook]) return rows;
+    const ids = new Set(looks[selectedLook].photo_ids);
+    return rows.filter((r) => ids.has(r.id));
+  }, [rows, looks, selectedLook]);
+
+  // resolveId reads the latest shown rows without re-subscribing the viewer, so the
+  // lightbox's ←/→ stay scoped to whatever the grid is currently showing.
+  const rowsRef = useRef<PhotoRow[]>(shown);
+  rowsRef.current = shown;
   const resolveId = useCallback(
     (i: number): Promise<number | null> => Promise.resolve(rowsRef.current[i]?.id ?? null),
     [],
   );
+  // The full photo set (independent of any look filter) — corrections and undo act on
+  // this so they're correct even when the grid is filtered to one look.
+  const fullRowsRef = useRef<PhotoRow[]>(rows);
+  fullRowsRef.current = rows;
 
   // Reload this person's photo set from the backend — after a correction made in
   // the open photo (Lightbox) changes who's in it.
@@ -128,10 +152,22 @@ export default function PersonView({
       .catch(() => setLoaded(true));
   }, [cluster.cluster_id]);
 
-  // Load this person's photos once on mount (the whole set is known — no paging).
+  // Load (and reload) this person's "looks" — the appearance sub-clusters. Refreshed
+  // after any correction, since moving faces changes the grouping (and clears a flag).
+  const loadLooks = useCallback(() => {
+    getPersonLooks(cluster.cluster_id)
+      .then((l) => {
+        setLooks(l);
+        setSelectedLook((cur) => (cur != null && cur >= l.length ? null : cur));
+      })
+      .catch(() => {});
+  }, [cluster.cluster_id]);
+
+  // Load this person's photos + looks once on mount (the whole set is known — no paging).
   useEffect(() => {
     reloadPhotos();
-  }, [reloadPhotos]);
+    loadLooks();
+  }, [reloadPhotos, loadLooks]);
 
   // Fill cells whose thumbnails finish while the page is open.
   useEffect(() => {
@@ -158,7 +194,7 @@ export default function PersonView({
     return () => ro.disconnect();
   }, [loaded]);
 
-  const total = rows.length;
+  const total = shown.length;
   const { columns, cellSize, rowHeight, rowCount } = useMemo(() => {
     const w = Math.max(width, TARGET_CELL);
     const cols = Math.max(1, Math.floor((w + GAP) / (TARGET_CELL + GAP)));
@@ -185,18 +221,47 @@ export default function PersonView({
     prioritizeTimer.current = window.setTimeout(() => {
       const ids: number[] = [];
       for (let i = firstIndex; i <= lastIndex; i++) {
-        const p = rows[i];
+        const p = shown[i];
         if (p && !readyRef.current.has(p.id)) ids.push(p.id);
       }
       setVisibleRange(ids).catch(() => {});
     }, 80);
-  }, [virtualRows, columns, total, rows]);
+  }, [virtualRows, columns, total, shown]);
+
+  // Existing people whose name contains the draft (merge-into-existing suggestions),
+  // and the one that matches it exactly — the signal that naming should merge, not
+  // rename. Mirrors the People grid so renaming here behaves the same.
+  const nameMatches = (q: string): Cluster[] => {
+    const s = q.trim().toLowerCase();
+    if (!s) return [];
+    return people
+      .filter((c) => c.cluster_id !== cluster.cluster_id && c.name && c.name.toLowerCase().includes(s))
+      .slice(0, 5);
+  };
+  const exactNameMatch = (q: string): Cluster | undefined => {
+    const s = q.trim().toLowerCase();
+    if (!s) return undefined;
+    return people.find(
+      (c) => c.cluster_id !== cluster.cluster_id && c.name != null && c.name.toLowerCase() === s,
+    );
+  };
+  // Fold this whole person into another (picked, or typed as an exact match), then
+  // leave the page — this cluster is now part of the other.
+  const mergeThisInto = (target: Cluster) => {
+    setEditing(false);
+    mergeClusters(target.cluster_id, cluster.cluster_id).then(onBack).catch(() => {});
+  };
 
   const commitName = () => {
     const value = draft.trim();
+    setEditing(false);
+    const match = value ? exactNameMatch(value) : undefined;
+    if (match) {
+      mergeThisInto(match);
+      return;
+    }
     nameCluster(cluster.cluster_id, value).catch(() => {});
     setName(value || null);
-    setEditing(false);
   };
 
   // Review-tail decisions (the "N more might also be this person" band). "Yes" folds
@@ -207,7 +272,12 @@ export default function PersonView({
   const resolveReview = (c: GrowthCluster, keep: boolean) => {
     if (!review) return;
     setReviewResolved((s) => new Set(s).add(c.cluster_id));
-    (keep ? absorbClusters(review.into, [c.cluster_id]) : rejectMerge(review.into, c.cluster_id))
+    // "Yes" folds the group in; "No" makes it a durable competitor (its own confirmed
+    // identity) so this and other look-alikes get pulled away from this person.
+    (keep
+      ? absorbClusters(review.into, [c.cluster_id])
+      : notThisPerson(review.into, c.cluster_id)
+    )
       .then(() => {
         if (keep) reloadPhotos();
       })
@@ -241,7 +311,7 @@ export default function PersonView({
     async (photoIds: number[], run: (faceIds: number[]) => Promise<CorrectionUndo>, label: string) => {
       if (photoIds.length === 0) return;
       const idSet = new Set(photoIds);
-      const removed = rowsRef.current.filter((r) => idSet.has(r.id));
+      const removed = fullRowsRef.current.filter((r) => idSet.has(r.id));
       setRows((rs) => rs.filter((r) => !idSet.has(r.id)));
       clearSelection();
       try {
@@ -250,11 +320,13 @@ export default function PersonView({
         setUndo({ rows: removed, undo: tok, label });
         if (undoTimer.current) window.clearTimeout(undoTimer.current);
         undoTimer.current = window.setTimeout(() => setUndo(null), 6000);
+        // Moving faces out changes the look grouping (and clears a repair flag).
+        loadLooks();
       } catch {
         setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
       }
     },
-    [cluster.cluster_id],
+    [cluster.cluster_id, loadLooks],
   );
 
   const doUndo = () => {
@@ -262,7 +334,10 @@ export default function PersonView({
     const { rows: removed, undo: tok } = undo;
     setUndo(null);
     undoCorrection(tok)
-      .then(() => setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs)))
+      .then(() => {
+        setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
+        loadLooks();
+      })
       .catch(() => {});
   };
 
@@ -281,15 +356,67 @@ export default function PersonView({
     );
   const ignoreSelected = () =>
     applyCorrection(selectedIds, (fids) => ignoreFaces(fids), "Ignored");
+  // "Not [name]" on a multi-selection: detach without saying who they are — each
+  // re-homes by appearance (may become several people, or none), not forced together.
+  const notThisSelected = () =>
+    applyCorrection(selectedIds, (fids) => detachFaces(fids), `Not ${name ?? "this person"}`);
 
-  // Named people other than the one we're viewing, filtered by the typeahead.
-  const pickMatches = useMemo(() => {
-    const q = pickQuery.trim().toLowerCase();
-    return people
+  // Acting on a whole look (the selected swatch). Every look — flagged or not — can be
+  // moved to a person you pick, sent to a specific target, or detached back to the
+  // unnamed batches. All reuse the reassign+undo path; clear the filter so the result
+  // is visible. `endLook` resets the swatch selection + picker afterward.
+  const activeLook = selectedLook != null ? looks[selectedLook] : undefined;
+  const endLook = () => {
+    setSelectedLook(null);
+    setLookPicking(false);
+    setLookPickQuery("");
+  };
+  const moveLookToCluster = (targetCluster: number, label: string) => {
+    if (!activeLook) return;
+    const ids = activeLook.photo_ids;
+    endLook();
+    applyCorrection(ids, (fids) => reassignFacesToCluster(fids, cluster.cluster_id, targetCluster), label);
+  };
+  const moveLookToPerson = (target: Cluster) =>
+    moveLookToCluster(target.cluster_id, `Moved to ${target.name}`);
+  // "+ New person" in the look picker: split the whole look into one fresh person
+  // (optionally named) — they ARE all one person, just not any existing one.
+  const moveLookToNewPerson = (newName?: string) => {
+    if (!activeLook) return;
+    const ids = activeLook.photo_ids;
+    endLook();
+    applyCorrection(
+      ids,
+      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName),
+      newName ? `Moved to ${newName}` : "Moved to a new person",
+    );
+  };
+  // "Not [name]" on a look: detach without saying who — each re-homes by appearance,
+  // not forced together (they may be several different people).
+  const notLook = () => {
+    if (!activeLook) return;
+    const ids = activeLook.photo_ids;
+    endLook();
+    applyCorrection(ids, (fids) => detachFaces(fids), `Not ${name ?? "this person"}`);
+  };
+  // "It's actually this person" on a flagged look: record that this person and the
+  // suggested other are *different* people (durable cannot-link), which both dismisses
+  // this flag and stops the look ever being suggested as them again.
+  const keepLook = () => {
+    if (!activeLook || activeLook.likely_other_cluster == null) return;
+    endLook();
+    rejectMerge(cluster.cluster_id, activeLook.likely_other_cluster).then(loadLooks).catch(() => {});
+  };
+
+  // Named people other than the one we're viewing, filtered by a typeahead — shared by
+  // the multi-select move picker and the per-look move picker.
+  const filterPeople = (q: string) =>
+    people
       .filter((c) => c.cluster_id !== cluster.cluster_id && c.name)
-      .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
+      .filter((c) => (q.trim() ? c.name!.toLowerCase().includes(q.trim().toLowerCase()) : true))
       .slice(0, 6);
-  }, [people, pickQuery, cluster.cluster_id]);
+  const pickMatches = useMemo(() => filterPeople(pickQuery), [people, pickQuery, cluster.cluster_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const lookPickMatches = useMemo(() => filterPeople(lookPickQuery), [people, lookPickQuery, cluster.cluster_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const header = (
     <div className="person-header">
@@ -299,18 +426,42 @@ export default function PersonView({
       <img className="person-avatar" src={faceCropUrl(cluster.cover_face_id)} alt="" draggable={false} />
       <div className="person-meta">
         {editing ? (
-          <input
-            className="pname-input"
-            autoFocus
-            value={draft}
-            placeholder="Name"
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitName();
-              else if (e.key === "Escape") setEditing(false);
-            }}
-            onBlur={commitName}
-          />
+          <div className="pname-combo">
+            <input
+              className="pname-input"
+              autoFocus
+              value={draft}
+              placeholder="Name"
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitName();
+                else if (e.key === "Escape") setEditing(false);
+              }}
+              onBlur={commitName}
+            />
+            {(() => {
+              const matches = nameMatches(draft);
+              if (matches.length === 0) return null;
+              // preventDefault keeps the input from blurring (and rename-committing)
+              // before a suggestion click runs its merge.
+              return (
+                <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
+                  <li className="name-suggest-head">Merge into an existing person</li>
+                  {matches.map((m) => (
+                    <li
+                      key={m.cluster_id}
+                      className="name-suggest-item"
+                      onClick={() => mergeThisInto(m)}
+                    >
+                      <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                      <span className="ns-name">{m.name}</span>
+                      <span className="ns-count">{m.count.toLocaleString()}</span>
+                    </li>
+                  ))}
+                </ul>
+              );
+            })()}
+          </div>
         ) : name ? (
           <button
             className="person-name"
@@ -333,12 +484,12 @@ export default function PersonView({
           </button>
         )}
         <div className="person-sub">
-          {total.toLocaleString()} {total === 1 ? "photo" : "photos"}
-          {total > 0 && (
+          {rows.length.toLocaleString()} {rows.length === 1 ? "photo" : "photos"}
+          {rows.length > 0 && (
             <>
               {" · "}
               {(() => {
-                const lo = monthYear(rows[total - 1].ts);
+                const lo = monthYear(rows[rows.length - 1].ts);
                 const hi = monthYear(rows[0].ts);
                 return lo === hi ? lo : `${lo} – ${hi}`;
               })()}
@@ -352,6 +503,126 @@ export default function PersonView({
   return (
     <div className="person-view">
       {header}
+
+      {looks.length > 0 && (
+        <div className="person-looks">
+          <button
+            className={`look look-all${selectedLook == null ? " sel" : ""}`}
+            onClick={() => setSelectedLook(null)}
+          >
+            <span className="look-allmark" aria-hidden="true">▦</span>
+            <span className="look-lbl">All</span>
+            <span className="look-sub">{rows.length.toLocaleString()}</span>
+          </button>
+          {looks.map((lk, i) => {
+            const flagged = lk.likely_other_name != null;
+            return (
+              <button
+                key={i}
+                className={`look${flagged ? " flag" : ""}${selectedLook === i ? " sel" : ""}`}
+                title={
+                  flagged
+                    ? `Might be ${lk.likely_other_name} — click to move`
+                    : "Filter to this look, or move it"
+                }
+                onClick={() => {
+                  setSelectedLook(selectedLook === i ? null : i);
+                  setLookPicking(false);
+                }}
+              >
+                <img className="look-face" src={faceCropUrl(lk.cover_face_id)} alt="" draggable={false} />
+                {flagged ? (
+                  <span className="look-flagtag">looks like {lk.likely_other_name}</span>
+                ) : (
+                  <span className="look-sub">
+                    {lk.photos.toLocaleString()} {lk.photos === 1 ? "photo" : "photos"}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {activeLook && selected.size === 0 && (
+        <div className="look-bar">
+          <span className="lb-count">
+            {activeLook.photos.toLocaleString()} in this look
+          </span>
+          {lookPicking ? (
+            <div className="sb-picker">
+              <input
+                className="pname-input"
+                autoFocus
+                value={lookPickQuery}
+                placeholder="Move to which person?"
+                onChange={(e) => setLookPickQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setLookPicking(false);
+                  else if (e.key === "Enter" && lookPickQuery.trim())
+                    moveLookToNewPerson(lookPickQuery.trim());
+                }}
+              />
+              <ul className="sb-matches">
+                {lookPickMatches.map((m) => (
+                  <li key={m.cluster_id} className="sb-match" onClick={() => moveLookToPerson(m)}>
+                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                    <span className="ns-name">{m.name}</span>
+                    <span className="ns-count">{m.count.toLocaleString()}</span>
+                  </li>
+                ))}
+                <li
+                  className="sb-match sb-new"
+                  onClick={() => moveLookToNewPerson(lookPickQuery.trim() || undefined)}
+                >
+                  + New person{lookPickQuery.trim() ? ` “${lookPickQuery.trim()}”` : ""}
+                </li>
+              </ul>
+            </div>
+          ) : activeLook.likely_other_name != null ? (
+            // A flagged look: affirm it's this person, accept the suggestion, or pick.
+            <>
+              <button className="sb-btn" onClick={keepLook} title="This look really is this person">
+                It’s {name ?? "this person"}
+              </button>
+              <button
+                className="sb-btn"
+                onClick={() =>
+                  moveLookToCluster(
+                    activeLook.likely_other_cluster!,
+                    `Moved to ${activeLook.likely_other_name}`,
+                  )
+                }
+              >
+                Move to {activeLook.likely_other_name}
+              </button>
+              <button className="sb-btn" onClick={() => setLookPicking(true)}>
+                Someone else…
+              </button>
+              <button className="sb-btn ghost" onClick={endLook}>
+                Done
+              </button>
+            </>
+          ) : (
+            // A genuine look: move it to a person, or detach it back to unnamed.
+            <>
+              <button className="sb-btn" onClick={() => setLookPicking(true)}>
+                Move to…
+              </button>
+              <button
+                className="sb-btn"
+                title="Detach — let each face re-cluster where it belongs"
+                onClick={notLook}
+              >
+                Not {name ?? "this person"}
+              </button>
+              <button className="sb-btn ghost" onClick={endLook}>
+                Done
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       {reviewLeft.length > 0 && (
         <div className="person-review">
@@ -401,7 +672,7 @@ export default function PersonView({
         </div>
       ) : (
         <div className="grid-wrap">
-          <div ref={scrollRef} className="grid-scroll">
+          <div ref={scrollRef} className="grid-scroll person-scroll">
             <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, width: "100%", position: "relative" }}>
               {virtualRows.map((virtualRow) => {
                 const rowStart = virtualRow.index * columns;
@@ -409,7 +680,7 @@ export default function PersonView({
                 for (let c = 0; c < columns; c++) {
                   const index = rowStart + c;
                   if (index >= total) break;
-                  const photo = rows[index];
+                  const photo = shown[index];
                   const isSelected = selected.has(photo.id);
                   const selecting = selected.size > 0;
                   cells.push(
@@ -499,6 +770,13 @@ export default function PersonView({
             <>
               <button className="sb-btn" onClick={() => setPicking(true)}>
                 Move to…
+              </button>
+              <button
+                className="sb-btn"
+                onClick={notThisSelected}
+                title="Detach — let each face re-cluster where it belongs"
+              >
+                Not {name ?? "this person"}
               </button>
               <button className="sb-btn" onClick={ignoreSelected} title="Not a person — hide from People">
                 Not a person

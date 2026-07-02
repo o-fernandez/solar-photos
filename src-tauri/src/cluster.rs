@@ -366,6 +366,44 @@ pub fn merge_evidence(faces: &[(i64, i64, Vec<f32>)]) -> Vec<PairEvidence> {
         .collect()
 }
 
+/// Coarse intra-person "looks": group one person's own faces into a handful of
+/// appearance-coherent sub-clusters (baby vs. adult, glasses vs. not — and any
+/// misclassified batch, which lands in its own group because it's a different face).
+/// Single-pass leader clustering: a face joins the nearest existing look whose
+/// centroid it clears `tau`, else it seeds a new one. Cheap (O(faces × looks)) and,
+/// fed chronologically-ordered faces, stable and era-aligned. Returns each look as a
+/// list of indices into `embs`. `tau` is deliberately looser than the global link
+/// threshold — we want a few broad looks, not the global algorithm's fine fragments.
+pub fn group_looks(embs: &[Vec<f32>], tau: f32) -> Vec<Vec<usize>> {
+    let mut sums: Vec<Vec<f32>> = Vec::new(); // running sum of normalized members
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, e) in embs.iter().enumerate() {
+        let en = normalized(e);
+        let mut best: Option<usize> = None;
+        let mut best_sim = tau;
+        for (g, s) in sums.iter().enumerate() {
+            let sim = cosine(&normalized(s), &en);
+            if sim >= best_sim {
+                best_sim = sim;
+                best = Some(g);
+            }
+        }
+        match best {
+            Some(g) => {
+                for (k, v) in en.iter().enumerate() {
+                    sums[g][k] += v;
+                }
+                groups[g].push(i);
+            }
+            None => {
+                sums.push(en);
+                groups.push(vec![i]);
+            }
+        }
+    }
+    groups
+}
+
 /// A cluster the magnet judges to be the same person as a confirmed identity:
 /// how many of its faces match the anchor, the cluster's size, and the strongest
 /// match. `matched == size` means the whole group is confidently that person.

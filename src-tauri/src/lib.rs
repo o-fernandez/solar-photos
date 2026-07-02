@@ -61,6 +61,10 @@ struct AppState {
     faces_paused: Arc<AtomicBool>,
     /// Guards against two re-clusters running at once (migration + manual + sweep).
     reclustering: Arc<AtomicBool>,
+    /// Set when a re-cluster is requested while one is already running, so the request
+    /// isn't dropped — the running pass re-runs once on finish (e.g. naming several
+    /// people in a row each needs its fold applied).
+    recluster_pending: Arc<AtomicBool>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -403,10 +407,10 @@ fn name_cluster(
         let conn = state.conn.lock().unwrap();
         db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
     }
-    // Confirming a person is exactly when their scattered fragments become foldable —
-    // reunite them in the background (no-op if empty or the library is still scanning).
+    // Confirming a person adds an exemplar, which can re-home other people's
+    // wrongly-folded look-alikes — so re-cluster + re-fold competitively (self-heal).
     if !name.trim().is_empty() {
-        run_auto_fold(app);
+        run_recluster(app);
     }
     Ok(())
 }
@@ -420,10 +424,12 @@ fn merge_clusters(
 ) -> Result<(), String> {
     {
         let conn = state.conn.lock().unwrap();
+        // A user merge vouches for the moved faces — confirm them (sticky exemplars).
+        db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
         db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
     }
-    // The merge grew this person's anchor — fold in anything newly confident.
-    run_auto_fold(app);
+    // The merge added exemplars — re-cluster + re-fold competitively (self-heal).
+    run_recluster(app);
     Ok(())
 }
 
@@ -436,6 +442,228 @@ fn get_person_photos(
 ) -> Result<Vec<db::PhotoRow>, String> {
     let conn = state.conn.lock().unwrap();
     db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
+}
+
+/// L2-normalized mean of a set of embeddings — a robust single-vector summary of a
+/// look or an identity's anchor. (Cosine of two of these is their centroid cosine.)
+fn mean_normalized(v: &[Vec<f32>]) -> Vec<f32> {
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let dim = v[0].len();
+    let mut s = vec![0f32; dim];
+    for e in v {
+        for (k, x) in e.iter().enumerate() {
+            s[k] += *x;
+        }
+    }
+    let n = s.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+    s.iter().map(|x| x / n).collect()
+}
+
+/// Cosine of two already-normalized vectors (a dot product).
+fn cos(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// One "look" of a person on their page: a coarse appearance sub-cluster of their own
+/// faces, used both to filter their photos (baby / kid / adult) and — when the look
+/// actually matches a *different* named person — to move a misclassified batch out.
+#[derive(Clone, serde::Serialize)]
+struct PersonLook {
+    /// Representative face (highest detector score in the look).
+    cover_face_id: i64,
+    /// Distinct photos in this look (drives the count and the grid filter).
+    photos: i64,
+    from_ts: i64,
+    to_ts: i64,
+    photo_ids: Vec<i64>,
+    /// Set when the look looks more like a different named person than like this one:
+    /// their name, and the cluster to move the batch into. The repair suggestion.
+    likely_other_name: Option<String>,
+    likely_other_cluster: Option<i64>,
+}
+
+// Look-grouping tuning. Deliberately coarse — a few *significant* looks, not fragments.
+const LOOK_TAU: f32 = 0.5; // leader-cluster threshold for the initial fine grouping
+const LOOK_MERGE: f32 = 0.55; // then fuse fine looks whose centroids are this close
+const LOOK_ABS_MIN: i64 = 10; // a genuine look needs at least this many photos…
+const LOOK_PCT: f32 = 0.05; // …and this share of the person, so count scales with size
+                            // (a 4k-photo person doesn't get a swatch per pose; a
+                            // 200-photo one still can). Flagged repair looks bypass both.
+const LOOK_SHARE_MAX: f32 = 0.85; // …and a genuine look that's ~the whole person is just
+                                  // "All" — don't show it as a separate swatch.
+const LOOK_FLAG_ABS: f32 = 0.5; // a look must match another anchor at least this well…
+const LOOK_FLAG_MARGIN: f32 = 0.08; // …and beat its match to *this* person by this much
+
+/// Group a person's faces into coarse "looks" for the person page: appearance-and-date
+/// sub-clusters to filter by, and — where a look matches a different confirmed person
+/// better than this one — a one-click "move the batch" repair. Empty (no strip) unless
+/// there are at least two looks worth showing.
+#[tauri::command]
+fn get_person_looks(
+    state: tauri::State<'_, AppState>,
+    cluster_id: i64,
+) -> Result<Vec<PersonLook>, String> {
+    let conn = state.conn.lock().unwrap();
+    let faces = db::person_faces(&conn, cluster_id).map_err(|e| e.to_string())?;
+    if faces.len() < 16 {
+        return Ok(Vec::new());
+    }
+    let embs: Vec<Vec<f32>> = faces.iter().map(|f| f.4.clone()).collect();
+
+    // Fine leader grouping, then fuse looks whose centroids are close: pose/lighting
+    // variants of one appearance collapse into a single significant look, while a
+    // genuinely different look (or a different person) stays its own group.
+    let fine = cluster::group_looks(&embs, LOOK_TAU);
+    let fine_centroids: Vec<Vec<f32>> = fine
+        .iter()
+        .map(|g| mean_normalized(&g.iter().map(|&i| embs[i].clone()).collect::<Vec<_>>()))
+        .collect();
+    fn find(p: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut c = x;
+        while p[c] != c {
+            let nx = p[c];
+            p[c] = r;
+            c = nx;
+        }
+        r
+    }
+    let mut parent: Vec<usize> = (0..fine.len()).collect();
+    for i in 0..fine.len() {
+        for j in (i + 1)..fine.len() {
+            if cos(&fine_centroids[i], &fine_centroids[j]) >= LOOK_MERGE {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut merged: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (gi, g) in fine.iter().enumerate() {
+        let r = find(&mut parent, gi);
+        merged.entry(r).or_default().extend(g.iter().cloned());
+    }
+    let groups: Vec<Vec<usize>> = merged.into_values().collect();
+
+    // This person's own reference: their anchor if named (robust to a little pollution),
+    // else the dominant look's centroid.
+    let own_identity = db::identity_of_cluster(&conn, cluster_id).ok().flatten();
+    let centroids: Vec<Vec<f32>> = groups
+        .iter()
+        .map(|g| mean_normalized(&g.iter().map(|&i| embs[i].clone()).collect::<Vec<_>>()))
+        .collect();
+    let dominant = groups
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, g)| g.len())
+        .map(|(i, _)| i);
+    let own_ref: Option<Vec<f32>> = match own_identity {
+        Some(id) => {
+            let a = db::confirmed_anchor_embeddings(&conn, id, 64).map_err(|e| e.to_string())?;
+            if a.is_empty() { dominant.map(|i| centroids[i].clone()) } else { Some(mean_normalized(&anchor_core(a))) }
+        }
+        None => dominant.map(|i| centroids[i].clone()),
+    };
+
+    // Every *other* named person we may flag a look against: enough confirmed evidence
+    // to be a trustworthy target (MIN_ANCHOR), and not already declared "not the same"
+    // as this person — once you've said Omar isn't Xiao Xiao, we stop suggesting it.
+    let blocked: std::collections::HashSet<(i64, i64)> =
+        db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+    struct Other {
+        name: String,
+        cluster: i64,
+        anchor: Vec<f32>,
+    }
+    let mut others: Vec<Other> = Vec::new();
+    for (id, name) in db::named_identities(&conn).map_err(|e| e.to_string())? {
+        if Some(id) == own_identity {
+            continue;
+        }
+        if let Some(oid) = own_identity {
+            let key = if oid < id { (oid, id) } else { (id, oid) };
+            if blocked.contains(&key) {
+                continue;
+            }
+        }
+        let a = db::confirmed_anchor_embeddings(&conn, id, 48).map_err(|e| e.to_string())?;
+        if a.len() < MIN_ANCHOR {
+            continue;
+        }
+        let cl = db::clusters_of_identity(&conn, id).map_err(|e| e.to_string())?.into_iter().next();
+        if let Some(cl) = cl {
+            others.push(Other { name, cluster: cl, anchor: mean_normalized(&anchor_core(a)) });
+        }
+    }
+
+    // A genuine look must be substantial in absolute *and* relative terms, so a big
+    // library doesn't sprout a swatch per pose; a flagged (repair) look bypasses both.
+    let total_photos =
+        faces.iter().map(|f| f.1).collect::<std::collections::BTreeSet<i64>>().len() as i64;
+    let min_photos = LOOK_ABS_MIN.max((LOOK_PCT * total_photos as f32).ceil() as i64);
+
+    let mut looks: Vec<PersonLook> = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        let mut photo_set = std::collections::BTreeSet::new();
+        let (mut from_ts, mut to_ts) = (i64::MAX, i64::MIN);
+        let mut cover = (f32::MIN, faces[g[0]].0);
+        for &i in g {
+            let f = &faces[i];
+            photo_set.insert(f.1);
+            from_ts = from_ts.min(f.2);
+            to_ts = to_ts.max(f.2);
+            if f.3 > cover.0 {
+                cover = (f.3, f.0);
+            }
+        }
+        // Does this look match a different confirmed person better than it matches this
+        // one (by a clear margin, above an absolute bar)? Then it's likely misclassified.
+        let own_sim = own_ref.as_ref().map(|r| cos(&centroids[gi], r)).unwrap_or(1.0);
+        let mut flag: Option<(String, i64, f32)> = None;
+        for o in &others {
+            let s = cos(&centroids[gi], &o.anchor);
+            if s >= LOOK_FLAG_ABS
+                && s > own_sim + LOOK_FLAG_MARGIN
+                && flag.as_ref().map_or(true, |(_, _, bs)| s > *bs)
+            {
+                flag = Some((o.name.clone(), o.cluster, s));
+            }
+        }
+        // A genuine look shows only if it's substantial *and* not basically the whole
+        // person (that's just "All"). A flagged one shows however big or small — repair.
+        if flag.is_none() {
+            let n = photo_set.len() as i64;
+            if n < min_photos || n as f32 > LOOK_SHARE_MAX * total_photos as f32 {
+                continue;
+            }
+        }
+        looks.push(PersonLook {
+            cover_face_id: cover.1,
+            photos: photo_set.len() as i64,
+            from_ts,
+            to_ts,
+            photo_ids: photo_set.into_iter().collect(),
+            likely_other_name: flag.as_ref().map(|(n, _, _)| n.clone()),
+            likely_other_cluster: flag.as_ref().map(|(_, c, _)| *c),
+        });
+    }
+    // Genuine looks first (biggest first), flagged repair looks last. Only worth a
+    // strip with two or more.
+    let (mut flagged, mut genuine): (Vec<PersonLook>, Vec<PersonLook>) =
+        looks.into_iter().partition(|l| l.likely_other_name.is_some());
+    genuine.sort_by(|a, b| b.photos.cmp(&a.photos));
+    flagged.sort_by(|a, b| b.photos.cmp(&a.photos));
+    genuine.extend(flagged);
+    if genuine.len() < 2 {
+        return Ok(Vec::new());
+    }
+    Ok(genuine)
 }
 
 /// The faces detected in one photo, with the person each belongs to — backs the
@@ -502,13 +730,26 @@ fn reassign_faces_to_new_person(
     let mut conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
+    // If the typed name is already a person, merge into them instead of minting a
+    // duplicate — moving "this is someone else: Mía" twice shouldn't make two Mías.
+    let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(nm) = trimmed {
+        if let Some(target) = db::cluster_for_name(&conn, nm).map_err(|e| e.to_string())? {
+            if target != source_cluster_id {
+                let target_id = db::ensure_identity_for_cluster(&conn, target).map_err(|e| e.to_string())?;
+                db::set_faces_person(&mut conn, &face_ids, target, target_id).map_err(|e| e.to_string())?;
+                let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
+                return Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added });
+            }
+        }
+    }
     let new_cluster = db::next_cluster_id(&conn).map_err(|e| e.to_string())?;
     // Mint the identity on the (empty) new cluster, then bind the faces to both —
     // so the split person is a durable identity that survives the next re-cluster.
     let new_id = db::ensure_identity_for_cluster(&conn, new_cluster).map_err(|e| e.to_string())?;
     db::set_faces_person(&mut conn, &face_ids, new_cluster, new_id).map_err(|e| e.to_string())?;
-    if let Some(name) = name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        db::name_cluster(&conn, new_cluster, name).map_err(|e| e.to_string())?;
+    if let Some(nm) = trimmed {
+        db::name_cluster(&conn, new_cluster, nm).map_err(|e| e.to_string())?;
     }
     let added = record_cannot_link_if_new(&conn, source_id, new_id).map_err(|e| e.to_string())?;
     Ok(CorrectionUndo { prior, new_cluster_id: Some(new_cluster), added_cannot_link: added })
@@ -524,6 +765,29 @@ fn ignore_faces(
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     db::ignore_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
     Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
+}
+
+/// "Not this person" without naming who they are: detach the faces from their current
+/// person and let each re-home by appearance. Distinct from "move to a new person"
+/// (which forces them together) and "ignore" (which hides them) — here they scatter
+/// and the re-cluster re-groups them wherever they belong (possibly several people, or
+/// none). Kicks a re-cluster so it happens now. Returns prior state for a best-effort
+/// undo (a full undo would need the pre-detach clustering, which the re-cluster rewrote).
+#[tauri::command]
+fn detach_faces(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+) -> Result<CorrectionUndo, String> {
+    let undo = {
+        let mut conn = state.conn.lock().unwrap();
+        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+        let base = db::next_cluster_id(&conn).map_err(|e| e.to_string())?;
+        db::detach_faces(&mut conn, &face_ids, base).map_err(|e| e.to_string())?;
+        CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None }
+    };
+    run_recluster(app);
+    Ok(undo)
 }
 
 /// Undo any correction: restore the faces' prior grouping and drop any cannot-link
@@ -707,6 +971,9 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
     let all_faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
     let blocked: std::collections::HashSet<(i64, i64)> =
         db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+    // How well every cluster matches each confirmed identity (incl. "not X" splits) —
+    // so we don't suggest a cluster that's decisively someone else's.
+    let matches = cluster_identity_matches(&conn).map_err(|e| e.to_string())?;
 
     // Pass 1: gather each identity's candidate clusters (already filtered by
     // "not the same"), and tally how many distinct identities claim each cluster.
@@ -720,10 +987,12 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
     let mut pending: Vec<Pending> = Vec::new();
     let mut claims: HashMap<i64, u32> = HashMap::new(); // cluster_id -> # identities claiming it
     for (identity_id, name) in named {
-        let anchor = db::identity_anchor_embeddings(&conn, identity_id, 64).map_err(|e| e.to_string())?;
-        if anchor.is_empty() {
-            continue;
+        let anchor = db::confirmed_anchor_embeddings(&conn, identity_id, 64).map_err(|e| e.to_string())?;
+        if anchor.len() < MIN_ANCHOR {
+            continue; // too little confirmed evidence to suggest look-alikes yet
         }
+        // Match against the anchor's dominant core, not a possibly-polluted full set.
+        let core = anchor_core(anchor);
         // The clusters this identity already occupies are excluded from the search;
         // the largest is the fold-in target.
         let own: Vec<i64> = db::clusters_of_identity(&conn, identity_id).map_err(|e| e.to_string())?;
@@ -738,7 +1007,7 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
             .cloned()
             .collect();
 
-        let mut cands = cluster::identity_candidates(&anchor, &others);
+        let mut cands = cluster::identity_candidates(&core, &others);
         // Strongest matches first, and drop any cluster the user said isn't this person.
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
         let mut candidates = Vec::new();
@@ -746,6 +1015,18 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
             if let Ok(Some(other_id)) = db::identity_of_cluster(&conn, c.cluster_id) {
                 let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
                 if blocked.contains(&key) {
+                    continue;
+                }
+            }
+            // Competitive: skip a cluster a confirmed competitor matches decisively
+            // better — it's someone else's, so don't keep offering it as this person.
+            if let Some(ms) = matches.get(&c.cluster_id) {
+                let best_other = ms
+                    .iter()
+                    .filter(|(id, _)| *id != identity_id)
+                    .map(|(_, s)| *s)
+                    .fold(f32::MIN, f32::max);
+                if best_other > c.max_sim + AUTO_FOLD_MARGIN {
                     continue;
                 }
             }
@@ -825,12 +1106,14 @@ fn absorb_clusters(
         let conn = state.conn.lock().unwrap();
         for from in clusters {
             if from != into {
+                // The user vouched for each absorbed group — confirm before folding in.
+                db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
                 db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
             }
         }
     }
-    // Bulk-merging enlarged the anchor — fold in anything that now clears the bar too.
-    run_auto_fold(app);
+    // Bulk-merging added exemplars — re-cluster + re-fold competitively (self-heal).
+    run_recluster(app);
     Ok(())
 }
 
@@ -840,6 +1123,29 @@ fn absorb_clusters(
 fn reject_merge(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Result<(), String> {
     let conn = state.conn.lock().unwrap();
     db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())
+}
+
+/// "Not <person>" on a review candidate: instead of a weak, per-group cannot-link, make
+/// the rejected group a *durable competitor* — confirm its faces as their own identity
+/// (an unnamed "someone else") and cannot-link it from the person. Because confirmed
+/// identities compete for faces, this generalizes: other look-alikes now get pulled
+/// toward the competitor and away from the person. Re-cluster so it takes effect.
+#[tauri::command]
+fn not_this_person(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    person_cluster_id: i64,
+    other_cluster_id: i64,
+) -> Result<(), String> {
+    {
+        let conn = state.conn.lock().unwrap();
+        // Mint identities for both sides + cannot-link, then confirm the rejected group
+        // so it's a durable, competing exemplar (not wiped as a tentative machine label).
+        db::add_cannot_link(&conn, person_cluster_id, other_cluster_id).map_err(|e| e.to_string())?;
+        db::confirm_cluster_faces(&conn, other_cluster_id).map_err(|e| e.to_string())?;
+    }
+    run_recluster(app);
+    Ok(())
 }
 
 /// Wipe all face data — detections, clusters, names, identities, decisions — and
@@ -857,6 +1163,28 @@ fn reset_face_recognition(app: tauri::AppHandle) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&state.faces_dir);
     let _ = app.emit("faces-progress", FaceProgress { scanned: 0, eligible: 0 });
     Ok(())
+}
+
+/// Fast "start people over": clear every decision (identities, names, cannot-links)
+/// but keep the detected faces and their embeddings, then re-cluster from scratch,
+/// unsupervised. No re-detection — seconds, not the full sweep. Snapshots the database
+/// to `<db>.pre-reset.bak` first (via VACUUM INTO, a consistent copy) so a regretted
+/// reset is recoverable. Returns the backup path.
+#[tauri::command]
+fn reset_face_decisions(app: tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let backup = state.db_path.with_extension("pre-reset.bak");
+    {
+        let conn = state.conn.lock().unwrap();
+        // Snapshot first (best-effort restore point), then wipe decisions.
+        let _ = std::fs::remove_file(&backup);
+        conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            .map_err(|e| format!("backup failed: {e}"))?;
+        db::clear_face_decisions(&conn).map_err(|e| e.to_string())?;
+    }
+    // Rebuild clusters from embeddings, unsupervised, in the background.
+    run_recluster(app);
+    Ok(backup.to_string_lossy().into_owned())
 }
 
 /// Set once the one-time migration off the old greedy clustering has run.
@@ -930,6 +1258,57 @@ fn suggestions_ready(conn: &Connection, reclustering: &AtomicBool) -> bool {
     }
 }
 
+/// The evidence floor: an identity earns "magnet authority" — the right to auto-fold
+/// look-alikes in, to generate "N groups might also be…" suggestions, and to be a
+/// "looks like X" flag target — only once it has at least this many *confirmed* faces.
+/// One face (worse, a profile shot) defines a point, not a person; extrapolating a
+/// whole identity from it is what pulls in swarms of unrelated pose/lighting matches.
+/// Naming a real cluster clears this instantly; naming a single stray face does not,
+/// until you confirm a few more. (`identity_anchor_embeddings` returns min(faces, N),
+/// so `anchor.len()` is a direct read of confirmed evidence.)
+const MIN_ANCHOR: usize = 4;
+
+/// Minimum confirmed faces for an identity to *compete* (pull look-alikes toward it).
+/// Lower than [`MIN_ANCHOR`] on purpose: a competitor can only ever push a face into
+/// *review* (never silently claim it — that still needs `MIN_ANCHOR`), so it's safe to
+/// let even a one-group "not Mía" rejection start defending its faces immediately.
+const COMPETITOR_MIN: usize = 1;
+
+/// How similar a candidate must be to a confirmed anchor before auto-fold reunites it
+/// *without asking*. Above this, the match is safe to apply silently; below it (down to
+/// the linkage floor) the match is real but uncertain — it goes to the review path
+/// instead of being folded. Adults cluster tight and clear this easily, so they still
+/// auto-reunite; two different babies rarely clear it against each other, so naming one
+/// baby no longer vacuums up the others — those land in review, where a human decides.
+const AUTO_FOLD_MIN: f32 = 0.6;
+
+/// How much the best-matching person must beat the runner-up before a cluster is
+/// auto-assigned. Below this the match is a near-tie — two people the model can't
+/// separate (two babies) — so it's left for the human to resolve, never guessed.
+const AUTO_FOLD_MARGIN: f32 = 0.06;
+
+/// Similarity used to find an anchor's dominant appearance when trimming it to a core.
+const ANCHOR_CORE_TAU: f32 = 0.5;
+
+/// A cleaned "core" of an identity's anchor: cluster the exemplars and keep only the
+/// dominant appearance group, so a few outliers — a wrong fold, an off-angle shot —
+/// can't drag the anchor off the person and cascade (one bad fold poisoning every
+/// future match). Falls back to the full set when there's no clear majority to trust,
+/// or too few exemplars to bother.
+fn anchor_core(embs: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    if embs.len() < 6 {
+        return embs;
+    }
+    let groups = cluster::group_looks(&embs, ANCHOR_CORE_TAU);
+    if let Some(biggest) = groups.iter().max_by_key(|g| g.len()) {
+        // Only trust a core when it's a clear majority of the exemplars.
+        if biggest.len() * 2 >= embs.len() {
+            return biggest.iter().map(|&i| embs[i].clone()).collect();
+        }
+    }
+    embs
+}
+
 /// Fold every cluster that confidently matches a *confirmed* identity's anchor into
 /// that identity — the automatic reunification behind "you named them, so we gather
 /// their scattered fragments for you." This is safe where unsupervised clustering
@@ -943,72 +1322,87 @@ fn suggestions_ready(conn: &Connection, reclustering: &AtomicBool) -> bool {
 /// This is what turns "merge dozens of 1-photo clusters by hand" into "already done":
 /// naming a person, or the sweep settling, reunites their scattered fragments with no
 /// clicks. The manual review path remains only for the genuinely ambiguous residual.
-fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
+/// For every candidate cluster, how well it matches *each confirmed identity* (named or
+/// not), best-first — the shared basis for auto-fold and review. Because unnamed
+/// "someone else" splits are confirmed identities too, they compete here: a face that
+/// looks like a rejected look-alike is pulled toward that competitor and away from the
+/// person, which is how a "not Mía" generalizes to similar faces.
+fn cluster_identity_matches(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<i64, Vec<(i64, f32)>>> {
     use std::collections::{HashMap, HashSet};
+    let all_faces = db::face_cluster_embeddings(conn)?;
+    let mut per_cluster: HashMap<i64, Vec<(i64, f32)>> = HashMap::new();
+    for identity_id in db::confirmed_identity_ids(conn)? {
+        let anchor = db::confirmed_anchor_embeddings(conn, identity_id, 64)?;
+        if anchor.len() < COMPETITOR_MIN {
+            continue; // no confirmed evidence to compete with
+        }
+        let core = anchor_core(anchor);
+        let own: HashSet<i64> =
+            db::clusters_of_identity(conn, identity_id)?.into_iter().collect();
+        let others: Vec<(i64, i64, Vec<f32>)> =
+            all_faces.iter().filter(|(_, c, _)| !own.contains(c)).cloned().collect();
+        for c in cluster::identity_candidates(&core, &others) {
+            per_cluster.entry(c.cluster_id).or_default().push((identity_id, c.max_sim));
+        }
+    }
+    for v in per_cluster.values_mut() {
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    }
+    Ok(per_cluster)
+}
+
+fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
+    use std::collections::HashSet;
     // Mid-sweep anchors are incomplete and would misfire — wait until scanning settles.
     match db::face_progress(conn) {
         Ok((scanned, eligible)) if eligible > 0 && scanned >= eligible => {}
         _ => return Ok(0),
     }
-    let named = db::named_identities(conn)?;
-    if named.is_empty() {
+    if db::confirmed_identity_ids(conn)?.is_empty() {
         return Ok(0);
     }
-    let all_faces = db::face_cluster_embeddings(conn)?;
+    // Wipe the machine's previous tentative labels and re-derive them from scratch —
+    // competitively — against the *confirmed* exemplars. This is what makes a wrong fold
+    // self-correcting: nothing auto is welded on, so every pass reconsiders it against
+    // whatever people (and "not X" competitors) you've since confirmed.
+    db::clear_unconfirmed_identities(conn)?;
 
-    // Pass 1: each identity's confident candidate clusters, plus a tally of how many
-    // distinct identities claim each — the conflict guard's raw material.
-    struct Pending {
-        into: i64,
-        candidates: Vec<i64>,
-    }
-    let mut pending: Vec<Pending> = Vec::new();
-    let mut claims: HashMap<i64, u32> = HashMap::new();
-    for (identity_id, _name) in &named {
-        let anchor = db::identity_anchor_embeddings(conn, *identity_id, 64)?;
-        if anchor.is_empty() {
+    // A person's own cluster (holds their confirmed faces) is never a fold target.
+    let confirmed_clusters: HashSet<i64> = db::confirmed_clusters(conn)?.into_iter().collect();
+    // Only identities with enough confirmed evidence may *claim* a cluster; a thin
+    // competitor can still win the ranking (and thereby push a face off someone else)
+    // but can't silently absorb it — that face just stays unassigned for review.
+    let fold_eligible: HashSet<i64> =
+        db::fold_eligible_identities(conn, MIN_ANCHOR as i64)?.into_iter().collect();
+    let matches = cluster_identity_matches(conn)?;
+
+    // Assign each candidate to the identity it matches *decisively* best: the top match
+    // must clear AUTO_FOLD_MIN and beat the runner-up by AUTO_FOLD_MARGIN. A near-tie
+    // (two babies both plausible) is ambiguous — left unassigned for the review path,
+    // never guessed. Confirmed people-clusters are never folded away.
+    let mut folded = 0usize;
+    for (cid, m) in matches {
+        if confirmed_clusters.contains(&cid) {
             continue;
         }
-        // The identity's own clusters are excluded from the search; the largest is the
-        // fold-in target.
-        let own = db::clusters_of_identity(conn, *identity_id)?;
-        let into = match own.first() {
+        let (best_id, best_sim) = m[0];
+        if best_sim < AUTO_FOLD_MIN {
+            continue;
+        }
+        if m.len() > 1 && best_sim - m[1].1 < AUTO_FOLD_MARGIN {
+            continue; // ambiguous between people — hold for review
+        }
+        if !fold_eligible.contains(&best_id) {
+            continue; // best match is only a thin competitor — don't let it absorb
+        }
+        let into = match db::clusters_of_identity(conn, best_id)?.first() {
             Some(&c) => c,
             None => continue,
         };
-        let own_set: HashSet<i64> = own.iter().cloned().collect();
-        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
-            .iter()
-            .filter(|(_, c, _)| !own_set.contains(c))
-            .cloned()
-            .collect();
-        let mut candidates = Vec::new();
-        for c in cluster::identity_candidates(&anchor, &others) {
-            // Only reunite *unclaimed* fragments — never pull a cluster that already
-            // belongs to a different identity (named or not). That subsumes cannot-link
-            // and can never auto-merge two confirmed people.
-            if let Ok(Some(other)) = db::identity_of_cluster(conn, c.cluster_id) {
-                if other != *identity_id {
-                    continue;
-                }
-            }
-            *claims.entry(c.cluster_id).or_insert(0) += 1;
-            candidates.push(c.cluster_id);
-        }
-        if !candidates.is_empty() {
-            pending.push(Pending { into, candidates });
-        }
-    }
-
-    // Pass 2: fold in only the clusters a single identity claims. A fragment two people
-    // both match is ambiguous — leave it for the pairwise review path, don't guess.
-    let mut folded = 0usize;
-    for p in pending {
-        for cid in p.candidates {
-            if cid == p.into || claims.get(&cid).copied().unwrap_or(0) != 1 {
-                continue;
-            }
-            db::merge_clusters(conn, p.into, cid)?;
+        if cid != into {
+            db::merge_clusters(conn, into, cid)?;
             folded += 1;
         }
     }
@@ -1050,10 +1444,16 @@ fn run_auto_fold(app: AppHandle) {
 fn run_recluster(app: AppHandle) {
     let state = app.state::<AppState>();
     if state.reclustering.swap(true, Ordering::SeqCst) {
-        return; // a re-cluster is already in progress
+        // Already running — don't drop this request; have the running pass re-run once
+        // it finishes, so a fold triggered mid-recluster (naming several people) lands.
+        state.recluster_pending.store(true, Ordering::SeqCst);
+        return;
     }
     let db_path = state.db_path.clone();
     let reclustering = state.reclustering.clone();
+    let recluster_pending = state.recluster_pending.clone();
+    recluster_pending.store(false, Ordering::SeqCst);
+    let app_for_rerun = app.clone();
     drop(state);
 
     std::thread::spawn(move || {
@@ -1067,15 +1467,16 @@ fn run_recluster(app: AppHandle) {
                 db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
                 return Ok(());
             }
-            let old_names: HashMap<i64, String> = db::cluster_names_all(&conn)?.into_iter().collect();
-            let old_fc = db::face_clusters(&conn)?;
 
             // The user's durable "not the same person" decisions, enforced as hard
             // constraints in the agglomeration: a merge that would co-locate two
             // cannot-linked identities is refused, so embedding-close strangers
             // (e.g. two babies) the user pulled apart never drift back together.
+            // Only *confirmed* (user-labeled) faces are must-links; auto-folded ones
+            // are left free to re-cluster by appearance, so a wrongly-folded look-alike
+            // isn't welded on — it re-homes once a better-matching person exists.
             let constraints = cluster::LinkConstraints {
-                face_identity: db::face_identities(&conn)?.into_iter().collect(),
+                face_identity: db::confirmed_face_identities(&conn)?.into_iter().collect(),
                 cannot_link: db::cannot_link_pairs(&conn)?.into_iter().collect(),
             };
 
@@ -1088,34 +1489,35 @@ fn run_recluster(app: AppHandle) {
                     let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
                 }
             });
-            // Honor must-links: every face the user bound to the same identity (by
-            // naming or merging) is forced into one cluster, however the embeddings
-            // split it. This is what makes a confirmed merge durable — the re-cluster
-            // can no longer undo it.
-            apply_must_links(&db::face_identities(&conn)?, &mut assignments);
+            // Honor must-links: every face the user *confirmed* under one identity is
+            // forced into one cluster, however the embeddings split it. This is what
+            // makes a confirmed merge durable — the re-cluster can no longer undo it.
+            apply_must_links(&db::confirmed_face_identities(&conn)?, &mut assignments);
             db::set_face_clusters(&mut conn, &assignments)?;
 
-            // Name preservation: for each old *named* cluster, find where the bulk
-            // of its faces landed and move the name there. If two old names collide
-            // on one new cluster, the one that contributed more faces wins.
+            // Re-derive each cluster's display name from the durable *identity* whose
+            // confirmed faces landed in it — read fresh here (post-clustering), so a
+            // name added while this pass ran is honored, not wiped by a stale snapshot.
+            // (Names live on the identity; cluster_names is just a per-cluster cache.)
             let new_of: HashMap<i64, i64> = assignments.iter().cloned().collect();
-            let mut tally: HashMap<i64, HashMap<i64, usize>> = HashMap::new();
-            for (face, oldc) in old_fc {
-                if old_names.contains_key(&oldc) {
+            let named_idents: HashMap<i64, String> =
+                db::named_identities(&conn)?.into_iter().collect();
+            let mut tally: HashMap<i64, HashMap<i64, usize>> = HashMap::new(); // identity -> cluster -> n
+            for (face, ident) in db::confirmed_face_identities(&conn)? {
+                if named_idents.contains_key(&ident) {
                     if let Some(&newc) = new_of.get(&face) {
-                        *tally.entry(oldc).or_default().entry(newc).or_insert(0) += 1;
+                        *tally.entry(ident).or_default().entry(newc).or_insert(0) += 1;
                     }
                 }
             }
-            let mut winner: HashMap<i64, (String, usize)> = HashMap::new();
-            for (oldc, m) in tally {
-                if let Some((&newc, &cnt)) = m.iter().max_by_key(|(_, c)| **c) {
-                    if winner.get(&newc).map_or(true, |(_, e)| cnt > *e) {
-                        winner.insert(newc, (old_names[&oldc].clone(), cnt));
-                    }
-                }
-            }
-            let names: Vec<(i64, String)> = winner.into_iter().map(|(c, (n, _))| (c, n)).collect();
+            let names: Vec<(i64, String)> = tally
+                .into_iter()
+                .filter_map(|(ident, m)| {
+                    m.iter()
+                        .max_by_key(|(_, c)| **c)
+                        .map(|(&newc, _)| (newc, named_idents[&ident].clone()))
+                })
+                .collect();
             db::replace_cluster_names(&mut conn, &names)?;
             // Now that clusters and names are settled, reunite each confirmed person's
             // scattered look-alike fragments automatically (see `auto_fold_confident`).
@@ -1128,6 +1530,10 @@ fn run_recluster(app: AppHandle) {
         }
         let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
         reclustering.store(false, Ordering::SeqCst);
+        // A fold was requested while we ran — honor it now so nothing is dropped.
+        if recluster_pending.swap(false, Ordering::SeqCst) {
+            run_recluster(app_for_rerun);
+        }
     });
 }
 
@@ -1608,6 +2014,7 @@ pub fn run() {
                 rescanning: Arc::new(AtomicBool::new(false)),
                 faces_paused,
                 reclustering: Arc::new(AtomicBool::new(false)),
+                recluster_pending: Arc::new(AtomicBool::new(false)),
             });
 
             // One-time migration of the existing (greedy-clustered) mess to the
@@ -1655,15 +2062,19 @@ pub fn run() {
             get_identity_growth,
             absorb_clusters,
             reject_merge,
+            not_this_person,
             reset_face_recognition,
+            reset_face_decisions,
             recluster,
             cluster_debug,
             get_person_photos,
+            get_person_looks,
             get_faces_in_photo,
             face_ids_for_photos,
             reassign_faces_to_cluster,
             reassign_faces_to_new_person,
             ignore_faces,
+            detach_faces,
             undo_correction
         ])
         .run(tauri::generate_context!())

@@ -114,6 +114,19 @@ pub fn init(conn: &Connection) -> Result<()> {
     // reflection) — they keep cluster_id = NULL like a detach, but the flag marks
     // the exclusion as intentional and permanent so the overlay never re-draws them.
     let _ = conn.execute("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0", []);
+    // `confirmed` marks faces the *user* vouched for (named / moved / merged), as
+    // opposed to ones the machine auto-folded in. Only confirmed faces are must-links
+    // (so auto-folds stay free to re-home), and only they are anchor exemplars (so the
+    // magnet learns from your labels). This is what lets naming a second person eject
+    // the first person's wrongly-folded look-alikes.
+    let _ = conn.execute("ALTER TABLE faces ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0", []);
+    // One-time backfill: treat every existing identity-bound face as confirmed, so a
+    // library curated before this column existed isn't blown away on the next
+    // re-cluster (which now honors only confirmed must-links). Guarded so it runs once.
+    if get_meta(conn, "confirmed_backfill_v1")?.is_none() {
+        conn.execute("UPDATE faces SET confirmed = 1 WHERE identity_id IS NOT NULL", [])?;
+        set_meta(conn, "confirmed_backfill_v1", "1")?;
+    }
     Ok(())
 }
 
@@ -239,14 +252,6 @@ pub fn face_cluster_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// (face_id, cluster_id) for every clustered face — used to learn where each old
-/// cluster's faces landed after a re-cluster, so names can follow them.
-pub fn face_clusters(conn: &Connection) -> Result<Vec<(i64, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, cluster_id FROM faces WHERE cluster_id IS NOT NULL")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
 
 /// Apply a full re-cluster: set every face's cluster id in one transaction. Pairs
 /// are `(face_id, cluster_id)`.
@@ -308,22 +313,18 @@ pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The highest-confidence embeddings of an identity — a compact "anchor profile"
-/// the magnet matches other clusters against. Capped via `limit` because a few
-/// dozen good exemplars characterize a person as well as hundreds.
-pub fn identity_anchor_embeddings(
-    conn: &Connection,
-    identity_id: i64,
-    limit: i64,
-) -> Result<Vec<Vec<f32>>> {
-    let mut stmt = conn.prepare(
-        "SELECT embedding FROM faces WHERE identity_id = ?1 ORDER BY score DESC LIMIT ?2",
+/// Clear every *decision* — identities, names, cannot-links — while keeping the
+/// detected faces and their embeddings, then reset each face to its own singleton
+/// cluster (also un-ignoring any). A fresh unsupervised re-cluster then starts from a
+/// truly clean slate, with no re-detection needed — the fast "start people over".
+pub fn clear_face_decisions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM identities;
+         DELETE FROM cluster_names;
+         DELETE FROM cannot_link;
+         UPDATE faces SET identity_id = NULL, ignored = 0, confirmed = 0, cluster_id = id;",
     )?;
-    let rows = stmt.query_map(rusqlite::params![identity_id, limit], |r| {
-        let blob: Vec<u8> = r.get(0)?;
-        Ok(decode_embedding(&blob))
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    Ok(())
 }
 
 /// The clusters an identity's faces currently sit in, largest first. The first is
@@ -386,12 +387,16 @@ pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Every named cluster as `(cluster_id, name)` — used to carry names across a
-/// re-cluster.
-pub fn cluster_names_all(conn: &Connection) -> Result<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare("SELECT cluster_id, name FROM cluster_names")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+/// The cluster of an existing person by name (case-insensitive), if one exists — so
+/// "move to a new person: Mía" merges into the real Mía instead of minting a duplicate.
+pub fn cluster_for_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT cluster_id FROM cluster_names WHERE lower(name) = lower(?1) LIMIT 1",
+            [name.trim()],
+            |r| r.get(0),
+        )
+        .ok())
 }
 
 /// Name (or rename) a cluster. Empty name clears it. Naming also confirms an
@@ -414,7 +419,80 @@ pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()
     )?;
     let id = ensure_identity_for_cluster(conn, cluster_id)?;
     conn.execute("UPDATE identities SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])?;
+    // Naming a cluster vouches for its current contents — they become confirmed
+    // exemplars (must-links + anchor), the label the magnet learns from.
+    conn.execute("UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1", [cluster_id])?;
     Ok(())
+}
+
+/// Mark a cluster's faces as user-confirmed (exemplars + must-links). Used before an
+/// absorb/merge so the vouched-for faces become sticky, not auto-ejectable.
+pub fn confirm_cluster_faces(conn: &Connection, cluster_id: i64) -> Result<()> {
+    conn.execute("UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1", [cluster_id])?;
+    Ok(())
+}
+
+/// (face_id, identity_id) for every *confirmed* face — the must-link constraints a
+/// re-cluster honors. Auto-folded faces are excluded so they stay free to re-home.
+pub fn confirmed_face_identities(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn
+        .prepare("SELECT id, identity_id FROM faces WHERE identity_id IS NOT NULL AND confirmed = 1")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The highest-confidence *confirmed* exemplars of an identity — the anchor profile the
+/// magnet matches against. Confirmed-only so the anchor is what the user taught, never
+/// drifting from the machine's own guesses.
+pub fn confirmed_anchor_embeddings(conn: &Connection, identity_id: i64, limit: i64) -> Result<Vec<Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT embedding FROM faces WHERE identity_id = ?1 AND confirmed = 1 ORDER BY score DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![identity_id, limit], |r| {
+        let blob: Vec<u8> = r.get(0)?;
+        Ok(decode_embedding(&blob))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Clear the identity binding on every *unconfirmed* (auto-folded) face — wiping the
+/// machine's tentative labels before they're re-derived competitively. User labels
+/// (confirmed) are untouched.
+pub fn clear_unconfirmed_identities(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE faces SET identity_id = NULL WHERE confirmed = 0", [])?;
+    Ok(())
+}
+
+/// Every identity with at least one confirmed face — each user-labeled person, named
+/// or not, that can compete for faces. A "not Mía" split mints an unnamed one of these
+/// so look-alikes get pulled toward it and away from Mía.
+pub fn confirmed_identity_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT identity_id FROM faces WHERE confirmed = 1 AND identity_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Identities with at least `min_count` confirmed faces — enough evidence to *claim*
+/// (absorb) look-alikes, not just compete defensively for them.
+pub fn fold_eligible_identities(conn: &Connection, min_count: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT identity_id FROM faces WHERE confirmed = 1 AND identity_id IS NOT NULL
+         GROUP BY identity_id HAVING COUNT(*) >= ?1",
+    )?;
+    let rows = stmt.query_map([min_count], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Clusters that hold a confirmed face — the "owned" people-clusters auto-fold must
+/// never fold *into* another (it would merge two confirmed people).
+pub fn confirmed_clusters(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cluster_id FROM faces WHERE confirmed = 1 AND cluster_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Merge cluster `from` into `into`: reassign its faces and drop its name. The
@@ -466,15 +544,6 @@ pub fn ensure_identity_for_cluster(conn: &Connection, cluster_id: i64) -> Result
         rusqlite::params![id, cluster_id],
     )?;
     Ok(id)
-}
-
-/// (face_id, identity_id) for every face the user has bound to an identity — the
-/// must-link constraints a re-cluster must honor.
-pub fn face_identities(conn: &Connection) -> Result<Vec<(i64, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, identity_id FROM faces WHERE identity_id IS NOT NULL")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// (identity_id, name) for every identity that has been given a name.
@@ -529,6 +598,24 @@ pub fn person_photos(conn: &Connection, cluster_id: i64) -> Result<Vec<PhotoRow>
             status: r.get(1)?,
             ts: r.get(2)?,
         })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (face_id, photo_id, ts, detector_score, embedding) for every face in a person's
+/// cluster — the input to the person-page "looks" (intra-identity sub-clustering).
+/// Ordered oldest-first so the look grouping is stable and reads chronologically.
+pub fn person_faces(conn: &Connection, cluster_id: i64) -> Result<Vec<(i64, i64, i64, f32, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.photo_id, COALESCE(p.taken_ts, p.mtime) AS ts, f.score, f.embedding
+         FROM faces f
+         JOIN photos p ON p.id = f.photo_id
+         WHERE f.cluster_id = ?1
+         ORDER BY ts ASC, f.id ASC",
+    )?;
+    let rows = stmt.query_map([cluster_id], |r| {
+        let blob: Vec<u8> = r.get(4)?;
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, decode_embedding(&blob)))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -674,8 +761,9 @@ pub fn set_faces_person(
     }
     let tx = conn.transaction()?;
     {
+        // A deliberate move is a user label: confirm it (sticky exemplar, must-link).
         let mut up = tx.prepare(
-            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = 0 WHERE id = ?3",
+            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = 0, confirmed = 1 WHERE id = ?3",
         )?;
         for id in face_ids {
             up.execute(rusqlite::params![cluster_id, identity_id, id])?;
@@ -696,6 +784,28 @@ pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> Result<()> {
         placeholders(face_ids.len())
     );
     conn.execute(&sql, rusqlite::params_from_iter(face_ids.iter()))?;
+    Ok(())
+}
+
+/// Detach faces from their person without saying who they are: clear the identity
+/// must-link and scatter each into its own fresh cluster (starting at `base_cluster`),
+/// so the next re-cluster re-homes each by appearance. Unlike `ignore_faces` they stay
+/// in the pool (cluster_id non-NULL), and unlike a new-person split they're not forced
+/// together. Backs "not this person / not <name>".
+pub fn detach_faces(conn: &mut Connection, face_ids: &[i64], base_cluster: i64) -> Result<()> {
+    if face_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut up = tx.prepare(
+            "UPDATE faces SET cluster_id = ?1, identity_id = NULL, ignored = 0, confirmed = 0 WHERE id = ?2",
+        )?;
+        for (i, id) in face_ids.iter().enumerate() {
+            up.execute(rusqlite::params![base_cluster + i as i64, id])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 

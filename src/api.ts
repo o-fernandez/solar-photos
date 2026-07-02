@@ -221,6 +221,19 @@ export function rejectMerge(into: number, from: number): Promise<void> {
   return invoke("reject_merge", { into, from });
 }
 
+/** "Not <person>" on a review candidate: make the rejected group a durable competitor
+ *  (its own confirmed identity, cannot-linked) so similar faces get pulled toward it
+ *  and away from the person — the rejection generalizes. Triggers a re-cluster. */
+export function notThisPerson(personClusterId: number, otherClusterId: number): Promise<void> {
+  return invoke("not_this_person", { personClusterId, otherClusterId });
+}
+
+/** Fast "start people over": clear all names/groups/decisions, keep detected faces,
+ *  re-cluster from scratch. Backs up the DB first; resolves to the backup path. */
+export function resetFaceDecisions(): Promise<string> {
+  return invoke("reset_face_decisions");
+}
+
 /** Wipe all face data and re-scan from scratch (for testing the experience clean). */
 export function resetFaceRecognition(): Promise<void> {
   return invoke("reset_face_recognition");
@@ -250,6 +263,26 @@ export function faceCropUrl(faceId: number): string {
 /** Every photo containing this person, newest first (a filtered timeline). */
 export function getPersonPhotos(clusterId: number): Promise<PhotoRow[]> {
   return invoke("get_person_photos", { clusterId });
+}
+
+/** A coarse "look" of a person — an appearance sub-cluster of their own faces used
+ *  to filter their photos, and (when it matches a different named person) to move a
+ *  misclassified batch out. */
+export interface PersonLook {
+  cover_face_id: number;
+  photos: number;
+  from_ts: number;
+  to_ts: number;
+  photo_ids: number[];
+  /** Set when this look looks more like a different named person: their name and the
+   *  cluster to move the batch into. Absent for a genuine look of this person. */
+  likely_other_name: string | null;
+  likely_other_cluster: number | null;
+}
+
+/** The person's "looks" strip (empty unless there are at least two worth showing). */
+export function getPersonLooks(clusterId: number): Promise<PersonLook[]> {
+  return invoke("get_person_looks", { clusterId });
 }
 
 // --- Face corrections (reassign / ignore), shared by the person page and the
@@ -319,6 +352,14 @@ export function reassignFacesToNewPerson(
 /** Ignore faces — drop them from People for good. */
 export function ignoreFaces(faceIds: number[]): Promise<CorrectionUndo> {
   return invoke("ignore_faces", { faceIds });
+}
+
+/** "Not this person" without naming who they are: detach the faces and let the
+ *  re-cluster re-home each by appearance (they may land in several people, or none).
+ *  Unlike a new-person split they aren't forced together; unlike ignore they aren't
+ *  hidden. Kicks a re-cluster. */
+export function detachFaces(faceIds: number[]): Promise<CorrectionUndo> {
+  return invoke("detach_faces", { faceIds });
 }
 
 /** Undo any correction with the token it returned. */

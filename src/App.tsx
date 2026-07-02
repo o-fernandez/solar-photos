@@ -14,6 +14,7 @@ import {
   pickFolder,
   removeFolder,
   rescan,
+  resetFaceDecisions,
   type Cluster,
 } from "./api";
 import "./App.css";
@@ -44,6 +45,8 @@ function App() {
   const [view, setView] = useState<"timeline" | "people">("timeline");
   // Settings menu (Add folder / Rescan / folders), tucked behind the gear.
   const [showSettings, setShowSettings] = useState(false);
+  // Two-click guard on the destructive "start people over" reset.
+  const [confirmReset, setConfirmReset] = useState(false);
   // The "new friend" nudge: the freshly-qualified person to celebrate, plus the
   // cluster People should open the name field for when you act on it.
   const [newPerson, setNewPerson] = useState<Cluster | null>(null);
@@ -172,6 +175,17 @@ function App() {
     // The new total + refresh arrive via the scan-progress "done" event.
   }, []);
 
+  // "Start people over": clear all names/groups/decisions (keeping detected faces) and
+  // re-cluster from scratch. Backs up the DB first. A background re-cluster follows;
+  // the People view refreshes itself when it lands.
+  const handleResetPeople = useCallback(() => {
+    setConfirmReset(false);
+    setShowSettings(false);
+    resetFaceDecisions()
+      .then((backup) => console.info(`People reset. Backup: ${backup}`))
+      .catch(() => {});
+  }, []);
+
   // Jump to the new person and open their name field straight away.
   const nameNewPerson = useCallback(() => {
     setNewPerson((p) => {
@@ -236,7 +250,10 @@ function App() {
               className="tb-gear"
               aria-label="Settings"
               aria-expanded={showSettings}
-              onClick={() => setShowSettings((s) => !s)}
+              onClick={() => {
+                setShowSettings((s) => !s);
+                setConfirmReset(false);
+              }}
             >
               <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3" />
@@ -245,7 +262,13 @@ function App() {
             </button>
             {showSettings && (
               <>
-                <div className="menu-backdrop" onClick={() => setShowSettings(false)} />
+                <div
+                  className="menu-backdrop"
+                  onClick={() => {
+                    setShowSettings(false);
+                    setConfirmReset(false);
+                  }}
+                />
                 <div className="settings-menu">
                   <button
                     className="menu-item"
@@ -291,6 +314,31 @@ function App() {
                         </div>
                       ))}
                     </>
+                  )}
+                  <div className="menu-sep" />
+                  {confirmReset ? (
+                    <div className="menu-confirm">
+                      <span className="menu-confirm-q">
+                        Clear every name and grouping and start people over? Your photos are
+                        untouched, and the database is backed up first.
+                      </span>
+                      <div className="menu-confirm-row">
+                        <button className="menu-danger-btn" onClick={handleResetPeople}>
+                          Start over
+                        </button>
+                        <button className="menu-cancel-btn" onClick={() => setConfirmReset(false)}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button className="menu-item menu-danger" onClick={() => setConfirmReset(true)}>
+                      <span className="menu-ic">⟲</span>
+                      <span className="menu-label">
+                        Start people over
+                        <span className="menu-hint">clears all names and groups, keeps your photos</span>
+                      </span>
+                    </button>
                   )}
                 </div>
               </>

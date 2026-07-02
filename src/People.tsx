@@ -84,9 +84,15 @@ export default function People({
   const lastReloadRef = useRef(0);
 
   const reload = useCallback(() => {
+    // Paint the people grid first. The suggestion passes (merge-evidence graph +
+    // per-identity matching) are heavy and hold the DB lock while they compute, so
+    // running them inline freezes the tab switch — defer them a tick so the grid
+    // shows immediately and the prompts fill in just after.
     getClusters().then(setClusters).catch(() => {});
-    getMergeSuggestions().then(setSuggestions).catch(() => {});
-    getIdentityGrowth().then(setGrowth).catch(() => {});
+    setTimeout(() => {
+      getMergeSuggestions().then(setSuggestions).catch(() => {});
+      getIdentityGrowth().then(setGrowth).catch(() => {});
+    }, 50);
   }, []);
 
   useEffect(() => {
