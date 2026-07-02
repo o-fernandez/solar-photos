@@ -145,14 +145,22 @@ fn embedding_matrix<T>(faces: &[(T, Vec<f32>)]) -> Array2<f32> {
 }
 
 /// Cannot-link constraints for a re-cluster: which face belongs to which durable
-/// identity, and which identity *pairs* the user has declared "not the same."
-/// Empty maps mean "no constraints" — the pure embedding clustering.
+/// identity, which identity *pairs* the user has declared "not the same," and
+/// which faces co-occur in one photo (two faces in a photo are two different
+/// people — the strongest free signal for separating sibling babies the
+/// embeddings can't tell apart). Empty maps mean "no constraints."
 #[derive(Default)]
 pub struct LinkConstraints {
     /// `face_id -> identity_id` for every face the user has bound to an identity.
     pub face_identity: std::collections::HashMap<i64, i64>,
     /// Normalized `(lo, hi)` identity pairs that must never share a cluster.
     pub cannot_link: std::collections::HashSet<(i64, i64)>,
+    /// `face_id -> photo_id`, for faces in photos holding 2+ faces (singletons
+    /// can't conflict, so they're omitted to keep the map small).
+    pub photo_of: std::collections::HashMap<i64, i64>,
+    /// Normalized `(lo, hi)` face-id pairs exempt from the same-photo rule:
+    /// heavily-overlapping boxes are a double detection of one face, not two people.
+    pub same_photo_ok: std::collections::HashSet<(i64, i64)>,
 }
 
 impl LinkConstraints {
@@ -235,11 +243,19 @@ pub fn recluster<F: FnMut(f32)>(
             s
         })
         .collect();
+    // Per-index photo id (None = single-face photo, can't conflict) and face id,
+    // for the same-photo exclusion check inside the merge test.
+    let photo: Vec<Option<i64>> = faces
+        .iter()
+        .map(|(fid, _)| constraints.photo_of.get(fid).copied())
+        .collect();
+    let fid: Vec<i64> = faces.iter().map(|(f, _)| *f).collect();
     let total = edges.len().max(1);
     for (idx, &(_, a, b)) in edges.iter().enumerate() {
         let (ra, rb) = (uf.find(a), uf.find(b));
         if ra != rb
             && constraints.allows(&ident_sets[ra], &ident_sets[rb])
+            && photos_disjoint(&photo, &fid, &constraints.same_photo_ok, &members[ra], &members[rb])
             && complete_link(&mat, &members[ra], &members[rb])
         {
             // Fold the smaller set into the larger so root membership stays cheap.
@@ -271,6 +287,42 @@ pub fn recluster<F: FnMut(f32)>(
         out.push((*face_id, cid));
     }
     out
+}
+
+/// Same-photo exclusion: false if the two member sets contain faces from the same
+/// photo (two faces in one photo are two people — a merge would mix them), unless
+/// that face pair is a known double detection (`same_photo_ok`). The smaller set
+/// is hashed by photo so the check is ~O(|a| + |b|).
+fn photos_disjoint(
+    photo: &[Option<i64>],
+    fid: &[i64],
+    ok: &std::collections::HashSet<(i64, i64)>,
+    a: &[usize],
+    b: &[usize],
+) -> bool {
+    let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let mut by_photo: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+    for &i in small {
+        if let Some(p) = photo[i] {
+            by_photo.entry(p).or_default().push(i);
+        }
+    }
+    if by_photo.is_empty() {
+        return true;
+    }
+    for &j in big {
+        if let Some(p) = photo[j] {
+            if let Some(is) = by_photo.get(&p) {
+                for &i in is {
+                    let key = if fid[i] < fid[j] { (fid[i], fid[j]) } else { (fid[j], fid[i]) };
+                    if !ok.contains(&key) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Complete-linkage test: true iff *every* cross-pair between the two member sets
@@ -443,13 +495,21 @@ pub fn identity_candidates(
         others.iter().flat_map(|(_, _, e)| normalized(e)).collect(),
     )
     .expect("uniform other length");
-    // best = each other face's strongest cosine to any anchor face.
+    // Each other face's score = the mean of its top-K anchor similarities, not the
+    // single max: max grows with anchor-set size, so a person with 60 confirmed
+    // faces outbid one with 6 for the same candidate — few-exemplar people (babies,
+    // exactly the contested ones) kept losing their own faces. Top-K mean is
+    // size-invariant once an identity has K exemplars.
+    const ANCHOR_TOP_K: usize = 3;
     let sims = o.dot(&a.t()); // (others x anchor)
     use std::collections::HashMap;
     // cluster_id -> (size, matched, max_sim)
     let mut tally: HashMap<i64, (usize, usize, f32)> = HashMap::new();
     for (i, (_, cid, _)) in others.iter().enumerate() {
-        let best = sims.row(i).iter().cloned().fold(f32::MIN, f32::max);
+        let mut row: Vec<f32> = sims.row(i).iter().cloned().collect();
+        row.sort_unstable_by(|x, y| y.partial_cmp(x).unwrap());
+        let k = ANCHOR_TOP_K.min(row.len());
+        let best = row[..k].iter().sum::<f32>() / k as f32;
         let e = tally.entry(*cid).or_insert((0, 0, 0.0));
         e.0 += 1;
         if best >= TAU_LINK {
@@ -471,27 +531,29 @@ pub fn identity_candidates(
 }
 
 /// In-memory state for incremental assignment of newly-detected faces. Holds every
-/// already-clustered face's `(cluster_id, embedding)` so a new face can vote among
-/// its nearest neighbors. Rebuilt from the DB at startup, so a restart reproduces
-/// the same state.
+/// already-clustered face's `(cluster_id, photo_id, embedding)` so a new face can
+/// vote among its nearest neighbors. Rebuilt from the DB at startup, so a restart
+/// reproduces the same state.
 pub struct ClusterIndex {
-    faces: Vec<(i64, Vec<f32>)>, // (cluster_id, embedding)
+    faces: Vec<(i64, i64, Vec<f32>)>, // (cluster_id, photo_id, embedding)
     next_id: i64,
 }
 
 impl ClusterIndex {
-    /// Rebuild from `(cluster_id, embedding)` rows of the already-clustered faces.
-    pub fn load(rows: Vec<(i64, Vec<f32>)>) -> Self {
-        let next_id = rows.iter().map(|(c, _)| *c).max().unwrap_or(0) + 1;
+    /// Rebuild from `(cluster_id, photo_id, embedding)` rows of the clustered faces.
+    pub fn load(rows: Vec<(i64, i64, Vec<f32>)>) -> Self {
+        let next_id = rows.iter().map(|(c, _, _)| *c).max().unwrap_or(0) + 1;
         ClusterIndex { faces: rows, next_id }
     }
 
     /// Assign a new embedding by majority vote among its nearest clustered faces —
     /// no centroid, so no single face can drag a cluster. Returns the cluster id
     /// (an existing one, or a fresh singleton). The face is remembered so later
-    /// faces in the same batch can match against it.
-    pub fn assign(&mut self, emb: &[f32]) -> i64 {
-        use std::collections::HashMap;
+    /// faces in the same batch can match against it. `photo_id` enforces the
+    /// same-photo exclusion: a cluster already holding a face from this photo is
+    /// never a join target (two faces in one photo are two people).
+    pub fn assign(&mut self, emb: &[f32], photo_id: i64) -> i64 {
+        use std::collections::{HashMap, HashSet};
         let q = normalized(emb);
         // One pass over every clustered face: collect the Top-K nearest above the
         // link threshold (the vote candidates) and, separately, each cluster's
@@ -500,25 +562,29 @@ impl ClusterIndex {
         // guard: a cluster is a valid join target only if the new face clears
         // TAU_LINK against every one of its members, which keeps the cluster a clique
         // and stops a mid-similarity bridge face from accreting two people into one
-        // pile during the live scan.
+        // pile during the live scan. Clusters sharing this face's photo are vetoed.
         let mut top: Vec<(usize, f32)> = Vec::new();
         let mut cluster_min: HashMap<i64, f32> = HashMap::new();
-        for (idx, (cid, e)) in self.faces.iter().enumerate() {
+        let mut same_photo: HashSet<i64> = HashSet::new();
+        for (idx, (cid, pid, e)) in self.faces.iter().enumerate() {
             let s = cosine(&q, e);
             let m = cluster_min.entry(*cid).or_insert(f32::INFINITY);
             *m = m.min(s);
+            if *pid == photo_id {
+                same_photo.insert(*cid);
+            }
             if s >= TAU_LINK {
                 push_topk(&mut top, idx, s);
             }
         }
 
-        let chosen = self.vote(&top, &cluster_min);
+        let chosen = self.vote(&top, &cluster_min, &same_photo);
         let cid = chosen.unwrap_or_else(|| {
             let c = self.next_id;
             self.next_id += 1;
             c
         });
-        self.faces.push((cid, q));
+        self.faces.push((cid, photo_id, q));
         cid
     }
 
@@ -528,13 +594,19 @@ impl ClusterIndex {
     /// keeps the cluster a clique). A single near-duplicate neighbor is still enough
     /// on its own: a ≥[`TAU_DUP`] match is unambiguous and is never the bridge that
     /// chains two people, so it bypasses the all-members test (and so a confirmed
-    /// identity, whose members can be spread, keeps accreting its duplicates).
-    /// `None` ⇒ singleton.
-    fn vote(&self, top: &[(usize, f32)], cluster_min: &std::collections::HashMap<i64, f32>) -> Option<i64> {
+    /// identity, whose members can be spread, keeps accreting its duplicates) —
+    /// but even a near-duplicate never joins a cluster holding a same-photo face
+    /// (that "duplicate" is the sibling standing next to them). `None` ⇒ singleton.
+    fn vote(
+        &self,
+        top: &[(usize, f32)],
+        cluster_min: &std::collections::HashMap<i64, f32>,
+        same_photo: &std::collections::HashSet<i64>,
+    ) -> Option<i64> {
         if top.is_empty() {
             return None;
         }
-        if top[0].1 >= TAU_DUP {
+        if top[0].1 >= TAU_DUP && !same_photo.contains(&self.faces[top[0].0].0) {
             return Some(self.faces[top[0].0].0);
         }
         use std::collections::HashMap;
@@ -544,7 +616,11 @@ impl ClusterIndex {
         }
         counts
             .into_iter()
-            .filter(|&(cid, c)| c >= MIN_VOTE && cluster_min.get(&cid).map_or(false, |&m| m >= TAU_LINK))
+            .filter(|&(cid, c)| {
+                c >= MIN_VOTE
+                    && !same_photo.contains(&cid)
+                    && cluster_min.get(&cid).map_or(false, |&m| m >= TAU_LINK)
+            })
             .max_by_key(|&(_, c)| c)
             .map(|(cid, _)| cid)
     }
@@ -672,11 +748,12 @@ mod tests {
     #[test]
     fn incremental_outlier_starts_its_own_cluster() {
         // Seed a cluster, then assign a far-away face: it must NOT join (no magnet).
-        let seed: Vec<(i64, Vec<f32>)> = blob(16, 0, 4).into_iter().map(|e| (1, e)).collect();
+        let seed: Vec<(i64, i64, Vec<f32>)> =
+            blob(16, 0, 4).into_iter().enumerate().map(|(k, e)| (1, 100 + k as i64, e)).collect();
         let mut idx = ClusterIndex::load(seed);
         let mut outlier = vec![0.0f32; 16];
         outlier[8] = 1.0;
-        let cid = idx.assign(&normalized(&outlier));
+        let cid = idx.assign(&normalized(&outlier), 999);
         assert_ne!(cid, 1, "an outlier must start a new cluster, not pollute cluster 1");
     }
 
@@ -705,11 +782,56 @@ mod tests {
 
     #[test]
     fn incremental_neighbor_joins_cluster() {
-        let seed: Vec<(i64, Vec<f32>)> = blob(16, 0, 4).into_iter().map(|e| (7, e)).collect();
+        let seed: Vec<(i64, i64, Vec<f32>)> =
+            blob(16, 0, 4).into_iter().enumerate().map(|(k, e)| (7, 100 + k as i64, e)).collect();
         let mut idx = ClusterIndex::load(seed);
         // A new face squarely inside the blob should join cluster 7.
-        let cid = idx.assign(&vec_near(16, 0, 3, 0.04));
+        let cid = idx.assign(&vec_near(16, 0, 3, 0.04), 999);
         assert_eq!(cid, 7);
+    }
+
+    #[test]
+    fn incremental_same_photo_blocks_join() {
+        // A near-duplicate of cluster 7's members, but photographed IN THE SAME
+        // PHOTO as one of them — two faces in one photo are two people, so it must
+        // not join, however similar the embeddings (the sibling-babies case).
+        let seed: Vec<(i64, i64, Vec<f32>)> =
+            blob(16, 0, 4).into_iter().enumerate().map(|(k, e)| (7, 100 + k as i64, e)).collect();
+        let mut idx = ClusterIndex::load(seed);
+        let cid = idx.assign(&vec_near(16, 0, 3, 0.04), 101); // photo 101 already in cluster 7
+        assert_ne!(cid, 7, "a same-photo face must never join the cluster");
+    }
+
+    #[test]
+    fn same_photo_faces_never_share_cluster() {
+        // Two identical blobs — unconstrained they merge into one cluster — but two
+        // of the faces (one from each side) share a photo, so the merge is refused.
+        let dim = 16;
+        let mut faces = Vec::new();
+        for (k, e) in blob(dim, 0, 4).into_iter().enumerate() {
+            faces.push((k as i64, e));
+        }
+        for (k, e) in blob(dim, 0, 4).into_iter().enumerate() {
+            faces.push((100 + k as i64, e));
+        }
+        // Sanity: with no constraints these merge.
+        let free = recluster(&faces, &LinkConstraints::default(), |_| {});
+        assert_eq!(cluster_of(&free, 0), cluster_of(&free, 100));
+
+        let mut c = LinkConstraints::default();
+        c.photo_of.insert(0, 555); // face 0 and face 100 are in photo 555 together
+        c.photo_of.insert(100, 555);
+        let a = recluster(&faces, &c, |_| {});
+        assert_ne!(
+            cluster_of(&a, 0),
+            cluster_of(&a, 100),
+            "faces sharing a photo are two people and must not co-cluster",
+        );
+
+        // ...unless the pair is a marked double detection.
+        c.same_photo_ok.insert((0, 100));
+        let ok = recluster(&faces, &c, |_| {});
+        assert_eq!(cluster_of(&ok, 0), cluster_of(&ok, 100));
     }
 
     #[test]
@@ -730,14 +852,18 @@ mod tests {
         let mut m3 = vec![0.0f32; dim];
         m3[0] = 0.45;
         m3[5] = (1.0f32 - 0.45 * 0.45).sqrt();
-        let seed = vec![(1i64, normalized(&m1)), (1, normalized(&m2)), (1, normalized(&m3))];
+        let seed = vec![
+            (1i64, 100, normalized(&m1)),
+            (1, 101, normalized(&m2)),
+            (1, 102, normalized(&m3)),
+        ];
         let mut idx = ClusterIndex::load(seed);
         // Candidate: ~0.6 to m1/m2 (two votes, but below TAU_DUP so it must pass the
         // guard) and only ~0.27 to m3.
         let mut cand = vec![0.0f32; dim];
         cand[0] = 0.6;
         cand[7] = 0.8;
-        let cid = idx.assign(&normalized(&cand));
+        let cid = idx.assign(&normalized(&cand), 999);
         assert_ne!(cid, 1, "a bridge face must not join a cluster it fails complete-linkage against");
     }
 

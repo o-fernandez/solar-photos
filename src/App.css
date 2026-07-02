@@ -1651,3 +1651,157 @@ body,
     color: #ededed;
   }
 }
+
+/* --- Focus review (the training session as an inbox: one decision per screen). */
+.rf-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(22, 28, 24, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+.rf-card {
+  position: relative;
+  background: #fff;
+  border-radius: 16px;
+  padding: 20px 26px 18px;
+  width: min(560px, calc(100vw - 48px));
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+}
+.rf-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.rf-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: #ececec;
+  overflow: hidden;
+}
+.rf-fill {
+  height: 100%;
+  background: #1c7a45;
+  transition: width 160ms ease;
+}
+.rf-count {
+  font-size: 12px;
+  color: #8a8a8a;
+  white-space: nowrap;
+}
+.rf-x {
+  background: transparent;
+  border: none;
+  color: #8a8a8a;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  line-height: 1;
+}
+.rf-x:hover {
+  color: #3a3a3a;
+}
+.rf-faces {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+.rf-face {
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #ececec;
+}
+.rf-face.small {
+  width: 46px;
+  height: 46px;
+}
+.rf-face.tiny {
+  width: 26px;
+  height: 26px;
+  vertical-align: -7px;
+}
+.rf-face.mystery {
+  border: 2px solid #efb73e;
+}
+.rf-plus {
+  color: #8a8a8a;
+}
+.rf-q {
+  text-align: center;
+  font-size: 16px;
+  font-weight: 500;
+  margin: 0 0 2px;
+}
+/* The proposed person's own reference faces, inline next to the question. */
+.rf-anchor-strip {
+  margin-left: 8px;
+  display: inline-flex;
+  gap: 3px;
+}
+.rf-sub {
+  text-align: center;
+  font-size: 12px;
+  color: #8a8a8a;
+  margin: 0 0 14px;
+}
+.rf-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rf-key {
+  font-size: 10px;
+  color: #9a9a9a;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-left: 6px;
+}
+.rf-tally {
+  text-align: center;
+  font-size: 12px;
+  color: #8a8a8a;
+  margin: 14px 0 0;
+}
+.rf-who {
+  display: flex;
+  justify-content: center;
+  gap: 28px;
+  margin-bottom: 2px;
+}
+.rf-who-col {
+  text-align: center;
+}
+.rf-who-name {
+  font-size: 12px;
+  color: #5a5a5a;
+  margin: 0 0 6px;
+}
+.rf-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  margin-bottom: 14px;
+}
+.rf-picker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.rf-done {
+  text-align: center;
+  padding: 8px 0 4px;
+}

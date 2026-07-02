@@ -19,6 +19,7 @@ import {
   detachFaces,
   faceCropUrl,
   faceIdsForPhotos,
+  getClusterGeneration,
   getClusters,
   getPersonLooks,
   getPersonPhotos,
@@ -26,6 +27,7 @@ import {
   mergeClusters,
   nameCluster,
   notThisPerson,
+  onClusterProgress,
   onThumbReady,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
@@ -294,10 +296,29 @@ export default function PersonView({
       });
   };
 
-  // The people you can reassign a chunk *into* — every other person, biggest first.
-  // Loaded once; the picker filters it by the typeahead.
+  // The people you can reassign a chunk *into* — every other person, biggest first —
+  // plus the clustering generation their ids belong to. Both refresh when a
+  // background re-cluster finishes (it renumbers cluster ids), so a move started
+  // after that binds against current ids; a move racing the boundary is refused by
+  // the backend's generation check instead of landing on the wrong person.
+  const genRef = useRef<number>(0);
   useEffect(() => {
-    getClusters().then(setPeople).catch(() => {});
+    const load = () => {
+      getClusters().then(setPeople).catch(() => {});
+      getClusterGeneration()
+        .then((g) => {
+          genRef.current = g;
+        })
+        .catch(() => {});
+    };
+    load();
+    let unlisten: (() => void) | undefined;
+    onClusterProgress((p) => {
+      if (!p.running) load();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
   }, []);
 
   const toggleSelect = (photoId: number) => {
@@ -355,13 +376,13 @@ export default function PersonView({
   const moveToPerson = (target: Cluster) =>
     applyCorrection(
       selectedIds,
-      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, target.cluster_id),
+      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, target.cluster_id, genRef.current),
       `Moved to ${target.name}`,
     );
   const moveToNewPerson = (newName?: string) =>
     applyCorrection(
       selectedIds,
-      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName),
+      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName, genRef.current),
       newName ? `Moved to ${newName}` : "Moved to a new person",
     );
   const ignoreSelected = () =>
@@ -385,7 +406,11 @@ export default function PersonView({
     if (!activeLook) return;
     const ids = activeLook.photo_ids;
     endLook();
-    applyCorrection(ids, (fids) => reassignFacesToCluster(fids, cluster.cluster_id, targetCluster), label);
+    applyCorrection(
+      ids,
+      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, targetCluster, genRef.current),
+      label,
+    );
   };
   const moveLookToPerson = (target: Cluster) =>
     moveLookToCluster(target.cluster_id, `Moved to ${target.name}`);
@@ -397,7 +422,7 @@ export default function PersonView({
     endLook();
     applyCorrection(
       ids,
-      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName),
+      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName, genRef.current),
       newName ? `Moved to ${newName}` : "Moved to a new person",
     );
   };

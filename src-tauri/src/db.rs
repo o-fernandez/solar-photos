@@ -210,16 +210,58 @@ fn decode_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// (cluster_id, embedding) for every already-clustered face — used to rebuild the
-/// in-memory cluster index at startup.
-pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
-    let mut stmt =
-        conn.prepare("SELECT cluster_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+/// (cluster_id, photo_id, embedding) for every already-clustered face — used to
+/// rebuild the in-memory cluster index at startup (photo id feeds the same-photo
+/// exclusion during incremental assignment).
+pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f32>)>> {
+    let mut stmt = conn
+        .prepare("SELECT cluster_id, photo_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
     let rows = stmt.query_map([], |r| {
         let cid: i64 = r.get(0)?;
-        let blob: Vec<u8> = r.get(1)?;
-        Ok((cid, decode_embedding(&blob)))
+        let pid: i64 = r.get(1)?;
+        let blob: Vec<u8> = r.get(2)?;
+        Ok((cid, pid, decode_embedding(&blob)))
     })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (photo_id, face_id, x1, y1, x2, y2) for every clustered face in a photo that
+/// holds 2+ clustered faces — the raw material for the same-photo exclusion
+/// (two faces in one photo are two different people, unless their boxes overlap
+/// so much they're a double detection of one face).
+pub fn multi_face_boxes(conn: &Connection) -> Result<Vec<(i64, i64, f32, f32, f32, f32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT photo_id, id, x1, y1, x2, y2 FROM faces
+         WHERE cluster_id IS NOT NULL
+           AND photo_id IN (
+             SELECT photo_id FROM faces WHERE cluster_id IS NOT NULL
+             GROUP BY photo_id HAVING COUNT(*) > 1)
+         ORDER BY photo_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (cluster_id, photo_id) for every clustered face — for co-occurrence vetoes on
+/// suggestions and auto-fold (a candidate group photographed alongside the person
+/// cannot BE the person).
+pub fn cluster_photo_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn
+        .prepare("SELECT cluster_id, photo_id FROM faces WHERE cluster_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// (identity_id, photo_id) for every *confirmed* face — the person side of the
+/// co-occurrence veto.
+pub fn confirmed_identity_photos(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT identity_id, photo_id FROM faces
+         WHERE confirmed = 1 AND identity_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

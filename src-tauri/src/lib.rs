@@ -86,6 +86,7 @@ struct SuggestionCache {
     generation: i64,
     merges: Vec<MergeSuggestion>,
     growth: Vec<IdentityGrowth>,
+    queue: Vec<ReviewItem>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -467,6 +468,89 @@ fn get_person_photos(
     db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
 }
 
+/// Intersection-over-union of two face boxes — detects double detections of one
+/// face (the only case where two same-photo boxes may be the same person).
+fn box_iou(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
+    let ix = (a.2.min(b.2) - a.0.max(b.0)).max(0.0);
+    let iy = (a.3.min(b.3) - a.1.max(b.1)).max(0.0);
+    let inter = ix * iy;
+    let area_a = (a.2 - a.0).max(0.0) * (a.3 - a.1).max(0.0);
+    let area_b = (b.2 - b.0).max(0.0) * (b.3 - b.1).max(0.0);
+    let union = (area_a + area_b - inter).max(1e-9);
+    inter / union
+}
+
+/// Boxes overlapping at least this much are one face detected twice, not two people.
+const DOUBLE_DETECTION_IOU: f32 = 0.4;
+
+/// Same-photo constraint data for clustering: `face -> photo` (multi-face photos
+/// only — singletons can't conflict) and the double-detection exception pairs.
+fn photo_constraints(
+    conn: &Connection,
+) -> anyhow::Result<(std::collections::HashMap<i64, i64>, std::collections::HashSet<(i64, i64)>)> {
+    let rows = db::multi_face_boxes(conn)?; // ordered by photo_id
+    let mut photo_of = std::collections::HashMap::new();
+    let mut ok = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j < rows.len() && rows[j].0 == rows[i].0 {
+            j += 1;
+        }
+        for a in i..j {
+            photo_of.insert(rows[a].1, rows[a].0);
+            for b in (a + 1)..j {
+                let ba = (rows[a].2, rows[a].3, rows[a].4, rows[a].5);
+                let bb = (rows[b].2, rows[b].3, rows[b].4, rows[b].5);
+                if box_iou(ba, bb) >= DOUBLE_DETECTION_IOU {
+                    let (x, y) = (rows[a].1, rows[b].1);
+                    ok.insert(if x < y { (x, y) } else { (y, x) });
+                }
+            }
+        }
+        i = j;
+    }
+    Ok((photo_of, ok))
+}
+
+/// Per-cluster and per-confirmed-identity photo sets, for the co-occurrence veto:
+/// a candidate group photographed *alongside* a person cannot BE that person.
+fn cooccurrence_maps(
+    conn: &Connection,
+) -> anyhow::Result<(
+    std::collections::HashMap<i64, std::collections::HashSet<i64>>,
+    std::collections::HashMap<i64, std::collections::HashSet<i64>>,
+)> {
+    let mut cluster_photos: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    for (cid, pid) in db::cluster_photo_pairs(conn)? {
+        cluster_photos.entry(cid).or_default().insert(pid);
+    }
+    let mut identity_photos: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    for (ident, pid) in db::confirmed_identity_photos(conn)? {
+        identity_photos.entry(ident).or_default().insert(pid);
+    }
+    Ok((cluster_photos, identity_photos))
+}
+
+/// True if the cluster shares at least one photo with the identity's confirmed
+/// faces — they appear together, so they're two different people.
+fn cooccurs(
+    cluster_photos: &std::collections::HashMap<i64, std::collections::HashSet<i64>>,
+    cid: i64,
+    identity_photos: &std::collections::HashMap<i64, std::collections::HashSet<i64>>,
+    identity: i64,
+) -> bool {
+    match (cluster_photos.get(&cid), identity_photos.get(&identity)) {
+        (Some(cp), Some(ip)) => {
+            let (small, big) = if cp.len() <= ip.len() { (cp, ip) } else { (ip, cp) };
+            small.iter().any(|p| big.contains(p))
+        }
+        _ => false,
+    }
+}
+
 /// L2-normalized mean of a set of embeddings — a robust single-vector summary of a
 /// look or an identity's anchor. (Cosine of two of these is their centroid cosine.)
 fn mean_normalized(v: &[Vec<f32>]) -> Vec<f32> {
@@ -683,13 +767,20 @@ struct CorrectionUndo {
 /// Reassign faces to an **existing** person (their cluster). Binds them to that
 /// person's identity (must-link) and records a cannot-link from the source person,
 /// so the move is durable and the two never re-merge (§4/§5 of the spec).
+///
+/// The generation check matters here even though face ids are stable: the *target*
+/// cluster id came from a people list loaded earlier, and a re-cluster in between
+/// renumbers ids — binding the faces (confirmed!) to whatever cluster now holds
+/// that id would label them as the wrong person.
 #[tauri::command]
 fn reassign_faces_to_cluster(
     state: tauri::State<'_, AppState>,
     face_ids: Vec<i64>,
     source_cluster_id: i64,
     target_cluster_id: i64,
+    expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
     let mut conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     // Both sides become durable identities; record "not the same" between them.
@@ -708,7 +799,9 @@ fn reassign_faces_to_new_person(
     face_ids: Vec<i64>,
     source_cluster_id: i64,
     name: Option<String>,
+    expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
     let mut conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
@@ -821,6 +914,8 @@ struct MergeSuggestion {
     from_faces: Vec<i64>,
     into_name: Option<String>,
     similarity: f32,
+    /// Faces on the smaller side — the payoff of resolving this suggestion.
+    photos: i64,
     /// Clustering generation this card was computed at (checked by mutations).
     generation: i64,
 }
@@ -863,8 +958,27 @@ fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSugge
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     ranked.truncate(20);
 
+    // Two clusters that appear in the same photo are two people — never suggest them.
+    let mut cluster_photos: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    for (cid, pid) in db::cluster_photo_pairs(conn)? {
+        cluster_photos.entry(cid).or_default().insert(pid);
+    }
+    let share_photo = |a: i64, b: i64| -> bool {
+        match (cluster_photos.get(&a), cluster_photos.get(&b)) {
+            (Some(pa), Some(pb)) => {
+                let (small, big) = if pa.len() <= pb.len() { (pa, pb) } else { (pb, pa) };
+                small.iter().any(|p| big.contains(p))
+            }
+            _ => false,
+        }
+    };
+
     let mut out = Vec::with_capacity(ranked.len());
     for (e, _) in ranked {
+        if share_photo(e.a, e.b) {
+            continue;
+        }
         let (big, small) = {
             let (ca, cb) = (info[&e.a], info[&e.b]);
             if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
@@ -886,6 +1000,7 @@ fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSugge
             from_faces: db::top_face_ids(conn, small.cluster_id, 4).unwrap_or_default(),
             into_name: big.name.clone(),
             similarity: e.max_sim,
+            photos: small.count,
             generation: 0, // stamped by refresh_suggestion_cache
         });
     }
@@ -918,6 +1033,68 @@ struct GrowthCluster {
     similarity: f32,
 }
 
+/// One candidate answer on a "Who is this?" card.
+#[derive(Clone, serde::Serialize)]
+struct WhoCandidate {
+    identity_id: i64,
+    name: String,
+    /// The cluster an "it's them" answer folds the group into.
+    into: i64,
+    anchor_faces: Vec<i64>,
+    similarity: f32,
+}
+
+/// One decision in the unified review queue (the focus-mode flow). Every engine's
+/// output — strong batches, uncertain growth, contested clusters, pairwise
+/// evidence — is normalized to this shape and sorted by payoff (photos), so the
+/// user answers the biggest questions first with one grammar: yes / no / who.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReviewItem {
+    /// "N groups strongly match <name>" — bulk-mergeable, with per-group verbs.
+    StrongBatch {
+        photos: i64,
+        name: String,
+        into: i64,
+        anchor_faces: Vec<i64>,
+        groups: Vec<GrowthCluster>,
+    },
+    /// "Might also be <name>?" — one group, yes / no / someone else.
+    Maybe {
+        photos: i64,
+        name: String,
+        into: i64,
+        anchor_faces: Vec<i64>,
+        group: GrowthCluster,
+    },
+    /// Two+ named people both plausibly match this group — the near-tie the model
+    /// can't resolve (babies). One answer teaches the winner *and* the loser, the
+    /// highest information-per-click question in the app.
+    WhoIsThis {
+        photos: i64,
+        cluster_id: i64,
+        group_faces: Vec<i64>,
+        candidates: Vec<WhoCandidate>,
+    },
+    /// "Same person?" — face-to-face pairwise evidence between two clusters.
+    Pairwise {
+        photos: i64,
+        into: i64,
+        from: i64,
+        into_name: Option<String>,
+        into_faces: Vec<i64>,
+        from_faces: Vec<i64>,
+    },
+}
+
+/// The review queue as of one clustering generation. All items share the payload's
+/// generation — mutations pass it back so stale answers are refused.
+#[derive(Clone, serde::Serialize, Default)]
+struct ReviewQueue {
+    generation: i64,
+    items: Vec<ReviewItem>,
+}
+
 /// A batch offer from a confirmed person, split by confidence. The `strong` matches
 /// ("N groups are a strong match for <name>") fold in with one bulk click; the
 /// less-certain `maybe` tail is reviewed one face at a time. That tail is exactly
@@ -934,6 +1111,8 @@ struct IdentityGrowth {
     anchor_faces: Vec<i64>,
     /// Strong matches, offered as a single bulk merge.
     strong_clusters: Vec<i64>,
+    /// Per-group chip data for the strong matches (review-queue batch card).
+    strong_groups: Vec<GrowthCluster>,
     /// Example faces drawn from the strong matches, for the card strip.
     strong_faces: Vec<i64>,
     /// Total photos across the strong matches.
@@ -965,14 +1144,20 @@ struct IdentityGrowth {
 /// Heavy (a full-library pass per confirmed identity) — runs only from the
 /// background cache refresh, never from a UI command; the old per-tab-open compute
 /// held the shared DB lock through seconds of matrix math, stalling every avatar.
-fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrowth>> {
+///
+/// Also returns the "Who is this?" review items: the clusters *dropped* from the
+/// growth cards because two or more named people claim them. Those near-ties used
+/// to fall silently into limbo; now they're the queue's best question.
+fn compute_identity_growth(
+    conn: &Connection,
+) -> anyhow::Result<(Vec<IdentityGrowth>, Vec<ReviewItem>)> {
     match db::face_progress(conn)? {
         (scanned, eligible) if eligible > 0 && scanned >= eligible => {}
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), Vec::new())),
     }
     let named = db::named_identities(conn)?;
     if named.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let all_faces = db::face_cluster_embeddings(conn)?;
     let blocked: std::collections::HashSet<(i64, i64)> =
@@ -988,6 +1173,8 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
     // the explicit rename/typeahead path, never a one-click suggestion.
     let confirmed_clusters: std::collections::HashSet<i64> =
         db::confirmed_clusters(conn)?.into_iter().collect();
+    // Co-occurrence veto for candidates (see auto_fold_confident).
+    let (cluster_photos, identity_photos) = cooccurrence_maps(conn)?;
 
     // Pass 1: gather each identity's candidate clusters (already filtered by
     // "not the same"), and tally how many distinct identities claim each cluster.
@@ -999,7 +1186,9 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
         candidates: Vec<(i64, i64, f32)>, // strongest-first (cluster_id, size, max_sim)
     }
     let mut pending: Vec<Pending> = Vec::new();
-    let mut claims: HashMap<i64, u32> = HashMap::new(); // cluster_id -> # identities claiming it
+    // cluster_id -> the identities claiming it (with match strength) + its size.
+    let mut claims: HashMap<i64, Vec<(i64, f32)>> = HashMap::new();
+    let mut claim_size: HashMap<i64, i64> = HashMap::new();
     for (identity_id, name) in named {
         let anchor = db::confirmed_anchor_embeddings(conn, identity_id, 64)?;
         if anchor.len() < MIN_ANCHOR {
@@ -1029,6 +1218,9 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
             if confirmed_clusters.contains(&c.cluster_id) {
                 continue; // someone's confirmed group — never offered for absorption
             }
+            if cooccurs(&cluster_photos, c.cluster_id, &identity_photos, identity_id) {
+                continue; // photographed together — cannot be this person
+            }
             if let Ok(Some(other_id)) = db::identity_of_cluster(conn, c.cluster_id) {
                 let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
                 if blocked.contains(&key) {
@@ -1047,7 +1239,8 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
                     continue;
                 }
             }
-            *claims.entry(c.cluster_id).or_insert(0) += 1;
+            claims.entry(c.cluster_id).or_default().push((identity_id, c.max_sim));
+            claim_size.insert(c.cluster_id, c.size as i64);
             candidates.push((c.cluster_id, c.size as i64, c.max_sim));
         }
         if candidates.is_empty() {
@@ -1063,24 +1256,31 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
     // so the chip row stays glanceable.
     const STRONG: f32 = 0.6;
     const MAX_MAYBE: usize = 12;
+    // Identity display info for the who-is-this cards, captured before pass 2
+    // consumes `pending`.
+    let ident_info: HashMap<i64, (String, i64)> =
+        pending.iter().map(|p| (p.identity_id, (p.name.clone(), p.into))).collect();
     let mut out = Vec::new();
     for p in pending {
         let mut strong_clusters = Vec::new();
+        let mut strong_groups: Vec<GrowthCluster> = Vec::new();
         let mut strong_faces = Vec::new();
         let mut strong_photos: i64 = 0;
         let mut maybe: Vec<GrowthCluster> = Vec::new();
         let mut photos: i64 = 0;
         for (cid, size, sim) in p.candidates {
-            if claims.get(&cid).copied().unwrap_or(0) > 1 {
-                continue; // ambiguous — leave it to the pairwise path
+            if claims.get(&cid).map_or(0, |v| v.len()) > 1 {
+                continue; // contested between people — becomes a who-is-this card
             }
             photos += size;
             if sim >= STRONG {
                 strong_clusters.push(cid);
+                let face_id = db::top_face_ids(conn, cid, 1).ok().and_then(|v| v.into_iter().next());
+                strong_groups.push(GrowthCluster { cluster_id: cid, face_id, photos: size, similarity: sim });
                 strong_photos += size;
                 if strong_faces.len() < 4 {
-                    if let Ok(mut f) = db::top_face_ids(conn, cid, 1) {
-                        strong_faces.append(&mut f);
+                    if let Some(f) = face_id {
+                        strong_faces.push(f);
                     }
                 }
             } else {
@@ -1104,6 +1304,7 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
             into: p.into,
             anchor_faces: db::top_face_ids(conn, p.into, 4).unwrap_or_default(),
             strong_clusters,
+            strong_groups,
             strong_faces,
             strong_photos,
             maybe,
@@ -1113,7 +1314,38 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
     }
     // Most impactful person first.
     out.sort_by(|a, b| b.photos.cmp(&a.photos));
-    Ok(out)
+
+    // The contested clusters (claimed by 2+ named people) become who-is-this cards.
+    let mut who: Vec<ReviewItem> = Vec::new();
+    for (cid, claimants) in &claims {
+        if claimants.len() < 2 {
+            continue;
+        }
+        let mut cands: Vec<WhoCandidate> = claimants
+            .iter()
+            .filter_map(|(id, sim)| {
+                ident_info.get(id).map(|(name, into)| WhoCandidate {
+                    identity_id: *id,
+                    name: name.clone(),
+                    into: *into,
+                    anchor_faces: db::top_face_ids(conn, *into, 2).unwrap_or_default(),
+                    similarity: *sim,
+                })
+            })
+            .collect();
+        if cands.len() < 2 {
+            continue;
+        }
+        cands.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        cands.truncate(3);
+        who.push(ReviewItem::WhoIsThis {
+            photos: claim_size.get(cid).copied().unwrap_or(0),
+            cluster_id: *cid,
+            group_faces: db::top_face_ids(conn, *cid, 3).unwrap_or_default(),
+            candidates: cands,
+        });
+    }
+    Ok((out, who))
 }
 
 /// The cached growth cards from the last clustering pass — see
@@ -1128,6 +1360,20 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
         Ok(cache.growth.clone())
     } else {
         Ok(Vec::new())
+    }
+}
+
+/// The unified review queue from the last clustering pass — the focus flow's feed.
+#[tauri::command]
+fn get_review_queue(state: tauri::State<'_, AppState>) -> Result<ReviewQueue, String> {
+    if state.reclustering.load(Ordering::SeqCst) {
+        return Ok(ReviewQueue::default());
+    }
+    let cache = state.suggestion_cache.lock().unwrap();
+    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
+        Ok(ReviewQueue { generation: cache.generation, items: cache.queue.clone() })
+    } else {
+        Ok(ReviewQueue::default())
     }
 }
 
@@ -1311,14 +1557,67 @@ fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     let state = app.state::<AppState>();
     let generation = state.cluster_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let mut merges = compute_merge_suggestions(conn).unwrap_or_default();
-    let mut growth = compute_identity_growth(conn).unwrap_or_default();
+    let (mut growth, who) = compute_identity_growth(conn).unwrap_or_default();
     for s in &mut merges {
         s.generation = generation;
     }
     for g in &mut growth {
         g.generation = generation;
     }
-    *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth };
+    let queue = build_review_queue(&merges, &growth, who);
+    *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth, queue };
+}
+
+/// Normalize every engine's suggestions into the single payoff-sorted review queue
+/// the focus flow walks: strong batches and uncertain growth per person, contested
+/// who-is-this clusters, and pairwise same-person evidence — biggest photos first,
+/// capped so a session has a visible end.
+fn build_review_queue(
+    merges: &[MergeSuggestion],
+    growth: &[IdentityGrowth],
+    who: Vec<ReviewItem>,
+) -> Vec<ReviewItem> {
+    const MAX_QUEUE: usize = 60;
+    let mut items = who;
+    for g in growth {
+        if !g.strong_groups.is_empty() {
+            items.push(ReviewItem::StrongBatch {
+                photos: g.strong_photos,
+                name: g.name.clone(),
+                into: g.into,
+                anchor_faces: g.anchor_faces.clone(),
+                groups: g.strong_groups.clone(),
+            });
+        }
+        for m in &g.maybe {
+            items.push(ReviewItem::Maybe {
+                photos: m.photos,
+                name: g.name.clone(),
+                into: g.into,
+                anchor_faces: g.anchor_faces.clone(),
+                group: m.clone(),
+            });
+        }
+    }
+    for s in merges {
+        items.push(ReviewItem::Pairwise {
+            photos: s.photos,
+            into: s.into,
+            from: s.from,
+            into_name: s.into_name.clone(),
+            into_faces: s.into_faces.clone(),
+            from_faces: s.from_faces.clone(),
+        });
+    }
+    let photos_of = |i: &ReviewItem| match i {
+        ReviewItem::StrongBatch { photos, .. }
+        | ReviewItem::Maybe { photos, .. }
+        | ReviewItem::WhoIsThis { photos, .. }
+        | ReviewItem::Pairwise { photos, .. } => *photos,
+    };
+    items.sort_by(|a, b| photos_of(b).cmp(&photos_of(a)));
+    items.truncate(MAX_QUEUE);
+    items
 }
 
 /// Guard for suggestion-driven mutations. Cluster ids are reassigned from scratch by
@@ -1476,6 +1775,9 @@ fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
     let fold_eligible: HashSet<i64> =
         db::fold_eligible_identities(conn, MIN_ANCHOR as i64)?.into_iter().collect();
     let matches = cluster_identity_matches(conn)?;
+    // Co-occurrence veto: a group photographed alongside the person's confirmed
+    // faces cannot be them (siblings in one frame), however similar the embeddings.
+    let (cluster_photos, identity_photos) = cooccurrence_maps(conn)?;
 
     // Assign each candidate to the identity it matches *decisively* best: the top match
     // must clear AUTO_FOLD_MIN and beat the runner-up by AUTO_FOLD_MARGIN. A near-tie
@@ -1495,6 +1797,9 @@ fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
         }
         if !fold_eligible.contains(&best_id) {
             continue; // best match is only a thin competitor — don't let it absorb
+        }
+        if cooccurs(&cluster_photos, cid, &identity_photos, best_id) {
+            continue; // photographed together — two people, never fold
         }
         let into = match db::clusters_of_identity(conn, best_id)?.first() {
             Some(&c) => c,
@@ -1578,9 +1883,12 @@ fn run_recluster(app: AppHandle) {
             // Only *confirmed* (user-labeled) faces are must-links; auto-folded ones
             // are left free to re-cluster by appearance, so a wrongly-folded look-alike
             // isn't welded on — it re-homes once a better-matching person exists.
+            let (photo_of, same_photo_ok) = photo_constraints(&conn)?;
             let constraints = cluster::LinkConstraints {
                 face_identity: db::confirmed_face_identities(&conn)?.into_iter().collect(),
                 cannot_link: db::cannot_link_pairs(&conn)?.into_iter().collect(),
+                photo_of,
+                same_photo_ok,
             };
 
             // Throttle progress events to ~every 2% so we don't flood the channel.
@@ -1664,6 +1972,13 @@ fn run_recluster(app: AppHandle) {
 #[tauri::command]
 fn recluster(app: tauri::AppHandle) {
     run_recluster(app);
+}
+
+/// The current clustering generation — fetched with a people list so later
+/// mutations can prove their cluster ids are from the same clustering.
+#[tauri::command]
+fn get_cluster_generation(state: tauri::State<'_, AppState>) -> i64 {
+    state.cluster_gen.load(Ordering::SeqCst)
 }
 
 /// Debug-only: print the cosine distribution of mutual-kNN edges over the whole
@@ -1837,7 +2152,7 @@ fn spawn_face_workers(
             match res_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok((id, found)) => {
                     let cluster_ids: Vec<i64> =
-                        found.iter().map(|f| index.assign(&f.embedding)).collect();
+                        found.iter().map(|f| index.assign(&f.embedding, id)).collect();
                     pending_consolidation += found.len() as u64;
                     let _ = db::save_faces(&mut conn, id, &found, &cluster_ids);
                     outstanding -= 1;
@@ -2185,6 +2500,8 @@ pub fn run() {
             merge_clusters,
             get_merge_suggestions,
             get_identity_growth,
+            get_review_queue,
+            get_cluster_generation,
             absorb_clusters,
             reject_merge,
             not_this_person,

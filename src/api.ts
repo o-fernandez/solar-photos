@@ -179,6 +179,8 @@ export interface MergeSuggestion {
   from_faces: number[];
   into_name: string | null;
   similarity: number;
+  /** Faces on the smaller side — the payoff of resolving this suggestion. */
+  photos: number;
   /** Clustering generation this card was computed at — pass back to mutations. */
   generation: number;
 }
@@ -205,6 +207,8 @@ export interface IdentityGrowth {
   anchor_faces: number[];
   /** Strong matches, folded in as one bulk merge. */
   strong_clusters: number[];
+  /** Per-group chip data for the strong matches (review-queue batch card). */
+  strong_groups: GrowthCluster[];
   /** Example faces drawn from the strong matches. */
   strong_faces: number[];
   /** Total photos across the strong matches. */
@@ -221,6 +225,68 @@ export interface IdentityGrowth {
  *  same person, ready to fold in with one click. */
 export function getIdentityGrowth(): Promise<IdentityGrowth[]> {
   return invoke("get_identity_growth");
+}
+
+/** One candidate answer on a "Who is this?" card. */
+export interface WhoCandidate {
+  identity_id: number;
+  name: string;
+  /** The cluster an "it's them" answer folds the group into. */
+  into: number;
+  anchor_faces: number[];
+  similarity: number;
+}
+
+/** One decision in the unified review queue — every suggestion engine normalized
+ *  to a single grammar (yes / no / who), sorted biggest-payoff first. */
+export type ReviewItem =
+  | {
+      kind: "strong_batch";
+      photos: number;
+      name: string;
+      into: number;
+      anchor_faces: number[];
+      groups: GrowthCluster[];
+    }
+  | {
+      kind: "maybe";
+      photos: number;
+      name: string;
+      into: number;
+      anchor_faces: number[];
+      group: GrowthCluster;
+    }
+  | {
+      kind: "who_is_this";
+      photos: number;
+      cluster_id: number;
+      group_faces: number[];
+      candidates: WhoCandidate[];
+    }
+  | {
+      kind: "pairwise";
+      photos: number;
+      into: number;
+      from: number;
+      into_name: string | null;
+      into_faces: number[];
+      from_faces: number[];
+    };
+
+export interface ReviewQueue {
+  /** Clustering generation the queue was computed at — pass into every action. */
+  generation: number;
+  items: ReviewItem[];
+}
+
+/** The unified review queue (instant — computed when clustering last settled). */
+export function getReviewQueue(): Promise<ReviewQueue> {
+  return invoke("get_review_queue");
+}
+
+/** The current clustering generation, for guarding actions on loaded cluster ids. */
+export function getClusterGeneration(): Promise<number> {
+  return invoke("get_cluster_generation");
 }
 
 /** Fold a batch of look-alike clusters into a confirmed person (durable). */
@@ -359,13 +425,21 @@ export function faceIdsForPhotos(photoIds: number[], clusterId: number): Promise
 }
 
 /** Reassign faces to an existing person (their cluster). Durable: must-links to the
- *  target and cannot-links from the source so they never re-merge. */
+ *  target and cannot-links from the source so they never re-merge. The generation
+ *  guards the *target*: face ids are stable, but a re-cluster renumbers cluster ids,
+ *  and confirming faces into whatever cluster now holds a stale id mislabels them. */
 export function reassignFacesToCluster(
   faceIds: number[],
   sourceClusterId: number,
   targetClusterId: number,
+  expectedGeneration?: number,
 ): Promise<CorrectionUndo> {
-  return invoke("reassign_faces_to_cluster", { faceIds, sourceClusterId, targetClusterId });
+  return invoke("reassign_faces_to_cluster", {
+    faceIds,
+    sourceClusterId,
+    targetClusterId,
+    expectedGeneration: expectedGeneration ?? null,
+  });
 }
 
 /** Reassign faces to a brand-new person (optionally named). */
@@ -373,11 +447,13 @@ export function reassignFacesToNewPerson(
   faceIds: number[],
   sourceClusterId: number,
   name?: string,
+  expectedGeneration?: number,
 ): Promise<CorrectionUndo> {
   return invoke("reassign_faces_to_new_person", {
     faceIds,
     sourceClusterId,
     name: name ?? null,
+    expectedGeneration: expectedGeneration ?? null,
   });
 }
 

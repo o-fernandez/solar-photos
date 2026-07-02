@@ -78,7 +78,35 @@ identity's** dense-core anchor (`identity_candidates`), best-first. Then per clu
   (outliers dropped) so one bad fold can't poison the anchor and cascade.
 
 The review list (`get_identity_growth`) uses the same competitive matrix: it won't
-keep suggesting a cluster that's decisively **someone else's**.
+keep suggesting a cluster that's decisively **someone else's**, never offers a
+cluster holding *anyone's* confirmed faces (merging two named people is only ever
+the explicit rename/typeahead path), and scores with a **mean-of-top-K** anchor
+match (size-invariant — a 6-exemplar baby no longer loses to a 900-exemplar adult).
+
+## Same-photo exclusion (the free signal)
+
+Two faces in one photo are two different people — the strongest signal available
+for sibling babies the embeddings can't separate, and it's immune to bad metadata
+(a scanned print lies about its date, not about who's in the frame together).
+Enforced everywhere:
+- **Clustering**: `LinkConstraints.photo_of` — a merge whose sides share a photo is
+  refused (exception: `same_photo_ok`, box pairs with IoU ≥ `DOUBLE_DETECTION_IOU`
+  = one face detected twice). Same rule in the incremental `ClusterIndex::assign`.
+- **Auto-fold / growth / pairwise suggestions**: a candidate that co-occurs with the
+  identity's confirmed photos (or with the other cluster) is vetoed (`cooccurs`).
+
+## The review queue + focus mode
+
+Every engine's output is normalized into one payoff-sorted `ReviewQueue`
+(`build_review_queue`, cached per generation, served by `get_review_queue`):
+strong batches, uncertain "maybe" groups, **who-is-this** cards (clusters claimed
+by 2+ named people — the near-ties auto-fold refuses to guess; answering teaches
+the winner and starves the loser, the highest information-per-click question), and
+pairwise evidence. The People banner is just the entry point; `ReviewFocus.tsx`
+walks the queue one decision per screen (Y/N/S keys, skip, session tally). The
+session works on a snapshot — if a re-cluster completes mid-session, the next
+answer is refused by the generation guard and the session ends cleanly rather than
+acting on renumbered ids.
 
 ## Negatives that generalize ("not <person>")
 

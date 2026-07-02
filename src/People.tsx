@@ -12,22 +12,21 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PersonView from "./PersonView";
+import ReviewFocus from "./ReviewFocus";
 import {
-  absorbClusters,
   faceCropUrl,
   getClusters,
   getFaceProgress,
   getIdentityGrowth,
-  getMergeSuggestions,
+  getReviewQueue,
   mergeClusters,
   nameCluster,
   onClusterProgress,
   onFaceProgress,
-  rejectMerge,
   type Cluster,
   type FaceProgress,
   type IdentityGrowth,
-  type MergeSuggestion,
+  type ReviewQueue,
 } from "./api";
 
 // While the library is still being scanned, the incremental assign path spawns a
@@ -40,6 +39,25 @@ const SWEEP_FLOOR = 8; // min photos for an *unnamed* cluster to show mid-sweep
 const SETTLED_FLOOR = 2; // below this, settled clusters move to the "more" section
 const MID_SWEEP_REFRESH_MS = 20_000; // how often to re-pull the grid while scanning
 
+// A few example faces from the queue's top item, for the Review entry card.
+function queueFaces(q: ReviewQueue): number[] {
+  const it = q.items[0];
+  if (!it) return [];
+  switch (it.kind) {
+    case "strong_batch":
+      return it.groups
+        .map((g) => g.face_id)
+        .filter((f): f is number => f != null)
+        .slice(0, 4);
+    case "maybe":
+      return it.group.face_id != null ? [it.group.face_id] : [];
+    case "who_is_this":
+      return it.group_faces.slice(0, 4);
+    case "pairwise":
+      return [...it.into_faces.slice(0, 2), ...it.from_faces.slice(0, 2)];
+  }
+}
+
 export default function People({
   focusClusterId = null,
   onFocusConsumed,
@@ -50,10 +68,11 @@ export default function People({
   onFocusConsumed?: () => void;
 } = {}) {
   const [clusters, setClusters] = useState<Cluster[]>([]);
-  const [suggestions, setSuggestions] = useState<MergeSuggestion[]>([]);
   const [growth, setGrowth] = useState<IdentityGrowth[]>([]);
-  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
-  const [dismissedGrowth, setDismissedGrowth] = useState<Set<number>>(new Set());
+  // The unified review queue (all suggestion engines, payoff-sorted) and whether
+  // the focus-review session is open.
+  const [queue, setQueue] = useState<ReviewQueue | null>(null);
+  const [reviewing, setReviewing] = useState(false);
   // Maybe-tail chips the user has already judged (by cluster id), hidden in place so
   // the row doesn't reflow mid-review. Cleared on every reload (the refetch no longer
   // returns them, so a lingering id would only ever be stale).
@@ -84,15 +103,11 @@ export default function People({
   const lastReloadRef = useRef(0);
 
   const reload = useCallback(() => {
-    // Paint the people grid first. The suggestion passes (merge-evidence graph +
-    // per-identity matching) are heavy and hold the DB lock while they compute, so
-    // running them inline freezes the tab switch — defer them a tick so the grid
-    // shows immediately and the prompts fill in just after.
+    // All three are instant reads now — the heavy suggestion passes run in the
+    // background when clustering settles and are served from a cached snapshot.
     getClusters().then(setClusters).catch(() => {});
-    setTimeout(() => {
-      getMergeSuggestions().then(setSuggestions).catch(() => {});
-      getIdentityGrowth().then(setGrowth).catch(() => {});
-    }, 50);
+    getIdentityGrowth().then(setGrowth).catch(() => {});
+    getReviewQueue().then(setQueue).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -227,47 +242,12 @@ export default function People({
     }
   };
 
-  // Suggestion actions carry the card's clustering generation; the backend refuses a
-  // stale one (a re-cluster renumbered ids since it was computed). On any failure we
-  // reload — fresh suggestions replace the stale card, so the user just re-clicks.
-  const doMerge = (s: MergeSuggestion) => {
-    markHintDone();
-    mergeClusters(s.into, s.from, s.generation)
-      .then(reload)
-      .catch(() => reload());
-  };
-  const decline = (s: MergeSuggestion) => {
-    // Persist a cannot-link so it never returns (not just this session), then hide it.
-    rejectMerge(s.into, s.from, s.generation).catch(() => reload());
-    setDismissed((d) => new Set(d).add(`${s.into}-${s.from}`));
-  };
-
-  // Bulk-fold every strong match into the person in one action, then reload so the
-  // grid counts (and any remaining review tail) reflect it.
-  const mergeStrong = (g: IdentityGrowth) => {
-    markHintDone();
-    absorbClusters(g.into, g.strong_clusters, g.generation)
-      .then(reload)
-      .catch(() => reload());
-  };
-  const declineGrowth = (g: IdentityGrowth) => {
-    setDismissedGrowth((d) => new Set(d).add(g.identity_id));
-  };
-
-  // The banner now carries only the *confident* batch. The less-certain tail moved to
-  // each person's own page (reached via the "N to review" badge on their tile), where
-  // there's room and, crucially, context — you're looking at that person. So the
-  // banner growth card only appears when there's a strong batch to fold in.
-  //
-  // Both the growth ("N are a strong match") and pairwise ("same person?") tracks
-  // unlock on the same "scan finished" gate; show one at a time, growth first (higher
-  // precision, clears more per click), pairwise only when there's no growth to offer.
-  const grow = growth.find(
-    (g) => !dismissedGrowth.has(g.identity_id) && g.strong_clusters.length > 0,
+  // Everything reviewable lives in the unified queue; the banner is just the door.
+  const queueReady = queue != null && queue.items.length > 0;
+  const queuePhotos = useMemo(
+    () => (queue ? queue.items.reduce((n, i) => n + i.photos, 0) : 0),
+    [queue],
   );
-  const suggestion = grow
-    ? undefined
-    : suggestions.find((s) => !dismissed.has(`${s.into}-${s.from}`));
   // Which people have a review tail waiting, keyed by their tile's cluster id (the
   // identity's largest cluster = the growth card's fold-in target). Drives the tile
   // badge and the review section passed into that person's page.
@@ -400,90 +380,52 @@ export default function People({
         </div>
       ) : reorganizing ? (
         <div className="reorg-banner">Reorganizing people…</div>
-      ) : !hintDone && (grow || suggestion) ? (
+      ) : !hintDone && queueReady ? (
         <div className="reorg-banner people-banner">
           <button className="banner-x" aria-label="Dismiss" title="Dismiss" onClick={markHintDone}>
             ✕
           </button>
           <span className="pb-title">All faces scanned</span>
           <span className="pb-sub">
-            Name a few people and accept the suggestions below — similar groups fold in
-            automatically.
+            Name a few people, then hit Review — Solar asks its best questions one at a
+            time, biggest groups first.
           </span>
         </div>
       ) : null}
-      {grow && (
-        <div className="merge-card grow-card">
+      {queueReady && (
+        <div className="merge-card grow-card review-entry">
           <div className="merge-faces">
             <div className="mside">
-              {grow.anchor_faces.map((id) => (
-                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
-              ))}
-            </div>
-            <span className="mplus">+</span>
-            <div className="mside">
-              {grow.strong_faces.map((id) => (
+              {queueFaces(queue!).map((id) => (
                 <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
               ))}
             </div>
           </div>
           <div className="merge-text">
-            {grow.maybe.length > 0 ? (
-              <>
-                <b>
-                  {grow.strong_clusters.length.toLocaleString()}{" "}
-                  {grow.strong_clusters.length === 1 ? "group" : "groups"}
-                </b>{" "}
-                {grow.strong_clusters.length === 1 ? "is a strong match" : "are a strong match"} for{" "}
-                <b>{grow.name}</b> ({grow.strong_photos.toLocaleString()}{" "}
-                {grow.strong_photos === 1 ? "photo" : "photos"}).
-              </>
-            ) : (
-              <>
-                {grow.strong_clusters.length.toLocaleString()}{" "}
-                {grow.strong_clusters.length === 1 ? "group" : "groups"} (
-                {grow.strong_photos.toLocaleString()}{" "}
-                {grow.strong_photos === 1 ? "photo" : "photos"}) look like <b>{grow.name}</b> — merge
-                them all?
-              </>
-            )}
+            <b>{queue!.items.length.toLocaleString()}</b>{" "}
+            {queue!.items.length === 1 ? "question" : "questions"} to review (
+            {queuePhotos.toLocaleString()} {queuePhotos === 1 ? "photo" : "photos"}) — biggest
+            first, one at a time.
           </div>
-          <button className="pick-btn" onClick={() => mergeStrong(grow)}>
-            {grow.maybe.length > 0
-              ? `Merge ${grow.strong_clusters.length.toLocaleString()}`
-              : "Merge all"}
-          </button>
-          <button className="ghost-btn" onClick={() => declineGrowth(grow)}>
-            Not now
+          <button
+            className="pick-btn"
+            onClick={() => {
+              markHintDone();
+              setReviewing(true);
+            }}
+          >
+            Review
           </button>
         </div>
       )}
-      {suggestion && (
-        <div className="merge-card">
-          <div className="merge-faces">
-            <div className="mside">
-              {suggestion.into_faces.map((id) => (
-                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
-              ))}
-            </div>
-            <span className="mplus">+</span>
-            <div className="mside">
-              {suggestion.from_faces.map((id) => (
-                <img key={id} className="mface" src={faceCropUrl(id)} alt="" draggable={false} />
-              ))}
-            </div>
-          </div>
-          <div className="merge-text">
-            These look like the same person — merge
-            {suggestion.into_name ? <> into <b>{suggestion.into_name}</b></> : null}?
-          </div>
-          <button className="pick-btn" onClick={() => doMerge(suggestion)}>
-            Merge
-          </button>
-          <button className="ghost-btn" onClick={() => decline(suggestion)}>
-            Not the same
-          </button>
-        </div>
+      {reviewing && queue && (
+        <ReviewFocus
+          queue={queue}
+          onClose={() => {
+            setReviewing(false);
+            reload();
+          }}
+        />
       )}
 
       {visible.length > 0 ? (
