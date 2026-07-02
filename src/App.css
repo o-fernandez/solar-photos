@@ -1828,3 +1828,7 @@ body,
   gap: 2px;
   margin: 0;
 }
+/* Without the (removed) fixed-total bar, keep the close button right-aligned. */
+.rf-progress .rf-x {
+  margin-left: auto;
+}

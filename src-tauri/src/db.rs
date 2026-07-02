@@ -540,6 +540,43 @@ pub fn cluster_has_foreign_confirmed(
     Ok(n > 0)
 }
 
+/// Like [`cluster_has_foreign_confirmed`], but only *named* identities count — a
+/// real person the user labeled. Faces confirmed under an unnamed competitor
+/// (bookkeeping minted by a rejection) don't block an explicit assignment: the
+/// user's direct judgment on the faces outranks that bookkeeping.
+pub fn cluster_has_named_foreign_confirmed(
+    conn: &Connection,
+    cluster_id: i64,
+    identity: Option<i64>,
+) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM faces f JOIN identities i ON i.id = f.identity_id
+         WHERE f.cluster_id = ?1 AND f.confirmed = 1
+           AND i.name IS NOT NULL AND f.identity_id IS NOT ?2",
+        rusqlite::params![cluster_id, identity],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Rebind a cluster's faces confirmed under *unnamed* identities to `new_identity`.
+/// Used when the user explicitly assigns the cluster to a person: the unnamed
+/// competitor was minted by an earlier rejection, and without this adoption the
+/// assignment would be refused forever (the stuck-card loop).
+pub fn adopt_unnamed_confirmed(
+    conn: &Connection,
+    cluster_id: i64,
+    new_identity: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE faces SET identity_id = ?2
+         WHERE cluster_id = ?1 AND confirmed = 1 AND identity_id != ?2
+           AND identity_id IN (SELECT id FROM identities WHERE name IS NULL)",
+        rusqlite::params![cluster_id, new_identity],
+    )?;
+    Ok(())
+}
+
 /// Mark a cluster's faces as user-confirmed (exemplars + must-links) under the
 /// identity they're being vouched as: unclaimed faces and that identity's own.
 /// A face bound to a *different* identity is untouched — confirming it here would

@@ -24,6 +24,7 @@ import {
   photoUrl,
   rejectMerge,
   resolveSamePhoto,
+  setReviewActive,
   type Cluster,
   type ReviewItem,
   type ReviewQueue,
@@ -58,6 +59,16 @@ export default function ReviewFocus({
 
   useEffect(() => {
     getClusters().then(setPeople).catch(() => {});
+  }, []);
+
+  // Hold the debounced self-heal pass while the session is open: answers apply
+  // instantly, but the re-cluster (which renumbers the remaining cards' ids)
+  // waits until close. Ending the session (unmount) releases any deferred pass.
+  useEffect(() => {
+    setReviewActive(true).catch(() => {});
+    return () => {
+      setReviewActive(false).catch(() => {});
+    };
   }, []);
 
   const advance = useCallback(() => {
@@ -514,18 +525,18 @@ export default function ReviewFocus({
     <div className="rf-overlay" onClick={onClose}>
       <div className="rf-card" onClick={(e) => e.stopPropagation()}>
         <div className="rf-progress">
-          <div className="rf-bar">
-            <div
-              className="rf-fill"
-              style={{ width: `${Math.round((Math.min(idx, items.length) / Math.max(items.length, 1)) * 100)}%` }}
-            />
-          </div>
           <span className="rf-count">
-            {Math.min(idx + 1, items.length)} of {items.length}
+            {answered > 0
+              ? `${answered.toLocaleString()} answered`
+              : items.length > idx
+                ? `${(items.length - idx).toLocaleString()} to look at`
+                : ""}
           </span>
-          <button className="rf-x" aria-label="Close" title="Close (Esc)" onClick={onClose}>
-            ✕
-          </button>
+          {(item || refreshing) && (
+            <button className="rf-x" aria-label="Close" title="Close (Esc)" onClick={onClose}>
+              ✕
+            </button>
+          )}
         </div>
         {body()}
         {note && <p className="rf-note">{note}</p>}

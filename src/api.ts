@@ -308,6 +308,12 @@ export function getClusterGeneration(): Promise<number> {
   return invoke("get_cluster_generation");
 }
 
+/** Focus-review session lifecycle: while active, due re-clusters are deferred so
+ *  the session's cards stay valid; ending it runs any deferred pass. */
+export function setReviewActive(active: boolean): Promise<void> {
+  return invoke("set_review_active", { active });
+}
+
 /** Resolve a same-photo contradiction: `samePerson` = it's a collage/mirror
  *  (record durable per-pair exceptions + merge); otherwise they're two
  *  look-alikes — durable cannot-link so they never re-merge. */

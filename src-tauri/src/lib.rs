@@ -76,6 +76,13 @@ struct AppState {
     suggestion_cache: Arc<Mutex<SuggestionCache>>,
     /// Debounce token for `schedule_recluster`: only the newest pending request fires.
     recluster_epoch: Arc<AtomicU64>,
+    /// True while a focus-review session is open. The debounced self-heal pass is
+    /// held during a session — it renumbers cluster ids and would invalidate the
+    /// remaining cards mid-answer; answers apply instantly either way.
+    review_active: Arc<AtomicBool>,
+    /// Set when a due re-cluster was held by an active review session, so it runs
+    /// as soon as the session ends.
+    recluster_deferred: Arc<AtomicBool>,
 }
 
 /// The People suggestions as of one clustering generation. Served only while
@@ -1023,6 +1030,13 @@ fn compute_merge_suggestions(
             // The contradiction case: co-occurring, yet strong same-person evidence.
             // Never auto-merge (could be twins) — ask, showing the shared photo.
             if e.max_sim >= SAME_PHOTO_ASK_MIN {
+                // A pair whose "same person" answer would be refused (the fragment
+                // belongs to another *named* person) must never become a card — an
+                // unanswerable question is a stuck one.
+                let into_ident = db::identity_of_cluster(conn, big.cluster_id)?;
+                if db::cluster_has_named_foreign_confirmed(conn, small.cluster_id, into_ident)? {
+                    continue;
+                }
                 if let Ok(pairs) = db::cooccurring_face_pairs(conn, big.cluster_id, small.cluster_id)
                 {
                     if let Some(&(photo_id, fa, fb)) = pairs.first() {
@@ -1480,11 +1494,16 @@ fn absorb_clusters(
                 continue;
             }
             // Defense in depth (the suggestion pass already filters these): never
-            // absorb a group holding a different person's confirmed faces.
-            if db::cluster_has_foreign_confirmed(&conn, from, into_identity)
+            // absorb a group holding a different *named* person's confirmed faces.
+            // Unnamed-competitor confirmations are adopted — the user is explicitly
+            // assigning this group, which outranks that bookkeeping.
+            if db::cluster_has_named_foreign_confirmed(&conn, from, into_identity)
                 .map_err(|e| e.to_string())?
             {
                 continue;
+            }
+            if let Some(ii) = into_identity {
+                db::adopt_unnamed_confirmed(&conn, from, ii).map_err(|e| e.to_string())?;
             }
             // The user vouched for each absorbed group — confirm before folding in.
             db::confirm_cluster_faces(&conn, from, into_identity).map_err(|e| e.to_string())?;
@@ -1571,28 +1590,29 @@ fn resolve_same_photo(
     {
         let conn = state.conn.lock().unwrap();
         if same_person {
+            let into_identity =
+                db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
+            // Only a *named* other person blocks the assignment. Unnamed
+            // competitors (minted by earlier rejections) are adopted instead —
+            // refusing on them made this card unanswerable forever: every click
+            // failed, the queue refreshed, and the same card came back on top.
+            if db::cluster_has_named_foreign_confirmed(&conn, from, Some(into_identity))
+                .map_err(|e| e.to_string())?
+            {
+                return Err("that group already belongs to another named person".into());
+            }
             let pairs: Vec<(i64, i64)> = db::cooccurring_face_pairs(&conn, into, from)
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|(_, a, b)| (a, b))
                 .collect();
             db::add_same_photo_ok(&conn, &pairs).map_err(|e| e.to_string())?;
-            if db::cluster_has_foreign_confirmed(
-                &conn,
-                from,
-                db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?
-            {
-                return Err("that group holds another person's confirmed faces".into());
-            }
+            db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
             // Confirm both sides so the merge survives re-clustering (see
             // merge_clusters), then fold.
-            let into_identity =
-                db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
             db::confirm_cluster_faces(&conn, into, Some(into_identity))
                 .map_err(|e| e.to_string())?;
-            db::confirm_cluster_faces(&conn, from, db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?)
+            db::confirm_cluster_faces(&conn, from, Some(into_identity))
                 .map_err(|e| e.to_string())?;
             db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
         } else {
@@ -1846,14 +1866,32 @@ const RECLUSTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4
 fn schedule_recluster(app: AppHandle) {
     let state = app.state::<AppState>();
     let epoch = state.recluster_epoch.clone();
+    let review_active = state.review_active.clone();
+    let deferred = state.recluster_deferred.clone();
     let mine = epoch.fetch_add(1, Ordering::SeqCst) + 1;
     drop(state);
     std::thread::spawn(move || {
         std::thread::sleep(RECLUSTER_DEBOUNCE);
         if epoch.load(Ordering::SeqCst) == mine {
+            // Mid-review-session: hold the pass (it renumbers the session's cards);
+            // set_review_active(false) fires it the moment the session ends.
+            if review_active.load(Ordering::SeqCst) {
+                deferred.store(true, Ordering::SeqCst);
+                return;
+            }
             run_recluster(app);
         }
     });
+}
+
+/// Focus-review session lifecycle: while active, due re-clusters are deferred so
+/// the session's cards stay valid; ending the session runs any deferred pass.
+#[tauri::command]
+fn set_review_active(app: tauri::AppHandle, state: tauri::State<'_, AppState>, active: bool) {
+    state.review_active.store(active, Ordering::SeqCst);
+    if !active && state.recluster_deferred.swap(false, Ordering::SeqCst) {
+        schedule_recluster(app);
+    }
 }
 
 /// The evidence floor: an identity earns "magnet authority" — the right to auto-fold
@@ -2655,6 +2693,8 @@ pub fn run() {
                 cluster_gen: Arc::new(AtomicI64::new(0)),
                 suggestion_cache: Arc::new(Mutex::new(SuggestionCache::default())),
                 recluster_epoch: Arc::new(AtomicU64::new(0)),
+                review_active: Arc::new(AtomicBool::new(false)),
+                recluster_deferred: Arc::new(AtomicBool::new(false)),
             });
 
             // One-time migration of the existing (greedy-clustered) mess to the
@@ -2703,6 +2743,7 @@ pub fn run() {
             get_review_queue,
             get_cluster_generation,
             resolve_same_photo,
+            set_review_active,
             absorb_clusters,
             reject_merge,
             not_this_person,
