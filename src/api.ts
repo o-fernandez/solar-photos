@@ -158,9 +158,17 @@ export function nameCluster(clusterId: number, name: string): Promise<void> {
   return invoke("name_cluster", { clusterId, name });
 }
 
-/** Merge one cluster into another (folds `from`'s faces into `into`). */
-export function mergeClusters(into: number, from: number): Promise<void> {
-  return invoke("merge_clusters", { into, from });
+/** Merge one cluster into another (folds `from`'s faces into `into`).
+ *  `expectedGeneration` (from a suggestion payload) lets the backend refuse the
+ *  merge if clustering has been renumbered since the card was computed — acting on
+ *  a stale card would merge whatever cluster now holds that id. Omit for paths fed
+ *  by fresh data (the name typeahead). */
+export function mergeClusters(
+  into: number,
+  from: number,
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("merge_clusters", { into, from, expectedGeneration: expectedGeneration ?? null });
 }
 
 export interface MergeSuggestion {
@@ -171,6 +179,8 @@ export interface MergeSuggestion {
   from_faces: number[];
   into_name: string | null;
   similarity: number;
+  /** Clustering generation this card was computed at — pass back to mutations. */
+  generation: number;
 }
 
 /** "Same person?" suggestions — likely over-splits to fold together. */
@@ -199,10 +209,12 @@ export interface IdentityGrowth {
   strong_faces: number[];
   /** Total photos across the strong matches. */
   strong_photos: number;
-  /** The less-certain tail, reviewed one at a time. */
+  /** The less-certain tail, reviewed one at a time (biggest payoff first). */
   maybe: GrowthCluster[];
   /** Total photos across strong + maybe (for ranking people). */
   photos: number;
+  /** Clustering generation this card was computed at — pass back to mutations. */
+  generation: number;
 }
 
 /** Per confirmed person: the over-split fragments the magnet is confident are the
@@ -212,20 +224,40 @@ export function getIdentityGrowth(): Promise<IdentityGrowth[]> {
 }
 
 /** Fold a batch of look-alike clusters into a confirmed person (durable). */
-export function absorbClusters(into: number, clusters: number[]): Promise<void> {
-  return invoke("absorb_clusters", { into, clusters });
+export function absorbClusters(
+  into: number,
+  clusters: number[],
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("absorb_clusters", {
+    into,
+    clusters,
+    expectedGeneration: expectedGeneration ?? null,
+  });
 }
 
 /** "Not the same": record a durable cannot-link so the pair is never re-suggested. */
-export function rejectMerge(into: number, from: number): Promise<void> {
-  return invoke("reject_merge", { into, from });
+export function rejectMerge(
+  into: number,
+  from: number,
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("reject_merge", { into, from, expectedGeneration: expectedGeneration ?? null });
 }
 
 /** "Not <person>" on a review candidate: make the rejected group a durable competitor
  *  (its own confirmed identity, cannot-linked) so similar faces get pulled toward it
  *  and away from the person — the rejection generalizes. Triggers a re-cluster. */
-export function notThisPerson(personClusterId: number, otherClusterId: number): Promise<void> {
-  return invoke("not_this_person", { personClusterId, otherClusterId });
+export function notThisPerson(
+  personClusterId: number,
+  otherClusterId: number,
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("not_this_person", {
+    personClusterId,
+    otherClusterId,
+    expectedGeneration: expectedGeneration ?? null,
+  });
 }
 
 /** Fast "start people over": clear all names/groups/decisions, keep detected faces,

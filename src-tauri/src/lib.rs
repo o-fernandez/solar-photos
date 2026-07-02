@@ -25,7 +25,7 @@ mod scan;
 mod thumbs;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,6 +65,27 @@ struct AppState {
     /// isn't dropped — the running pass re-runs once on finish (e.g. naming several
     /// people in a row each needs its fold applied).
     recluster_pending: Arc<AtomicBool>,
+    /// Monotonic clustering generation: bumped whenever a pass rewrites clusters
+    /// (re-cluster or auto-fold). Cluster ids are ephemeral — a re-cluster renumbers
+    /// them all — so suggestion payloads carry the generation they were computed at,
+    /// and suggestion-driven mutations verify it (see `ensure_generation`).
+    cluster_gen: Arc<AtomicI64>,
+    /// People suggestions computed at the end of the last clustering pass (see
+    /// `refresh_suggestion_cache`). The get_* commands read this instantly instead of
+    /// recomputing full-library passes per tab-open while holding the DB lock.
+    suggestion_cache: Arc<Mutex<SuggestionCache>>,
+    /// Debounce token for `schedule_recluster`: only the newest pending request fires.
+    recluster_epoch: Arc<AtomicU64>,
+}
+
+/// The People suggestions as of one clustering generation. Served only while
+/// `generation` still matches `cluster_gen` — a mismatch means clustering moved on,
+/// and serving nothing beats serving cards whose cluster ids now point elsewhere.
+#[derive(Default)]
+struct SuggestionCache {
+    generation: i64,
+    merges: Vec<MergeSuggestion>,
+    growth: Vec<IdentityGrowth>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
@@ -410,7 +431,7 @@ fn name_cluster(
     // Confirming a person adds an exemplar, which can re-home other people's
     // wrongly-folded look-alikes — so re-cluster + re-fold competitively (self-heal).
     if !name.trim().is_empty() {
-        run_recluster(app);
+        schedule_recluster(app);
     }
     Ok(())
 }
@@ -421,7 +442,9 @@ fn merge_clusters(
     state: tauri::State<'_, AppState>,
     into: i64,
     from: i64,
+    expected_generation: Option<i64>,
 ) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
         // A user merge vouches for the moved faces — confirm them (sticky exemplars).
@@ -429,7 +452,7 @@ fn merge_clusters(
         db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
     }
     // The merge added exemplars — re-cluster + re-fold competitively (self-heal).
-    run_recluster(app);
+    schedule_recluster(app);
     Ok(())
 }
 
@@ -484,15 +507,16 @@ struct PersonLook {
     likely_other_cluster: Option<i64>,
 }
 
-// Look-grouping tuning. Deliberately coarse — a few *significant* looks, not fragments.
-const LOOK_TAU: f32 = 0.5; // leader-cluster threshold for the initial fine grouping
-const LOOK_MERGE: f32 = 0.55; // then fuse fine looks whose centroids are this close
-const LOOK_ABS_MIN: i64 = 10; // a genuine look needs at least this many photos…
-const LOOK_PCT: f32 = 0.05; // …and this share of the person, so count scales with size
-                            // (a 4k-photo person doesn't get a swatch per pose; a
-                            // 200-photo one still can). Flagged repair looks bypass both.
-const LOOK_SHARE_MAX: f32 = 0.85; // …and a genuine look that's ~the whole person is just
-                                  // "All" — don't show it as a separate swatch.
+// Look-grouping tuning. Raw leader-clustering only ("stage 1"): no centroid merge —
+// within one person the look centroids sit at 0.70–0.95 cosine (measured on a real
+// 5k-face person), so any merge threshold that fuses pose variants also chains every
+// era into one blob that the filters then suppress, and the strip shows nothing.
+// Raw fine looks with an absolute floor + cap is what actually surfaces "kid Omar".
+const LOOK_TAU: f32 = 0.5; // leader-cluster threshold for the fine grouping
+const LOOK_ABS_MIN: i64 = 10; // a genuine look needs at least this many photos
+                              // (no relative floor: a childhood is a tiny share of a
+                              // lifetime library — that's the point of the feature)
+const MAX_LOOKS: usize = 8; // genuine looks shown, biggest first (flagged bypass)
 const LOOK_FLAG_ABS: f32 = 0.5; // a look must match another anchor at least this well…
 const LOOK_FLAG_MARGIN: f32 = 0.08; // …and beat its match to *this* person by this much
 
@@ -512,44 +536,10 @@ fn get_person_looks(
     }
     let embs: Vec<Vec<f32>> = faces.iter().map(|f| f.4.clone()).collect();
 
-    // Fine leader grouping, then fuse looks whose centroids are close: pose/lighting
-    // variants of one appearance collapse into a single significant look, while a
-    // genuinely different look (or a different person) stays its own group.
-    let fine = cluster::group_looks(&embs, LOOK_TAU);
-    let fine_centroids: Vec<Vec<f32>> = fine
-        .iter()
-        .map(|g| mean_normalized(&g.iter().map(|&i| embs[i].clone()).collect::<Vec<_>>()))
-        .collect();
-    fn find(p: &mut [usize], x: usize) -> usize {
-        let mut r = x;
-        while p[r] != r {
-            r = p[r];
-        }
-        let mut c = x;
-        while p[c] != c {
-            let nx = p[c];
-            p[c] = r;
-            c = nx;
-        }
-        r
-    }
-    let mut parent: Vec<usize> = (0..fine.len()).collect();
-    for i in 0..fine.len() {
-        for j in (i + 1)..fine.len() {
-            if cos(&fine_centroids[i], &fine_centroids[j]) >= LOOK_MERGE {
-                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                if a != b {
-                    parent[a] = b;
-                }
-            }
-        }
-    }
-    let mut merged: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for (gi, g) in fine.iter().enumerate() {
-        let r = find(&mut parent, gi);
-        merged.entry(r).or_default().extend(g.iter().cloned());
-    }
-    let groups: Vec<Vec<usize>> = merged.into_values().collect();
+    // Fine leader grouping only. No centroid-merge pass: within one person every
+    // look is "similar" (they're the same face), so merging chains eras together
+    // transitively and collapses the strip to a single suppressed blob.
+    let groups = cluster::group_looks(&embs, LOOK_TAU);
 
     // This person's own reference: their anchor if named (robust to a little pollution),
     // else the dominant look's centroid.
@@ -602,12 +592,6 @@ fn get_person_looks(
         }
     }
 
-    // A genuine look must be substantial in absolute *and* relative terms, so a big
-    // library doesn't sprout a swatch per pose; a flagged (repair) look bypasses both.
-    let total_photos =
-        faces.iter().map(|f| f.1).collect::<std::collections::BTreeSet<i64>>().len() as i64;
-    let min_photos = LOOK_ABS_MIN.max((LOOK_PCT * total_photos as f32).ceil() as i64);
-
     let mut looks: Vec<PersonLook> = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         let mut photo_set = std::collections::BTreeSet::new();
@@ -635,13 +619,10 @@ fn get_person_looks(
                 flag = Some((o.name.clone(), o.cluster, s));
             }
         }
-        // A genuine look shows only if it's substantial *and* not basically the whole
-        // person (that's just "All"). A flagged one shows however big or small — repair.
-        if flag.is_none() {
-            let n = photo_set.len() as i64;
-            if n < min_photos || n as f32 > LOOK_SHARE_MAX * total_photos as f32 {
-                continue;
-            }
+        // A genuine look shows only if it's substantial (absolute floor). A flagged
+        // one shows however big or small — it's a repair prompt, not a filter.
+        if flag.is_none() && (photo_set.len() as i64) < LOOK_ABS_MIN {
+            continue;
         }
         looks.push(PersonLook {
             cover_face_id: cover.1,
@@ -653,11 +634,12 @@ fn get_person_looks(
             likely_other_cluster: flag.as_ref().map(|(_, c, _)| *c),
         });
     }
-    // Genuine looks first (biggest first), flagged repair looks last. Only worth a
-    // strip with two or more.
+    // Genuine looks first (biggest first, capped so the strip stays glanceable),
+    // flagged repair looks last (never capped). Only worth a strip with two or more.
     let (mut flagged, mut genuine): (Vec<PersonLook>, Vec<PersonLook>) =
         looks.into_iter().partition(|l| l.likely_other_name.is_some());
     genuine.sort_by(|a, b| b.photos.cmp(&a.photos));
+    genuine.truncate(MAX_LOOKS);
     flagged.sort_by(|a, b| b.photos.cmp(&a.photos));
     genuine.extend(flagged);
     if genuine.len() < 2 {
@@ -786,7 +768,7 @@ fn detach_faces(
         db::detach_faces(&mut conn, &face_ids, base).map_err(|e| e.to_string())?;
         CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None }
     };
-    run_recluster(app);
+    schedule_recluster(app);
     Ok(undo)
 }
 
@@ -839,6 +821,8 @@ struct MergeSuggestion {
     from_faces: Vec<i64>,
     into_name: Option<String>,
     similarity: f32,
+    /// Clustering generation this card was computed at (checked by mutations).
+    generation: i64,
 }
 
 /// Find likely over-splits from **face-to-face** evidence: cluster pairs with at
@@ -846,19 +830,20 @@ struct MergeSuggestion {
 /// `cluster::merge_evidence`). Ranked by leverage — strength × combined size —
 /// so the most worthwhile, most confident merges come first. The larger cluster
 /// is the "into" side, so merging folds the small group into the person.
-#[tauri::command]
-fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
-    let conn = state.conn.lock().unwrap();
-    // Stay silent until clustering has settled — no prompts off half-built clusters.
-    if !suggestions_ready(&conn, &state.reclustering) {
-        return Ok(Vec::new());
+///
+/// Heavy (a kNN pass over every clustered face) — runs only from the background
+/// cache refresh at the end of a clustering pass, never from a UI command. Empty
+/// until the sweep has settled: no prompts off half-built clusters.
+fn compute_merge_suggestions(conn: &Connection) -> anyhow::Result<Vec<MergeSuggestion>> {
+    match db::face_progress(conn)? {
+        (scanned, eligible) if eligible > 0 && scanned >= eligible => {}
+        _ => return Ok(Vec::new()),
     }
-    let overview = db::clusters_overview(&conn).map_err(|e| e.to_string())?;
-    let faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
+    let overview = db::clusters_overview(conn)?;
+    let faces = db::face_cluster_embeddings(conn)?;
     // Declared "not the same" identity pairs — suggestions that name them are skipped.
     let blocked: std::collections::HashSet<(i64, i64)> =
-        db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
-    drop(conn);
+        db::cannot_link_pairs(conn)?.into_iter().collect();
 
     use std::collections::HashMap;
     let info: HashMap<i64, &db::ClusterRow> = overview.iter().map(|c| (c.cluster_id, c)).collect();
@@ -878,7 +863,6 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     ranked.truncate(20);
 
-    let conn = state.conn.lock().unwrap();
     let mut out = Vec::with_capacity(ranked.len());
     for (e, _) in ranked {
         let (big, small) = {
@@ -887,8 +871,8 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
         };
         // Skip a pair the user has already declared "not the same".
         if let (Ok(Some(ia)), Ok(Some(ib))) = (
-            db::identity_of_cluster(&conn, big.cluster_id),
-            db::identity_of_cluster(&conn, small.cluster_id),
+            db::identity_of_cluster(conn, big.cluster_id),
+            db::identity_of_cluster(conn, small.cluster_id),
         ) {
             let key = if ia < ib { (ia, ib) } else { (ib, ia) };
             if blocked.contains(&key) {
@@ -898,13 +882,30 @@ fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeS
         out.push(MergeSuggestion {
             into: big.cluster_id,
             from: small.cluster_id,
-            into_faces: db::top_face_ids(&conn, big.cluster_id, 4).unwrap_or_default(),
-            from_faces: db::top_face_ids(&conn, small.cluster_id, 4).unwrap_or_default(),
+            into_faces: db::top_face_ids(conn, big.cluster_id, 4).unwrap_or_default(),
+            from_faces: db::top_face_ids(conn, small.cluster_id, 4).unwrap_or_default(),
             into_name: big.name.clone(),
             similarity: e.max_sim,
+            generation: 0, // stamped by refresh_suggestion_cache
         });
     }
     Ok(out)
+}
+
+/// The cached "same person?" suggestions from the last clustering pass. Instant —
+/// the heavy pass ran in the background when clustering settled. Empty while a
+/// pass is running or the cache is from an older generation (no stale cards).
+#[tauri::command]
+fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
+    if state.reclustering.load(Ordering::SeqCst) {
+        return Ok(Vec::new());
+    }
+    let cache = state.suggestion_cache.lock().unwrap();
+    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
+        Ok(cache.merges.clone())
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// A single less-certain growth candidate, reviewed on its own in the card's tail.
@@ -941,6 +942,8 @@ struct IdentityGrowth {
     maybe: Vec<GrowthCluster>,
     /// Total photos across strong + maybe (ranks the most impactful person first).
     photos: i64,
+    /// Clustering generation this card was computed at (checked by mutations).
+    generation: i64,
 }
 
 /// For each named person, find the over-split fragments the magnet is confident are
@@ -958,22 +961,25 @@ struct IdentityGrowth {
 /// cluster claimed by more than one identity from *all* growth cards. Those
 /// ambiguous groups aren't lost — they stay reachable through the reviewable
 /// pairwise "same person?" path, where you decide one at a time.
-#[tauri::command]
-fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
-    let conn = state.conn.lock().unwrap();
-    if !suggestions_ready(&conn, &state.reclustering) {
-        return Ok(Vec::new());
+///
+/// Heavy (a full-library pass per confirmed identity) — runs only from the
+/// background cache refresh, never from a UI command; the old per-tab-open compute
+/// held the shared DB lock through seconds of matrix math, stalling every avatar.
+fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrowth>> {
+    match db::face_progress(conn)? {
+        (scanned, eligible) if eligible > 0 && scanned >= eligible => {}
+        _ => return Ok(Vec::new()),
     }
-    let named = db::named_identities(&conn).map_err(|e| e.to_string())?;
+    let named = db::named_identities(conn)?;
     if named.is_empty() {
         return Ok(Vec::new());
     }
-    let all_faces = db::face_cluster_embeddings(&conn).map_err(|e| e.to_string())?;
+    let all_faces = db::face_cluster_embeddings(conn)?;
     let blocked: std::collections::HashSet<(i64, i64)> =
-        db::cannot_link_pairs(&conn).map_err(|e| e.to_string())?.into_iter().collect();
+        db::cannot_link_pairs(conn)?.into_iter().collect();
     // How well every cluster matches each confirmed identity (incl. "not X" splits) —
     // so we don't suggest a cluster that's decisively someone else's.
-    let matches = cluster_identity_matches(&conn).map_err(|e| e.to_string())?;
+    let matches = cluster_identity_matches(conn)?;
 
     // Pass 1: gather each identity's candidate clusters (already filtered by
     // "not the same"), and tally how many distinct identities claim each cluster.
@@ -987,7 +993,7 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
     let mut pending: Vec<Pending> = Vec::new();
     let mut claims: HashMap<i64, u32> = HashMap::new(); // cluster_id -> # identities claiming it
     for (identity_id, name) in named {
-        let anchor = db::confirmed_anchor_embeddings(&conn, identity_id, 64).map_err(|e| e.to_string())?;
+        let anchor = db::confirmed_anchor_embeddings(conn, identity_id, 64)?;
         if anchor.len() < MIN_ANCHOR {
             continue; // too little confirmed evidence to suggest look-alikes yet
         }
@@ -995,7 +1001,7 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
         let core = anchor_core(anchor);
         // The clusters this identity already occupies are excluded from the search;
         // the largest is the fold-in target.
-        let own: Vec<i64> = db::clusters_of_identity(&conn, identity_id).map_err(|e| e.to_string())?;
+        let own: Vec<i64> = db::clusters_of_identity(conn, identity_id)?;
         let into = match own.first() {
             Some(&c) => c,
             None => continue,
@@ -1012,7 +1018,7 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
         let mut candidates = Vec::new();
         for c in cands {
-            if let Ok(Some(other_id)) = db::identity_of_cluster(&conn, c.cluster_id) {
+            if let Ok(Some(other_id)) = db::identity_of_cluster(conn, c.cluster_id) {
                 let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
                 if blocked.contains(&key) {
                     continue;
@@ -1042,9 +1048,8 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
     // Pass 2: build the cards, excluding any cluster claimed by 2+ identities, and
     // split the survivors by confidence. Above STRONG the match is folded in by the
     // bulk button; below it (but still past the linkage floor `identity_candidates`
-    // enforced) the cluster goes to the reviewable tail, capped so the chip row
-    // stays glanceable. Candidates arrive strongest-first, so `strong` fills before
-    // `maybe` and the tail is already ordered closest-match-first.
+    // enforced) the cluster goes to the reviewable tail, ranked by payoff and capped
+    // so the chip row stays glanceable.
     const STRONG: f32 = 0.6;
     const MAX_MAYBE: usize = 12;
     let mut out = Vec::new();
@@ -1063,33 +1068,56 @@ fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<Identity
                 strong_clusters.push(cid);
                 strong_photos += size;
                 if strong_faces.len() < 4 {
-                    if let Ok(mut f) = db::top_face_ids(&conn, cid, 1) {
+                    if let Ok(mut f) = db::top_face_ids(conn, cid, 1) {
                         strong_faces.append(&mut f);
                     }
                 }
-            } else if maybe.len() < MAX_MAYBE {
-                let face_id = db::top_face_ids(&conn, cid, 1).ok().and_then(|v| v.into_iter().next());
+            } else {
+                let face_id = db::top_face_ids(conn, cid, 1).ok().and_then(|v| v.into_iter().next());
                 maybe.push(GrowthCluster { cluster_id: cid, face_id, photos: size, similarity: sim });
             }
         }
         if strong_clusters.is_empty() && maybe.is_empty() {
             continue;
         }
+        // The review tail is ranked by payoff (photos), not similarity — a glance
+        // costs the same for a 1-photo fragment as for a 40-photo group, and
+        // similarity-ordering let high-sim singletons crowd big clusters out of
+        // the cap (the "twelve 1-photo chips" screenshot). Cap after sorting so
+        // the biggest candidates always make the strip.
+        maybe.sort_by(|a, b| b.photos.cmp(&a.photos));
+        maybe.truncate(MAX_MAYBE);
         out.push(IdentityGrowth {
             identity_id: p.identity_id,
             name: p.name,
             into: p.into,
-            anchor_faces: db::top_face_ids(&conn, p.into, 4).unwrap_or_default(),
+            anchor_faces: db::top_face_ids(conn, p.into, 4).unwrap_or_default(),
             strong_clusters,
             strong_faces,
             strong_photos,
             maybe,
             photos,
+            generation: 0, // stamped by refresh_suggestion_cache
         });
     }
     // Most impactful person first.
     out.sort_by(|a, b| b.photos.cmp(&a.photos));
     Ok(out)
+}
+
+/// The cached growth cards from the last clustering pass — see
+/// [`get_merge_suggestions`] for the caching rationale.
+#[tauri::command]
+fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
+    if state.reclustering.load(Ordering::SeqCst) {
+        return Ok(Vec::new());
+    }
+    let cache = state.suggestion_cache.lock().unwrap();
+    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
+        Ok(cache.growth.clone())
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// Fold a batch of look-alike clusters into a confirmed person in one action (the
@@ -1101,7 +1129,9 @@ fn absorb_clusters(
     state: tauri::State<'_, AppState>,
     into: i64,
     clusters: Vec<i64>,
+    expected_generation: Option<i64>,
 ) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
         for from in clusters {
@@ -1113,14 +1143,20 @@ fn absorb_clusters(
         }
     }
     // Bulk-merging added exemplars — re-cluster + re-fold competitively (self-heal).
-    run_recluster(app);
+    schedule_recluster(app);
     Ok(())
 }
 
 /// "Not the same" on a merge prompt: record a durable cannot-link so the pair is
 /// never suggested again (survives re-clusters, unlike a dismissed-in-memory card).
 #[tauri::command]
-fn reject_merge(state: tauri::State<'_, AppState>, into: i64, from: i64) -> Result<(), String> {
+fn reject_merge(
+    state: tauri::State<'_, AppState>,
+    into: i64,
+    from: i64,
+    expected_generation: Option<i64>,
+) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
     let conn = state.conn.lock().unwrap();
     db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())
 }
@@ -1136,7 +1172,9 @@ fn not_this_person(
     state: tauri::State<'_, AppState>,
     person_cluster_id: i64,
     other_cluster_id: i64,
+    expected_generation: Option<i64>,
 ) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
         // Mint identities for both sides + cannot-link, then confirm the rejected group
@@ -1144,7 +1182,7 @@ fn not_this_person(
         db::add_cannot_link(&conn, person_cluster_id, other_cluster_id).map_err(|e| e.to_string())?;
         db::confirm_cluster_faces(&conn, other_cluster_id).map_err(|e| e.to_string())?;
     }
-    run_recluster(app);
+    schedule_recluster(app);
     Ok(())
 }
 
@@ -1244,18 +1282,59 @@ fn apply_must_links(face_identity: &[(i64, i64)], assignments: &mut [(i64, i64)]
     }
 }
 
-/// Whether the People view should surface merge prompts yet. We stay quiet while a
-/// re-cluster is running or while the face sweep is still catching up: suggestions
-/// computed on not-yet-consolidated clusters are the source of the "this group is
-/// four different people" misfires. Only settled, consolidated clusters get prompts.
-fn suggestions_ready(conn: &Connection, reclustering: &AtomicBool) -> bool {
-    if reclustering.load(Ordering::SeqCst) {
-        return false;
+/// Recompute the suggestion caches (pairwise merges + identity growth) after a
+/// clustering pass, and bump the cluster generation. Runs on the pass's background
+/// thread with its own connection, so the UI's shared connection is never held
+/// through the matrix math (the old per-tab-open compute stalled every avatar
+/// request behind that lock). The get_* commands then serve instant reads.
+fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
+    let state = app.state::<AppState>();
+    let generation = state.cluster_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut merges = compute_merge_suggestions(conn).unwrap_or_default();
+    let mut growth = compute_identity_growth(conn).unwrap_or_default();
+    for s in &mut merges {
+        s.generation = generation;
     }
-    match db::face_progress(conn) {
-        Ok((scanned, eligible)) => eligible > 0 && scanned >= eligible,
-        _ => false,
+    for g in &mut growth {
+        g.generation = generation;
     }
+    *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth };
+}
+
+/// Guard for suggestion-driven mutations. Cluster ids are reassigned from scratch by
+/// every re-cluster, so a card computed before one completes may now point at a
+/// different group of faces — acting on it would confirm/merge the wrong people
+/// (durably: absorbing writes confirmed must-links). The payload carries the
+/// generation it was computed at; on mismatch we refuse and the frontend refreshes.
+/// `None` (paths not fed by suggestions, e.g. the name typeahead) is not checked.
+fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), String> {
+    match expected {
+        Some(g) if g != state.cluster_gen.load(Ordering::SeqCst) => {
+            Err("stale suggestion: people were reorganized since it was shown".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// How long a burst of corrections may extend before the self-heal pass runs.
+const RECLUSTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Debounced [`run_recluster`]: a correction's DB writes apply immediately, but the
+/// expensive re-cluster waits for a quiet moment, so a review session (answer,
+/// answer, answer) pays for one pass instead of one per click. Each call supersedes
+/// any still-pending one. Reset, startup, and the sweep-drain consolidation still
+/// call [`run_recluster`] directly — they're one-shot, not bursts.
+fn schedule_recluster(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let epoch = state.recluster_epoch.clone();
+    let mine = epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    drop(state);
+    std::thread::spawn(move || {
+        std::thread::sleep(RECLUSTER_DEBOUNCE);
+        if epoch.load(Ordering::SeqCst) == mine {
+            run_recluster(app);
+        }
+    });
 }
 
 /// The evidence floor: an identity earns "magnet authority" — the right to auto-fold
@@ -1427,7 +1506,11 @@ fn run_auto_fold(app: AppHandle) {
         let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
         let folded = (|| -> anyhow::Result<usize> {
             let conn = db::open(&db_path)?;
-            auto_fold_confident(&conn)
+            let n = auto_fold_confident(&conn)?;
+            // Clusters may have changed — recompute the suggestion caches (and bump
+            // the generation) before the UI is told to reload.
+            refresh_suggestion_cache(&app, &conn);
+            Ok(n)
         })();
         if let Err(e) = folded {
             eprintln!("auto-fold failed: {e}");
@@ -1523,6 +1606,9 @@ fn run_recluster(app: AppHandle) {
             // scattered look-alike fragments automatically (see `auto_fold_confident`).
             let _ = auto_fold_confident(&conn)?;
             db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+            // Everything is renumbered — recompute the suggestion caches (and bump
+            // the generation) before the UI is told to reload.
+            refresh_suggestion_cache(&app, &conn);
             Ok(())
         })();
         if let Err(e) = result {
@@ -2015,6 +2101,9 @@ pub fn run() {
                 faces_paused,
                 reclustering: Arc::new(AtomicBool::new(false)),
                 recluster_pending: Arc::new(AtomicBool::new(false)),
+                cluster_gen: Arc::new(AtomicI64::new(0)),
+                suggestion_cache: Arc::new(Mutex::new(SuggestionCache::default())),
+                recluster_epoch: Arc::new(AtomicU64::new(0)),
             });
 
             // One-time migration of the existing (greedy-clustered) mess to the

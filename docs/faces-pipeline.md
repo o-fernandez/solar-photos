@@ -42,10 +42,23 @@ anything in `src-tauri/src/{cluster,db,lib}.rs` or `src/{People,PersonView}.tsx`
    the pass isn't wiped by a stale snapshot; that was a real bug once).
 3. **Auto-fold** (`auto_fold_confident`) — the competitive assignment (below).
 
-Naming / merging / absorbing / detaching all trigger `run_recluster` (with a
-pending-rerun guard so rapid actions aren't dropped). That re-cluster is what makes
-the system **self-heal**: naming a second look-alike frees the tentative faces and
-re-decides them, ejecting the first person's wrongly-folded faces.
+Naming / merging / absorbing / detaching all trigger a **debounced** re-cluster
+(`schedule_recluster`, `RECLUSTER_DEBOUNCE` of quiet; plus the pending-rerun guard so
+rapid actions aren't dropped). That re-cluster is what makes the system **self-heal**:
+naming a second look-alike frees the tentative faces and re-decides them, ejecting
+the first person's wrongly-folded faces.
+
+### Suggestion cache + generation guard
+
+Merge suggestions and growth cards are **computed once at the end of each clustering
+pass** (`refresh_suggestion_cache`, on the pass's own thread + connection) and served
+from a cached snapshot — never recomputed per People-tab open (the old way held the
+shared DB lock through seconds of matrix math, stalling every avatar request). Each
+pass bumps a monotonic **cluster generation**; suggestion payloads carry it, and the
+suggestion-driven mutations (`merge_clusters`, `absorb_clusters`, `not_this_person`,
+`reject_merge`) verify it via `ensure_generation`. This closes a real corruption bug:
+cluster ids are renumbered by every re-cluster, so acting on a card computed before
+one completed used to confirm/merge whatever cluster *now* held the stale id.
 
 ## Competitive assignment (the intelligence)
 
@@ -83,10 +96,20 @@ competitor); `not_this_person` is the shortcut that mints an unnamed competitor 
 ## Person page
 
 - **Looks strip** (`get_person_looks`) — coarse appearance sub-clusters of one person
-  (`cluster::group_looks` leader-clustering + centroid merge). Two jobs: **filter**
-  the grid by look, and **repair** — a look whose centroid matches another named
-  person's anchor is flagged "looks like X" for a one-click batch move. A look that's
-  ~the whole person (`LOOK_SHARE_MAX`) is suppressed (it's just "All").
+  (`cluster::group_looks` leader-clustering, **raw** — no centroid merge). Two jobs:
+  **filter** the grid by look, and **repair** — a look whose centroid matches another
+  named person's anchor is flagged "looks like X" for a one-click batch move.
+  - **Why no merge / no relative floor** (learned the hard way, measured on a real
+    5k-face person): within one person the look centroids sit at 0.70–0.95 cosine —
+    identity embeddings are *trained* to erase vibes — so any centroid-merge threshold
+    chains every era into one blob transitively (the same single-linkage failure the
+    main clusterer exists to prevent). The blob then trips the "~whole person"
+    suppression, the small precious eras (childhood!) trip the 5%-of-person relative
+    floor, and the strip shows nothing. Raw fine looks + an absolute floor
+    (`LOOK_ABS_MIN`) + a cap (`MAX_LOOKS`) is what actually surfaces "kid Omar".
+  - **Never cluster looks by date**: scanned/photographed old prints carry the scan
+    date, not the capture date (kid-Omar's metadata spans 2004–2026). Appearance
+    grouping collects them correctly anyway; time is a display hint at most.
 - **Actions** on a selected look or multi-selection: move to a person, split to a new
   person, **"Not <name>"** (`detach_faces` — clear identity, scatter, re-home by
   appearance), **"It's <name>"** (dismiss a bad flag via cannot-link), ignore.
@@ -110,9 +133,10 @@ competitor); `not_this_person` is the shortcut that mints an unnamed competitor 
 | `MIN_ANCHOR` | 4 | confirmed faces needed to *absorb* / suggest / flag |
 | `COMPETITOR_MIN` | 1 | confirmed faces needed to *compete* defensively |
 | `ANCHOR_CORE_TAU` | 0.5 | grouping to find an anchor's dominant core |
-| `LOOK_TAU` / `LOOK_MERGE` | 0.5 / 0.55 | looks: sub-cluster then merge similar |
-| `LOOK_ABS_MIN` / `LOOK_PCT` | 10 / 0.05 | a look must be this big absolutely and relatively |
+| `LOOK_TAU` | 0.5 | looks: leader-cluster threshold (raw, no merge pass) |
+| `LOOK_ABS_MIN` / `MAX_LOOKS` | 10 / 8 | absolute look floor / genuine looks shown |
 | `LOOK_FLAG_ABS` / `LOOK_FLAG_MARGIN` | 0.5 / 0.08 | when to flag a look as another person |
+| `RECLUSTER_DEBOUNCE` | 4s | quiet period before a correction's re-cluster runs |
 
 ## Known limitations / future work
 
@@ -120,9 +144,12 @@ competitor); `not_this_person` is the shortcut that mints an unnamed competitor 
   cluster.** Must-links pull each person together but don't push two people *apart*.
   Fix: treat distinctly-named identities as implicitly cannot-linked during clustering.
 - **Naming triggers a full re-cluster** (seconds on 30k). That's the price of
-  self-heal. If it gets sluggish, move to **identity-centric grouping** so auto-fold
+  self-heal; the debounce batches a burst of corrections into one pass, and the
+  suggestion cache means the UI no longer pays for it per tab-open, but each pass is
+  still a full rebuild. The real fix remains **identity-centric grouping**: auto-fold
   sets `identity_id` for display without merging `cluster_id` — then self-heal is a
-  cheap re-derive, no full re-cluster.
+  cheap re-derive, no full re-cluster, and cluster ids stop being ephemeral (which
+  would retire the generation guard too).
 - **Competition favors larger exemplar sets** (uses best-match `max_sim`). A person
   with few confirmed faces can lose their own faces to a person with many. Confirming
   a few more usually tips it; a size-invariant metric (centroid / kNN vote) is the

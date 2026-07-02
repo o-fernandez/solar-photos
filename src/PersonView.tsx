@@ -77,8 +77,10 @@ export default function PersonView({
 }: {
   cluster: Cluster;
   // The less-certain look-alike groups the magnet thinks might also be this person —
-  // reviewed here, in context, one at a time. `into` is the cluster a "yes" folds into.
-  review?: { into: number; name: string; candidates: GrowthCluster[] };
+  // reviewed here, in context, one at a time. `into` is the cluster a "yes" folds
+  // into; `generation` is the clustering generation the card was computed at, passed
+  // back so the backend can refuse an answer that outlived a re-cluster.
+  review?: { into: number; name: string; candidates: GrowthCluster[]; generation: number };
   onBack: () => void;
 }) {
   const [rows, setRows] = useState<PhotoRow[]>([]);
@@ -273,15 +275,23 @@ export default function PersonView({
     if (!review) return;
     setReviewResolved((s) => new Set(s).add(c.cluster_id));
     // "Yes" folds the group in; "No" makes it a durable competitor (its own confirmed
-    // identity) so this and other look-alikes get pulled away from this person.
+    // identity) so this and other look-alikes get pulled away from this person. The
+    // generation check makes a chip that outlived a re-cluster fail instead of acting
+    // on whatever cluster now holds its id — un-hide it so the user sees it didn't land.
     (keep
-      ? absorbClusters(review.into, [c.cluster_id])
-      : notThisPerson(review.into, c.cluster_id)
+      ? absorbClusters(review.into, [c.cluster_id], review.generation)
+      : notThisPerson(review.into, c.cluster_id, review.generation)
     )
       .then(() => {
         if (keep) reloadPhotos();
       })
-      .catch(() => {});
+      .catch(() => {
+        setReviewResolved((s) => {
+          const next = new Set(s);
+          next.delete(c.cluster_id);
+          return next;
+        });
+      });
   };
 
   // The people you can reassign a chunk *into* — every other person, biggest first.

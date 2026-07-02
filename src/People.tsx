@@ -227,15 +227,18 @@ export default function People({
     }
   };
 
+  // Suggestion actions carry the card's clustering generation; the backend refuses a
+  // stale one (a re-cluster renumbered ids since it was computed). On any failure we
+  // reload — fresh suggestions replace the stale card, so the user just re-clicks.
   const doMerge = (s: MergeSuggestion) => {
     markHintDone();
-    mergeClusters(s.into, s.from)
+    mergeClusters(s.into, s.from, s.generation)
       .then(reload)
-      .catch(() => {});
+      .catch(() => reload());
   };
   const decline = (s: MergeSuggestion) => {
     // Persist a cannot-link so it never returns (not just this session), then hide it.
-    rejectMerge(s.into, s.from).catch(() => {});
+    rejectMerge(s.into, s.from, s.generation).catch(() => reload());
     setDismissed((d) => new Set(d).add(`${s.into}-${s.from}`));
   };
 
@@ -243,9 +246,9 @@ export default function People({
   // grid counts (and any remaining review tail) reflect it.
   const mergeStrong = (g: IdentityGrowth) => {
     markHintDone();
-    absorbClusters(g.into, g.strong_clusters)
+    absorbClusters(g.into, g.strong_clusters, g.generation)
       .then(reload)
-      .catch(() => {});
+      .catch(() => reload());
   };
   const declineGrowth = (g: IdentityGrowth) => {
     setDismissedGrowth((d) => new Set(d).add(g.identity_id));
@@ -352,7 +355,12 @@ export default function People({
         cluster={selected}
         review={
           review
-            ? { into: review.into, name: review.name, candidates: review.maybe }
+            ? {
+                into: review.into,
+                name: review.name,
+                candidates: review.maybe,
+                generation: review.generation,
+              }
             : undefined
         }
         onBack={() => {
