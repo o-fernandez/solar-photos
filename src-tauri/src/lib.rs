@@ -980,6 +980,14 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
     // How well every cluster matches each confirmed identity (incl. "not X" splits) —
     // so we don't suggest a cluster that's decisively someone else's.
     let matches = cluster_identity_matches(conn)?;
+    // Clusters holding anyone's *confirmed* faces are never growth candidates. An
+    // identity's own clusters are already excluded below, so anything left in this
+    // set belongs to a different person (or a "not X" competitor) — offering it as
+    // a bulk merge is how Camila's whole cluster once became "5 strong matches for
+    // Mía" and got absorbed. Merging two named people stays possible, but only via
+    // the explicit rename/typeahead path, never a one-click suggestion.
+    let confirmed_clusters: std::collections::HashSet<i64> =
+        db::confirmed_clusters(conn)?.into_iter().collect();
 
     // Pass 1: gather each identity's candidate clusters (already filtered by
     // "not the same"), and tally how many distinct identities claim each cluster.
@@ -1018,6 +1026,9 @@ fn compute_identity_growth(conn: &Connection) -> anyhow::Result<Vec<IdentityGrow
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
         let mut candidates = Vec::new();
         for c in cands {
+            if confirmed_clusters.contains(&c.cluster_id) {
+                continue; // someone's confirmed group — never offered for absorption
+            }
             if let Ok(Some(other_id)) = db::identity_of_cluster(conn, c.cluster_id) {
                 let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
                 if blocked.contains(&key) {
@@ -1134,12 +1145,21 @@ fn absorb_clusters(
     ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
+        let into_identity = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
         for from in clusters {
-            if from != into {
-                // The user vouched for each absorbed group — confirm before folding in.
-                db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
-                db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+            if from == into {
+                continue;
             }
+            // Defense in depth (the suggestion pass already filters these): never
+            // absorb a group holding a different person's confirmed faces.
+            if db::cluster_has_foreign_confirmed(&conn, from, into_identity)
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
+            // The user vouched for each absorbed group — confirm before folding in.
+            db::confirm_cluster_faces(&conn, from).map_err(|e| e.to_string())?;
+            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
         }
     }
     // Bulk-merging added exemplars — re-cluster + re-fold competitively (self-heal).
@@ -1593,14 +1613,30 @@ fn run_recluster(app: AppHandle) {
                     }
                 }
             }
-            let names: Vec<(i64, String)> = tally
-                .into_iter()
-                .filter_map(|(ident, m)| {
-                    m.iter()
-                        .max_by_key(|(_, c)| **c)
-                        .map(|(&newc, _)| (newc, named_idents[&ident].clone()))
-                })
-                .collect();
+            // Two identities can (transiently) have their plurality in the SAME new
+            // cluster — e.g. after a merge that combined two named people. Assign
+            // greedily by descending confirmed-face count, one name per cluster and
+            // one cluster per identity, so the runner-up re-anchors to its next-best
+            // cluster instead of being silently overwritten (the old ON CONFLICT
+            // upsert ate a name and the person vanished from the grid).
+            let mut claims: Vec<(usize, i64, i64)> = Vec::new(); // (count, identity, cluster)
+            for (ident, m) in tally {
+                for (newc, n) in m {
+                    claims.push((n, ident, newc));
+                }
+            }
+            claims.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut cluster_taken: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut ident_named: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut names: Vec<(i64, String)> = Vec::new();
+            for (_, ident, newc) in claims {
+                if ident_named.contains(&ident) || cluster_taken.contains(&newc) {
+                    continue;
+                }
+                ident_named.insert(ident);
+                cluster_taken.insert(newc);
+                names.push((newc, named_idents[&ident].clone()));
+            }
             db::replace_cluster_names(&mut conn, &names)?;
             // Now that clusters and names are settled, reunite each confirmed person's
             // scattered look-alike fragments automatically (see `auto_fold_confident`).

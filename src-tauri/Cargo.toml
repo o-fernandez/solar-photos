@@ -40,3 +40,13 @@ libheif-rs = "1.0"
 codegen-units = 1
 lto = true
 opt-level = "s"
+
+# Debug installs must not be numerically slow: the clustering/suggestion passes are
+# dense matrix math (ndarray/matrixmultiply) and image decoding, which at opt-level 0
+# run ~50x slower — a "Reorganizing people…" pass once pegged a core for an hour.
+# Optimize all dependencies fully and our own crate lightly (still debuggable).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

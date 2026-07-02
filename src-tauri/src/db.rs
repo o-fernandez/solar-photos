@@ -420,9 +420,32 @@ pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()
     let id = ensure_identity_for_cluster(conn, cluster_id)?;
     conn.execute("UPDATE identities SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])?;
     // Naming a cluster vouches for its current contents — they become confirmed
-    // exemplars (must-links + anchor), the label the magnet learns from.
-    conn.execute("UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1", [cluster_id])?;
+    // exemplars (must-links + anchor), the label the magnet learns from. Scoped to
+    // faces bound to THIS identity: confirming a stray face another person's
+    // identity still owns would mint bogus exemplars for *them*.
+    conn.execute(
+        "UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1 AND identity_id = ?2",
+        rusqlite::params![cluster_id, id],
+    )?;
     Ok(())
+}
+
+/// True if the cluster holds faces the user confirmed under an identity other
+/// than `identity` — i.e. absorbing or offering it would swallow (part of) a
+/// different person. `identity = None` means any confirmed identity is foreign.
+pub fn cluster_has_foreign_confirmed(
+    conn: &Connection,
+    cluster_id: i64,
+    identity: Option<i64>,
+) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM faces
+         WHERE cluster_id = ?1 AND confirmed = 1
+           AND identity_id IS NOT NULL AND identity_id IS NOT ?2",
+        rusqlite::params![cluster_id, identity],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Mark a cluster's faces as user-confirmed (exemplars + must-links). Used before an
@@ -496,21 +519,32 @@ pub fn confirmed_clusters(conn: &Connection) -> Result<Vec<i64>> {
 }
 
 /// Merge cluster `from` into `into`: reassign its faces and drop its name. The
-/// surviving cluster keeps `into`'s name. The merge is also recorded durably: all
-/// faces end up under `into`'s identity, a must-link that the next re-cluster
-/// honors (so you never have to merge the same two people twice).
+/// surviving cluster keeps `into`'s name and identity. The merge is recorded
+/// durably: the absorbed faces end up under `into`'s identity, a must-link the
+/// next re-cluster honors (so you never have to merge the same two people twice).
+///
+/// Identities are resolved BEFORE any face moves. The old version derived the
+/// winner from the *combined* cluster's plurality and rebound every face to it —
+/// so merging a big cluster into a small one let the big side hijack the result,
+/// rebinding even faces the user had confirmed under a different identity (the
+/// Mía/Camila incident: Mía's own confirmed faces became "Camila", and Mía
+/// vanished). Now a face confirmed under a different identity is never rebound.
 pub fn merge_clusters(conn: &Connection, into: i64, from: i64) -> Result<()> {
+    let from_identity = identity_of_cluster(conn, from)?;
+    let into_identity = ensure_identity_for_cluster(conn, into)?;
     conn.execute(
         "UPDATE faces SET cluster_id = ?1 WHERE cluster_id = ?2",
         rusqlite::params![into, from],
     )?;
     conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [from])?;
-    // Fold any pre-existing identity on the `from` side into `into`'s identity, then
-    // bind every face of the (now combined) cluster to it.
-    let into_id = ensure_identity_for_cluster(conn, into)?;
+    // Bind the combined cluster to `into`'s identity: unclaimed faces, faces that
+    // carried `from`'s identity (the user just vouched they're the same person),
+    // and tentative machine labels. Confirmed faces of any *other* identity stay.
     conn.execute(
-        "UPDATE faces SET identity_id = ?1 WHERE cluster_id = ?2",
-        rusqlite::params![into_id, into],
+        "UPDATE faces SET identity_id = ?1
+         WHERE cluster_id = ?2
+           AND (identity_id IS NULL OR identity_id = ?3 OR confirmed = 0)",
+        rusqlite::params![into_identity, into, from_identity],
     )?;
     Ok(())
 }
@@ -528,9 +562,12 @@ pub fn identity_of_cluster(conn: &Connection, cluster_id: i64) -> Result<Option<
         .ok())
 }
 
-/// Get (or create) the identity for a cluster and bind every face in the cluster
-/// to it. Reuses an existing identity already present on the cluster so repeated
-/// naming/merging doesn't spawn duplicates.
+/// Get (or create) the identity for a cluster and bind the cluster's faces to it.
+/// Reuses an existing identity already present on the cluster so repeated
+/// naming/merging doesn't spawn duplicates. Binding never touches a face the user
+/// confirmed under a *different* identity — a cluster can (transiently) hold two
+/// people's confirmed faces, and stamping the plurality identity over the
+/// minority's steals them (see `merge_clusters`).
 pub fn ensure_identity_for_cluster(conn: &Connection, cluster_id: i64) -> Result<i64> {
     let id = match identity_of_cluster(conn, cluster_id)? {
         Some(id) => id,
@@ -540,7 +577,8 @@ pub fn ensure_identity_for_cluster(conn: &Connection, cluster_id: i64) -> Result
         }
     };
     conn.execute(
-        "UPDATE faces SET identity_id = ?1 WHERE cluster_id = ?2",
+        "UPDATE faces SET identity_id = ?1
+         WHERE cluster_id = ?2 AND (identity_id IS NULL OR confirmed = 0)",
         rusqlite::params![id, cluster_id],
     )?;
     Ok(id)
@@ -1094,4 +1132,105 @@ pub fn set_status_many_where_downloading(conn: &Connection) -> Result<()> {
         rusqlite::params![STATUS_CLOUD, STATUS_DOWNLOADING],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        conn
+    }
+
+    fn insert_face(conn: &Connection, id: i64, cluster: i64, identity: Option<i64>, confirmed: bool) {
+        conn.execute(
+            "INSERT INTO faces (id, photo_id, x1, y1, x2, y2, score, embedding, cluster_id, identity_id, confirmed)
+             VALUES (?1, 1, 0, 0, 1, 1, 0.9, x'00000000', ?2, ?3, ?4)",
+            rusqlite::params![id, cluster, identity, confirmed as i64],
+        )
+        .unwrap();
+    }
+
+    fn identity_of_face(conn: &Connection, face: i64) -> Option<i64> {
+        conn.query_row("SELECT identity_id FROM faces WHERE id = ?1", [face], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The Mía/Camila incident: merging a BIG cluster into a small one must not let
+    /// the big side's plurality hijack the small side's confirmed identity. The old
+    /// code re-derived the combined cluster's identity after the move and rebound
+    /// every face to it — Mía's own confirmed faces became "Camila" and Mía
+    /// vanished from the grid.
+    #[test]
+    fn merge_transfers_from_side_but_never_steals_other_confirmed() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO identities (id, name) VALUES (1, 'Mía'), (2, 'Camila'), (3, 'Lianny');",
+        )
+        .unwrap();
+        // Mía: 2 confirmed faces in cluster 10. A stray confirmed Lianny face also
+        // sits in cluster 10 (transient states like this exist mid-correction).
+        insert_face(&conn, 1, 10, Some(1), true);
+        insert_face(&conn, 2, 10, Some(1), true);
+        insert_face(&conn, 8, 10, Some(3), true);
+        // Camila: 5 confirmed faces in cluster 20 (the bigger side), plus one
+        // tentative machine-labeled face.
+        for f in 3..=7 {
+            insert_face(&conn, f, 20, Some(2), true);
+        }
+        insert_face(&conn, 9, 20, Some(2), false);
+
+        // Explicit user merge: fold Camila's cluster INTO Mía's.
+        merge_clusters(&conn, 10, 20).unwrap();
+
+        // Mía's confirmed faces keep HER identity (the old code flipped them to 2).
+        assert_eq!(identity_of_face(&conn, 1), Some(1));
+        assert_eq!(identity_of_face(&conn, 2), Some(1));
+        // The from-side faces transfer to Mía — that's what the merge means.
+        for f in [3, 4, 5, 6, 7, 9] {
+            assert_eq!(identity_of_face(&conn, f), Some(1), "face {f} should now be Mía");
+        }
+        // The stray confirmed Lianny face is untouched — never stolen by a merge.
+        assert_eq!(identity_of_face(&conn, 8), Some(3));
+    }
+
+    /// ensure_identity_for_cluster must bind unclaimed/tentative faces without
+    /// re-stamping faces the user confirmed under a different identity.
+    #[test]
+    fn ensure_identity_leaves_foreign_confirmed_faces_alone() {
+        let conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
+            .unwrap();
+        insert_face(&conn, 1, 10, Some(1), true); // Omar, confirmed (plurality)
+        insert_face(&conn, 2, 10, Some(1), true);
+        insert_face(&conn, 6, 10, Some(1), true);
+        insert_face(&conn, 3, 10, None, false); // unclaimed
+        insert_face(&conn, 4, 10, Some(2), true); // Kevin, confirmed — must survive
+        insert_face(&conn, 5, 10, Some(2), false); // tentative Kevin — rebindable
+
+        let id = ensure_identity_for_cluster(&conn, 10).unwrap();
+        assert_eq!(id, 1, "plurality identity is reused, no duplicate minted");
+        assert_eq!(identity_of_face(&conn, 3), Some(1));
+        assert_eq!(identity_of_face(&conn, 5), Some(1));
+        assert_eq!(identity_of_face(&conn, 4), Some(2), "confirmed Kevin face stolen");
+    }
+
+    /// cluster_has_foreign_confirmed: the absorb-path guard.
+    #[test]
+    fn foreign_confirmed_detection() {
+        let conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
+            .unwrap();
+        insert_face(&conn, 1, 10, Some(2), true);
+        insert_face(&conn, 2, 20, Some(1), true);
+        insert_face(&conn, 3, 30, None, false);
+        // Cluster 10 holds Kevin-confirmed: foreign to Omar (1) and to "no identity".
+        assert!(cluster_has_foreign_confirmed(&conn, 10, Some(1)).unwrap());
+        assert!(cluster_has_foreign_confirmed(&conn, 10, None).unwrap());
+        assert!(!cluster_has_foreign_confirmed(&conn, 10, Some(2)).unwrap());
+        // Cluster 30 has no confirmed faces at all.
+        assert!(!cluster_has_foreign_confirmed(&conn, 30, Some(1)).unwrap());
+    }
 }
