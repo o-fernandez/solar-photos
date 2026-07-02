@@ -2,20 +2,22 @@
 //
 // The queue (see build_review_queue in lib.rs) is a payoff-sorted snapshot of every
 // suggestion engine's output, normalized to one grammar: yes / no / who. The
-// snapshot is captured once on open — actions schedule background re-clusters, and
-// a live-updating list would reorder under the user's hands mid-answer. The
+// snapshot is captured on open — actions schedule background re-clusters, and a
+// live-updating list would reorder under the user's hands mid-answer. The
 // generation guard keeps the snapshot safe: if clustering moves on (a pass
-// completes mid-session), the next answer is refused server-side and the session
-// ends with a "refreshed" note instead of acting on renumbered clusters.
+// completes mid-session — a correction landed, or the sweep found new photos),
+// the next answer is refused server-side and the session refetches a fresh queue
+// and CONTINUES, instead of dead-ending. Answers already given were saved.
 //
 // Keyboard-first: Y (yes / merge all), N (no / not the same), S (someone else…),
 // → (skip), Esc (close). Each answer advances; the tally makes progress felt.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   absorbClusters,
   faceCropUrl,
   getClusters,
+  getReviewQueue,
   mergeClusters,
   nameCluster,
   notThisPerson,
@@ -34,22 +36,25 @@ export default function ReviewFocus({
   queue: ReviewQueue;
   onClose: () => void; // caller reloads People on close
 }) {
-  // Snapshot the items once — the live queue refreshes behind our back.
-  const [items] = useState<ReviewItem[]>(queue.items);
-  const generation = queue.generation;
+  // Snapshot of the queue; replaced wholesale by refresh() when clustering moves on.
+  const [items, setItems] = useState<ReviewItem[]>(queue.items);
+  const [generation, setGeneration] = useState(queue.generation);
   const [idx, setIdx] = useState(0);
   const [answered, setAnswered] = useState(0);
   const [settled, setSettled] = useState(0); // photos settled this session
-  // Strong-batch chips already acted on (by cluster id), for the current item.
+  // Strong-batch / twin-pair chips already acted on, for the current item.
   const [chipDone, setChipDone] = useState<Set<number>>(new Set());
   // "Someone else…" picker state.
   const [picking, setPicking] = useState(false);
   const [pickQuery, setPickQuery] = useState("");
   const [people, setPeople] = useState<Cluster[]>([]);
-  // Set when an action was refused (clustering moved on) — end the session gently.
-  const [stale, setStale] = useState(false);
+  // True while we're waiting out a re-cluster and refetching the queue.
+  const [refreshing, setRefreshing] = useState(false);
+  // Transient "we refreshed under you" note after a mid-session reorganization.
+  const [note, setNote] = useState<string | null>(null);
+  const refreshTries = useRef(0);
 
-  const item = idx < items.length ? items[idx] : null;
+  const item = !refreshing && idx < items.length ? items[idx] : null;
 
   useEffect(() => {
     getClusters().then(setPeople).catch(() => {});
@@ -62,7 +67,36 @@ export default function ReviewFocus({
     setIdx((i) => i + 1);
   }, []);
 
-  // Run one answer: count it, advance on success, end the session on refusal.
+  // Clustering moved on mid-session (an answer was refused, or a pass completed):
+  // refetch the queue and continue with fresh items. While a pass is still
+  // running the queue reads empty — poll until it lands rather than giving up.
+  const refresh = useCallback(() => {
+    setRefreshing(true);
+    const attempt = () => {
+      getReviewQueue()
+        .then((q) => {
+          if (q.items.length === 0 && refreshTries.current < 10) {
+            refreshTries.current += 1;
+            window.setTimeout(attempt, 1500);
+            return;
+          }
+          refreshTries.current = 0;
+          setItems(q.items);
+          setGeneration(q.generation);
+          setIdx(0);
+          setChipDone(new Set());
+          setPicking(false);
+          setPickQuery("");
+          setRefreshing(false);
+          setNote("People were reorganized — continuing with fresh suggestions.");
+          window.setTimeout(() => setNote(null), 4000);
+        })
+        .catch(() => onClose());
+    };
+    attempt();
+  }, [onClose]);
+
+  // Run one answer: count it, advance on success, refresh-and-continue on refusal.
   const act = useCallback(
     (run: () => Promise<unknown>, photos: number) => {
       run()
@@ -71,9 +105,9 @@ export default function ReviewFocus({
           setSettled((s) => s + photos);
           advance();
         })
-        .catch(() => setStale(true));
+        .catch(() => refresh());
     },
-    [advance],
+    [advance, refresh],
   );
 
   // The named people the "someone else…" picker offers (excluding the proposed one).
@@ -110,7 +144,7 @@ export default function ReviewFocus({
         else onClose();
         return;
       }
-      if (picking || !item || stale) return;
+      if (picking || !item) return;
       const k = e.key.toLowerCase();
       if (k === "arrowright") advance();
       if (item.kind === "maybe") {
@@ -121,8 +155,12 @@ export default function ReviewFocus({
         if (k === "y") act(() => mergeClusters(item.into, item.from, generation), item.photos);
         else if (k === "n") act(() => rejectMerge(item.into, item.from, generation), item.photos);
       } else if (item.kind === "same_photo_twin") {
-        if (k === "y") act(() => resolveSamePhoto(item.into, item.from, true, generation), item.photos);
-        else if (k === "n") act(() => resolveSamePhoto(item.into, item.from, false, generation), item.photos);
+        const rest = item.pairs.filter((p) => !chipDone.has(p.from));
+        if (k === "y" || k === "n") {
+          act(async () => {
+            for (const p of rest) await resolveSamePhoto(p.into, p.from, k === "y", generation);
+          }, rest.reduce((n, p) => n + p.photos, 0));
+        }
       } else if (item.kind === "strong_batch") {
         if (k === "y") {
           const rest = item.groups.filter((g) => !chipDone.has(g.cluster_id));
@@ -137,38 +175,34 @@ export default function ReviewFocus({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [item, picking, stale, chipDone, generation, act, advance, onClose]);
+  }, [item, picking, chipDone, generation, act, advance, onClose]);
 
-  // One strong-batch chip answered: run it, tally it, and advance when the batch
-  // empties. Chip actions don't use `act` — the card stays put for the next chip.
-  const chipAct = (run: () => Promise<unknown>, clusterId: number, photos: number, total: number) => {
+  // One strong-batch / twin-pair chip answered: run it, tally it, and advance when
+  // the card empties. Chip actions don't use `act` — the card stays for the rest.
+  const chipAct = (run: () => Promise<unknown>, chipId: number, photos: number, total: number) => {
     run()
       .then(() => {
         setAnswered((a) => a + 1);
         setSettled((s) => s + photos);
         setChipDone((d) => {
-          const next = new Set(d).add(clusterId);
+          const next = new Set(d).add(chipId);
           if (next.size >= total) advance();
           return next;
         });
       })
-      .catch(() => setStale(true));
+      .catch(() => refresh());
   };
 
   const keyHint = (k: string) => <span className="rf-key">{k}</span>;
 
   const body = () => {
-    if (stale) {
+    if (refreshing) {
       return (
         <div className="rf-done">
           <p className="rf-q">People were just reorganized</p>
           <p className="rf-sub">
-            The remaining suggestions were recomputed — close and reopen Review to continue
-            with fresh ones. Everything you answered so far was saved.
+            Fetching fresh suggestions — everything you answered so far was saved.
           </p>
-          <div className="rf-actions">
-            <button className="sb-btn" onClick={onClose}>Close</button>
-          </div>
         </div>
       );
     }
@@ -262,30 +296,81 @@ export default function ReviewFocus({
       );
     }
     if (item.kind === "same_photo_twin") {
+      const rest = item.pairs.filter((p) => !chipDone.has(p.from));
+      const one = rest.length === 1 && item.pairs.length === 1;
       return (
         <>
           <img className="rf-photo" src={photoUrl(item.photo_id)} alt="" draggable={false} />
-          <div className="rf-faces">
-            <img className="rf-face small" src={faceCropUrl(item.face_a)} alt="" draggable={false} />
-            <img className="rf-face small" src={faceCropUrl(item.face_b)} alt="" draggable={false} />
-          </div>
-          <p className="rf-q">These two are in this one photo — same person?</p>
+          <p className="rf-q">
+            {one
+              ? "These two are in this one photo — same person?"
+              : `${rest.length.toLocaleString()} look-alike pairs in this one photo — same person, each?`}
+          </p>
           <p className="rf-sub">
             A collage, mirror, or photo-of-a-photo shows one person twice; twins or
             look-alike siblings are two people.
           </p>
+          <div className="rf-chiprow">
+            {rest.map((p) => (
+              <div className="pr-chip rf-twinpair" key={p.from}>
+                <div className="rf-faces">
+                  <img className="rf-face small" src={faceCropUrl(p.face_a)} alt="" draggable={false} />
+                  <img className="rf-face small" src={faceCropUrl(p.face_b)} alt="" draggable={false} />
+                </div>
+                {p.into_name && <div className="pr-count">{p.into_name}?</div>}
+                <div className="pr-yn">
+                  <button
+                    className="pr-y"
+                    title={`Same person${p.into_name ? ` — merge into ${p.into_name}` : ""} (collage/mirror)`}
+                    onClick={() =>
+                      chipAct(
+                        () => resolveSamePhoto(p.into, p.from, true, generation),
+                        p.from,
+                        p.photos,
+                        item.pairs.length,
+                      )
+                    }
+                  >
+                    ✓
+                  </button>
+                  <button
+                    className="pr-n"
+                    title="Two people — keep them apart for good"
+                    onClick={() =>
+                      chipAct(
+                        () => resolveSamePhoto(p.into, p.from, false, generation),
+                        p.from,
+                        p.photos,
+                        item.pairs.length,
+                      )
+                    }
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
           <div className="rf-actions">
             <button
               className="sb-btn"
-              onClick={() => act(() => resolveSamePhoto(item.into, item.from, true, generation), item.photos)}
+              onClick={() =>
+                act(async () => {
+                  for (const p of rest) await resolveSamePhoto(p.into, p.from, true, generation);
+                }, rest.reduce((n, p) => n + p.photos, 0))
+              }
             >
-              Same person {keyHint("Y")}
+              {one ? "Same person" : `All same person (${rest.length.toLocaleString()})`} {keyHint("Y")}
             </button>
             <button
               className="sb-btn"
-              onClick={() => act(() => resolveSamePhoto(item.into, item.from, false, generation), item.photos)}
+              onClick={() =>
+                act(async () => {
+                  for (const p of rest) await resolveSamePhoto(p.into, p.from, false, generation);
+                }, rest.reduce((n, p) => n + p.photos, 0))
+              }
             >
-              Two people {keyHint("N")}
+              {one ? "Two people" : "All two people"} {keyHint("N")}
             </button>
             <button className="sb-btn ghost" onClick={advance}>Skip {keyHint("→")}</button>
           </div>
@@ -443,7 +528,8 @@ export default function ReviewFocus({
           </button>
         </div>
         {body()}
-        {settled > 0 && !stale && item && (
+        {note && <p className="rf-note">{note}</p>}
+        {settled > 0 && item && (
           <p className="rf-tally">{settled.toLocaleString()} photos settled this session</p>
         )}
       </div>

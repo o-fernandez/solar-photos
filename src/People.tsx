@@ -56,7 +56,7 @@ function queueFaces(q: ReviewQueue): number[] {
     case "pairwise":
       return [...it.into_faces.slice(0, 2), ...it.from_faces.slice(0, 2)];
     case "same_photo_twin":
-      return [it.face_a, it.face_b];
+      return it.pairs.length > 0 ? [it.pairs[0].face_a, it.pairs[0].face_b] : [];
   }
 }
 

@@ -275,15 +275,22 @@ export type ReviewItem =
   | {
       kind: "same_photo_twin";
       photos: number;
-      into: number;
-      from: number;
-      into_name: string | null;
-      /** The shared photo and the co-occurring face from each side. */
+      /** The shared photo; every contested pair in it rides on this one card. */
       photo_id: number;
-      face_a: number;
-      face_b: number;
-      similarity: number;
+      pairs: TwinPair[];
     };
+
+/** One contested pair on a same-photo card. */
+export interface TwinPair {
+  into: number;
+  from: number;
+  into_name: string | null;
+  /** The co-occurring face from each side, cropped from the shared photo. */
+  face_a: number;
+  face_b: number;
+  similarity: number;
+  photos: number;
+}
 
 export interface ReviewQueue {
   /** Clustering generation the queue was computed at — pass into every action. */

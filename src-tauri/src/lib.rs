@@ -999,8 +999,11 @@ fn compute_merge_suggestions(
     };
 
     let mut out = Vec::with_capacity(ranked.len());
-    let mut twins: Vec<ReviewItem> = Vec::new();
-    let mut twin_photos_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Same-photo contradictions, grouped per photo: a collage split into N
+    // fragments raises N cluster pairs — showing them one-per-pass looked like the
+    // same broken card returning forever. One card per photo, every pair on it.
+    let mut twin_pairs: std::collections::HashMap<i64, Vec<TwinPair>> =
+        std::collections::HashMap::new();
     for (e, _) in ranked {
         let (big, small) = {
             let (ca, cb) = (info[&e.a], info[&e.b]);
@@ -1019,24 +1022,19 @@ fn compute_merge_suggestions(
         if share_photo(e.a, e.b) {
             // The contradiction case: co-occurring, yet strong same-person evidence.
             // Never auto-merge (could be twins) — ask, showing the shared photo.
-            // One question per photo: a collage split into N fragments would raise
-            // a card per fragment pair; the first answer re-clusters and re-derives.
             if e.max_sim >= SAME_PHOTO_ASK_MIN {
                 if let Ok(pairs) = db::cooccurring_face_pairs(conn, big.cluster_id, small.cluster_id)
                 {
                     if let Some(&(photo_id, fa, fb)) = pairs.first() {
-                        if twin_photos_seen.insert(photo_id) {
-                            twins.push(ReviewItem::SamePhotoTwin {
-                                photos: small.count,
-                                into: big.cluster_id,
-                                from: small.cluster_id,
-                                into_name: big.name.clone(),
-                                photo_id,
-                                face_a: fa,
-                                face_b: fb,
-                                similarity: e.max_sim,
-                            });
-                        }
+                        twin_pairs.entry(photo_id).or_default().push(TwinPair {
+                            into: big.cluster_id,
+                            from: small.cluster_id,
+                            into_name: big.name.clone(),
+                            face_a: fa,
+                            face_b: fb,
+                            similarity: e.max_sim,
+                            photos: small.count,
+                        });
                     }
                 }
             }
@@ -1053,6 +1051,17 @@ fn compute_merge_suggestions(
             generation: 0, // stamped by refresh_suggestion_cache
         });
     }
+    let twins: Vec<ReviewItem> = twin_pairs
+        .into_iter()
+        .map(|(photo_id, mut pairs)| {
+            pairs.sort_by(|a, b| b.photos.cmp(&a.photos));
+            ReviewItem::SamePhotoTwin {
+                photos: pairs.iter().map(|p| p.photos).sum(),
+                photo_id,
+                pairs,
+            }
+        })
+        .collect();
     Ok((out, twins))
 }
 
@@ -1134,21 +1143,29 @@ enum ReviewItem {
         into_faces: Vec<i64>,
         from_faces: Vec<i64>,
     },
-    /// The same-photo contradiction: two clusters look like one person (strong
+    /// The same-photo contradiction: clusters that look like one person (strong
     /// cross-similarity) but share a photo — one person twice (collage, mirror,
     /// booth strip) or two look-alikes (twins)? Undecidable from embeddings; the
-    /// human sees the shared photo and decides in a glance.
+    /// human sees the shared photo and decides in a glance. One card per photo
+    /// carries every contested pair, so a collage is a single stop, not a series.
     SamePhotoTwin {
         photos: i64,
-        into: i64,
-        from: i64,
-        into_name: Option<String>,
-        /// The shared photo, and the co-occurring face from each side.
         photo_id: i64,
-        face_a: i64,
-        face_b: i64,
-        similarity: f32,
+        pairs: Vec<TwinPair>,
     },
+}
+
+/// One contested pair on a same-photo card: the cluster the fragment would fold
+/// into, and the co-occurring face from each side (cropped from the shared photo).
+#[derive(Clone, serde::Serialize)]
+struct TwinPair {
+    into: i64,
+    from: i64,
+    into_name: Option<String>,
+    face_a: i64,
+    face_b: i64,
+    similarity: f32,
+    photos: i64,
 }
 
 /// The review queue as of one clustering generation. All items share the payload's
@@ -1790,9 +1807,9 @@ fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
             ReviewItem::WhoIsThis { cluster_id, candidates, .. } => {
                 set.contains(cluster_id) || candidates.iter().any(|c| set.contains(&c.into))
             }
-            ReviewItem::Pairwise { into, from, .. }
-            | ReviewItem::SamePhotoTwin { into, from, .. } => {
-                set.contains(into) || set.contains(from)
+            ReviewItem::Pairwise { into, from, .. } => set.contains(into) || set.contains(from),
+            ReviewItem::SamePhotoTwin { pairs, .. } => {
+                pairs.iter().any(|p| set.contains(&p.into) || set.contains(&p.from))
             }
         }
     };
