@@ -81,7 +81,29 @@ The full philosophy lives in **[VISION.md](VISION.md)**, and the responsiveness
 rules that govern every feature — *the user's place is sacred* — live in
 **[PRINCIPLES.md](PRINCIPLES.md)**.
 
-## Install & run
+## Download & install
+
+Grab the latest `.dmg` from **[Releases](https://github.com/o-fernandez/solar-photos/releases/latest)** — macOS on Apple Silicon, no Node/Rust toolchain required.
+
+1. Open the `.dmg` and drag **Solar.app** into `/Applications`.
+2. **First launch only:** this build is unsigned (no $99/year Apple developer
+   account behind it yet), so macOS Gatekeeper will refuse to open it and call
+   it damaged or from an "unidentified developer." This is a standard Gatekeeper
+   quarantine flag, not an actual problem with the app. Clear it either way:
+   - **Right-click (or Control-click) `Solar.app` → Open** → click **Open** again
+     in the dialog. Only needed once.
+   - Or: **System Settings → Privacy & Security**, scroll down, click
+     **"Open Anyway"** next to the Solar warning.
+3. It launches normally on every run after that.
+
+Your library lives in app-data, not inside the `.app` bundle (see
+[Architecture at a glance](#architecture-at-a-glance) below), so replacing
+`Solar.app` with a newer build later never loses your photos or your named
+people.
+
+## Build from source
+
+Prefer to build it yourself, or want to hack on it? Here's the dev setup.
 
 ### Prerequisites
 
@@ -111,12 +133,10 @@ This produces (on Apple Silicon):
 - `src-tauri/target/release/bundle/macos/Solar.app` — the app
 - `src-tauri/target/release/bundle/dmg/Solar_<version>_aarch64.dmg` — a disk image
 
-Drag `Solar.app` into `/Applications` (or open the `.dmg`). Then:
+Drag `Solar.app` into `/Applications` (or open the `.dmg`) and clear the same
+Gatekeeper warning described above — it's unsigned regardless of whether you
+built it or downloaded it. After that:
 
-- **First launch:** it's a self-built, unsigned app, so macOS Gatekeeper will warn
-  about an "unidentified developer." Right-click `Solar.app` → **Open** once (or
-  System Settings → Privacy & Security → "Open Anyway"). It launches normally
-  afterward.
 - **Your library persists.** It lives in app-data (see below), not inside the
   `.app`, so you can rebuild and replace the app anytime without losing anything.
 - **Upgrading:** after code changes, `npm run tauri build` again and drag the new
