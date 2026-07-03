@@ -17,7 +17,7 @@
 // the backend fetches them on demand (we report the visible range below), they
 // flip to a spinner, then to the image once cached.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
 import {
@@ -38,7 +38,7 @@ const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill
 const CHUNK = 200; // how many rows we fetch from the DB per request
 const OVERSCAN_ROWS = 4; // rows rendered just outside the viewport, for smoothness
 
-export default function PhotoGrid({
+function PhotoGrid({
   total,
   byDate,
   refreshKey,
@@ -105,9 +105,14 @@ export default function PhotoGrid({
   // Reset when the ordering changes (scan finished: discovery → date) or the
   // library changed on disk (add / rescan / remove → refreshKey). The
   // index→photo mapping is order-dependent, so drop it and refetch from the top;
-  // readyRef/downloadingRef are id-based and stay valid.
+  // readyRef/downloadingRef are id-based and stay valid. The discovery→date flip
+  // reorders everything under the user, so it announces itself briefly.
   const firstOrder = useRef(true);
+  const prevByDate = useRef(byDate);
+  const [sortNote, setSortNote] = useState(false);
   useEffect(() => {
+    const orderFlipped = !prevByDate.current && byDate;
+    prevByDate.current = byDate;
     if (firstOrder.current) {
       firstOrder.current = false;
       return;
@@ -116,6 +121,13 @@ export default function PhotoGrid({
     loadedChunks.current.clear();
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     invalidate();
+    // Only the discovery→date flip reorders under the user; refreshKey bumps
+    // (add / rescan / remove) keep the same ordering and stay silent.
+    if (orderFlipped) {
+      setSortNote(true);
+      const t = window.setTimeout(() => setSortNote(false), 5000);
+      return () => window.clearTimeout(t);
+    }
   }, [byDate, refreshKey, invalidate]);
 
   // --- Timeline scrubber ---
@@ -346,6 +358,7 @@ export default function PhotoGrid({
     {byDate && scrubbing && !dragging && topTs ? (
       <div className="month-chip">{monthYear(topTs)}</div>
     ) : null}
+    {sortNote && <div className="month-chip sort-note">Scan finished — sorted by date, newest first</div>}
     {showScrubber && (
       <div
         className={`scrubber${scrubbing ? " active" : ""}`}
@@ -418,6 +431,11 @@ export default function PhotoGrid({
     return null; // local pending — gray box
   }
 }
+
+// Memoized: App re-renders on background-progress ticks; the grid coalesces its
+// own updates internally (rAF invalidate) and only needs re-rendering when the
+// library itself changes shape.
+export default memo(PhotoGrid);
 
 function monthYear(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", year: "numeric" });

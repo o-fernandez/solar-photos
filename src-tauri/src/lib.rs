@@ -364,6 +364,8 @@ fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path:
 #[derive(serde::Serialize)]
 struct PhotoDetail {
     filename: String,
+    /// Full path on disk — backs the viewer's "Show in Finder".
+    path: String,
     timestamp: i64,
 }
 
@@ -378,8 +380,8 @@ fn get_photo_detail(
         let filename = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or(path);
-        PhotoDetail { filename, timestamp }
+            .unwrap_or_else(|| path.clone());
+        PhotoDetail { filename, path, timestamp }
     }))
 }
 

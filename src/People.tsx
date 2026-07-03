@@ -10,7 +10,7 @@
 // Loads on mount (i.e. each time you open the tab) and after every action, so
 // it reflects the current clustering.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PersonView from "./PersonView";
 import ReviewFocus from "./ReviewFocus";
 import {
@@ -66,7 +66,7 @@ function queueFaces(q: ReviewQueue): number[] {
   }
 }
 
-export default function People({
+function People({
   focusClusterId = null,
   onFocusConsumed,
 }: {
@@ -97,11 +97,15 @@ export default function People({
   const [draft, setDraft] = useState("");
   // The person whose page is open, in place of the people-grid (null = grid).
   const [selected, setSelected] = useState<Cluster | null>(null);
+  // Find-a-person filter — a hundred named people don't fit in a scroll hunt (P6).
+  const [query, setQuery] = useState("");
   // True while a background re-cluster is rebuilding people.
   const [reorganizing, setReorganizing] = useState(false);
-  // Sweep progress (null until first read); drives the "Finding people…" readout
-  // and decides whether we're still in the noisy mid-sweep phase.
-  const [faceProg, setFaceProg] = useState<FaceProgress | null>(null);
+  // Whether the face sweep is still running — a boolean, deliberately: the raw
+  // per-photo progress events stream constantly while cloud photos trickle in,
+  // and holding the counts in state re-rendered the entire tile grid per event
+  // (the "hover lags by seconds" bug). Same-value sets bail out render-free.
+  const [sweeping, setSweeping] = useState(false);
   // How many of the settled "more" (small/singleton) tiles are revealed (0 = collapsed).
   const [moreShown, setMoreShown] = useState(0);
   // Latest `editing` + last mid-sweep reload time, read inside the progress
@@ -152,16 +156,13 @@ export default function People({
   // real-sized clusters appear, never the singleton churn. Skipped while you're
   // naming someone, so a refresh never yanks the input out from under you.
   useEffect(() => {
-    getFaceProgress().then(setFaceProg).catch(() => {});
+    const stillSweeping = (p: FaceProgress) => p.eligible > 0 && p.scanned < p.eligible;
+    getFaceProgress().then((p) => setSweeping(stillSweeping(p))).catch(() => {});
     const un = onFaceProgress((p) => {
-      setFaceProg(p);
-      const stillSweeping = p.eligible > 0 && p.scanned < p.eligible;
+      const s = stillSweeping(p);
+      setSweeping(s); // same value → React bails out, no grid re-render
       const now = Date.now();
-      if (
-        stillSweeping &&
-        editingRef.current === null &&
-        now - lastReloadRef.current > MID_SWEEP_REFRESH_MS
-      ) {
+      if (s && editingRef.current === null && now - lastReloadRef.current > MID_SWEEP_REFRESH_MS) {
         lastReloadRef.current = now;
         reload();
       }
@@ -173,7 +174,6 @@ export default function People({
 
   // "Still working" = a re-cluster is running, or the sweep hasn't caught up. Same
   // condition the backend uses to gate merge prompts (suggestions_ready).
-  const sweeping = !!faceProg && faceProg.eligible > 0 && faceProg.scanned < faceProg.eligible;
   const inProgress = reorganizing || sweeping;
 
   // Named/confirmed people always show. Mid-sweep, unnamed clusters must clear a
@@ -181,7 +181,17 @@ export default function People({
   // Settled, the bar drops and the small remainder goes to an expandable section.
   // Within the visible grid, named people come first, then unnamed — each block
   // ordered biggest-first (backend already sorts by count, so this stays stable).
+  // A search query overrides all of it: just the named people who match.
   const { visible, tail } = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (q) {
+      return {
+        visible: clusters
+          .filter((c) => c.name && c.name.toLowerCase().includes(q))
+          .sort((a, b) => b.count - a.count),
+        tail: [] as Cluster[],
+      };
+    }
     const isReal = (c: Cluster) => c.name != null;
     const namedFirst = (a: Cluster, b: Cluster) =>
       (a.name != null ? 0 : 1) - (b.name != null ? 0 : 1) || b.count - a.count;
@@ -195,7 +205,8 @@ export default function People({
       visible: clusters.filter((c) => isReal(c) || c.count >= SETTLED_FLOOR).sort(namedFirst),
       tail: clusters.filter((c) => !isReal(c) && c.count < SETTLED_FLOOR),
     };
-  }, [clusters, inProgress]);
+  }, [clusters, inProgress, query]);
+  const namedCount = useMemo(() => clusters.filter((c) => c.name).length, [clusters]);
 
   // Arriving from the new-person toast: show the grid and open this person's name
   // field straight away, then tell the parent we've consumed the request.
@@ -495,8 +506,25 @@ export default function People({
         />
       )}
 
+      {namedCount >= 8 && (
+        <div className="people-tools">
+          <input
+            className="people-search"
+            type="search"
+            placeholder="Find a person"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setQuery("");
+            }}
+          />
+        </div>
+      )}
+
       {visible.length > 0 ? (
         <div className="people-grid">{visible.map(renderTile)}</div>
+      ) : query.trim() ? (
+        <p className="muted">No one named “{query.trim()}”.</p>
       ) : sweeping ? (
         <p className="muted">
           Finding your people — the first will show up here as your library is scanned.
@@ -528,3 +556,7 @@ export default function People({
     </div>
   );
 }
+
+// Memoized: App re-renders on background-progress ticks (hairline, counters), and
+// without this every tick re-rendered the whole tile grid with it.
+export default memo(People);

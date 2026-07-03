@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 /** Thumbnail status, mirrored from the Rust side. */
 export const STATUS_PENDING = 0;
@@ -113,12 +114,19 @@ export function photoUrl(id: number): string {
 
 export interface PhotoDetail {
   filename: string;
+  /** Full path on disk — backs the viewer's "Show in Finder". */
+  path: string;
   timestamp: number;
 }
 
-/** Filename + timestamp for the viewer chrome. */
+/** Filename + path + timestamp for the viewer chrome. */
 export function getPhotoDetail(id: number): Promise<PhotoDetail | null> {
   return invoke("get_photo_detail", { id });
+}
+
+/** Reveal a photo's file in Finder. */
+export function revealInFinder(path: string): Promise<void> {
+  return revealItemInDir(path);
 }
 
 export interface FaceProgress {

@@ -223,7 +223,8 @@ body,
   pointer-events: none;
   transition: opacity 0.15s ease;
 }
-.hairline:hover .hairline-tip {
+.hairline:hover .hairline-tip,
+.hairline-tip.show {
   opacity: 1;
 }
 
@@ -526,6 +527,25 @@ body,
   grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 18px;
 }
+/* Find-a-person filter, shown once there are enough named people to lose one. */
+.people-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 14px;
+}
+.people-search {
+  width: 200px;
+  font-size: 13px;
+  padding: 6px 10px;
+  border: 1px solid #d8d8d8;
+  border-radius: 8px;
+  background: #fff;
+  color: #1a1a1a;
+}
+.people-search:focus {
+  outline: none;
+  border-color: #f5a623;
+}
 /* The expander for the settled long-tail of tiny/singleton clusters. Quiet by
    design — it's an escape hatch, not a call to action. */
 .more-toggle {
@@ -598,13 +618,17 @@ body,
   color: #185fa5;
   cursor: pointer;
   padding: 0;
-  /* Hover-only: a settled grid repeats this on dozens of tiles — as permanent
-     chrome it's a wall of identical calls to action. */
+}
+/* Hover-only ON TILES: a settled grid repeats this on dozens of tiles — as
+   permanent chrome it's a wall of identical calls to action. Scoped to .ptile:
+   the person-page header uses .paddname too, and there it must always show
+   (an unnamed person's page has no other naming affordance). */
+.ptile .paddname {
   opacity: 0;
   transition: opacity 0.12s;
 }
 .ptile:hover .paddname,
-.paddname:focus-visible {
+.ptile .paddname:focus-visible {
   opacity: 1;
 }
 .pname-input {
@@ -1254,6 +1278,11 @@ body,
   pointer-events: none;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
 }
+/* Post-scan reorder announcement, centered so it reads as an event, not wayfinding. */
+.month-chip.sort-note {
+  left: 50%;
+  transform: translateX(-50%);
+}
 .scrubber-label {
   position: absolute;
   right: 18px;
@@ -1342,6 +1371,13 @@ body,
   justify-content: center;
   padding: 32px 64px;
   box-sizing: border-box;
+  overflow: hidden;
+}
+.viewer-stage.zoomed {
+  cursor: grab;
+}
+.viewer-stage.zoomed:active {
+  cursor: grabbing;
 }
 
 /* --- Face overlay over the open photo (name / reassign / ignore) --- */
@@ -1540,8 +1576,25 @@ body,
   font-size: 13px;
   pointer-events: none;
 }
+.viewer-counter,
 .viewer-filename {
   color: #9a9a96;
+}
+.viewer-reveal {
+  pointer-events: auto;
+  border: none;
+  background: none;
+  color: #9a9a96;
+  font-size: 12px;
+  cursor: pointer;
+  margin-left: 10px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.viewer-reveal:hover {
+  color: #fff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1848,6 +1901,11 @@ body,
     background: #3a2424;
   }
   .month-chip {
+    background: #2c2c2c;
+    border-color: #444;
+    color: #ededed;
+  }
+  .people-search {
     background: #2c2c2c;
     border-color: #444;
     color: #ededed;

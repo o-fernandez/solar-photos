@@ -23,6 +23,7 @@ import {
   photoUrl,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
+  revealInFinder,
   undoCorrection,
   type Cluster,
   type CorrectionUndo,
@@ -76,10 +77,23 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   const [loading, setLoading] = useState(true);
   // Face boxes can be hidden (F, or the button) to look at the photo clean.
   const [showFaces, setShowFaces] = useState(true);
+  // Zoom/pan: pinch (ctrl+wheel) or double-click zooms toward the cursor; while
+  // zoomed, scroll or drag pans and 0 (or double-click) snaps back to fit. Reset
+  // on every navigation. Face boxes draw only at fit — their overlay is measured
+  // against the untransformed image.
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
 
   const [faces, setFaces] = useState<PhotoFace[]>([]);
   const [rect, setRect] = useState<ContentRect | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  // Read by the (stable) zoom/pan handlers without re-binding per render.
+  const rectRef = useRef<ContentRect | null>(null);
+  rectRef.current = rect;
+  const stageSizeRef = useRef(stageSize);
+  stageSizeRef.current = stageSize;
   const [openFace, setOpenFace] = useState<number | null>(null);
   const [people, setPeople] = useState<Cluster[]>([]);
   // A toast for the last correction. `onUndo` is null for actions we don't reverse
@@ -89,12 +103,34 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   const stageRef = useRef<HTMLDivElement>(null);
   const undoTimer = useRef<number | undefined>(undefined);
 
+  // Clamp + commit a zoom/pan pair (fit snaps the pan home). Refs mirror the
+  // state so wheel/drag handlers stay stable across renders.
+  const setView = useCallback((z: number, p: { x: number; y: number }) => {
+    const zc = Math.min(6, Math.max(1, z));
+    let pc = { x: 0, y: 0 };
+    if (zc > 1) {
+      const r = rectRef.current;
+      const s = stageSizeRef.current;
+      const maxX = r && s.width ? Math.max(0, (r.width * zc - s.width) / 2) + 24 : 0;
+      const maxY = r && s.height ? Math.max(0, (r.height * zc - s.height) / 2) + 24 : 0;
+      pc = {
+        x: Math.min(maxX, Math.max(-maxX, p.x)),
+        y: Math.min(maxY, Math.max(-maxY, p.y)),
+      };
+    }
+    zoomRef.current = zc;
+    panRef.current = pc;
+    setZoom(zc);
+    setPan(pc);
+  }, []);
+
   const go = useCallback(
     (delta: number) => {
       setOpenFace(null);
+      setView(1, { x: 0, y: 0 });
       setCurrent((c) => Math.min(total - 1, Math.max(0, c + delta)));
     },
-    [total],
+    [total, setView],
   );
 
   // Keyboard: ←/→ navigate, F toggles face boxes, Esc closes (or just closes an
@@ -112,11 +148,78 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       else if (e.key.toLowerCase() === "f") {
         setOpenFace(null);
         setShowFaces((s) => !s);
-      }
+      } else if (e.key === "0") setView(1, { x: 0, y: 0 });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [go, onClose, openFace]);
+  }, [go, onClose, openFace, setView]);
+
+  // Pinch (ctrl/cmd+wheel) zooms toward the cursor; plain scroll pans while
+  // zoomed. Native listener — React's synthetic wheel is passive, and zooming
+  // must preventDefault or the page rubber-bands.
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (e: WheelEvent) => {
+      const z1 = zoomRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const r = stage.getBoundingClientRect();
+        const cx = e.clientX - r.left - r.width / 2;
+        const cy = e.clientY - r.top - r.height / 2;
+        const z2 = Math.min(6, Math.max(1, z1 * Math.exp(-e.deltaY * 0.01)));
+        if (z2 === z1) return;
+        const scale = z2 / z1;
+        const p1 = panRef.current;
+        setOpenFace(null);
+        setView(z2, { x: cx - scale * (cx - p1.x), y: cy - scale * (cy - p1.y) });
+      } else if (z1 > 1) {
+        e.preventDefault();
+        const p1 = panRef.current;
+        setView(z1, { x: p1.x - e.deltaX, y: p1.y - e.deltaY });
+      }
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, [setView]);
+
+  // Double-click: zoom in toward the click, or snap back to fit.
+  const onStageDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      if (zoomRef.current > 1) {
+        setView(1, { x: 0, y: 0 });
+        return;
+      }
+      const r = stage.getBoundingClientRect();
+      const cx = e.clientX - r.left - r.width / 2;
+      const cy = e.clientY - r.top - r.height / 2;
+      setOpenFace(null);
+      setView(2.5, { x: cx * (1 - 2.5), y: cy * (1 - 2.5) });
+    },
+    [setView],
+  );
+
+  // Drag pans while zoomed.
+  const onStagePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (zoomRef.current <= 1 || e.button !== 0) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const p0 = { ...panRef.current };
+      const move = (ev: PointerEvent) =>
+        setView(zoomRef.current, { x: p0.x + ev.clientX - startX, y: p0.y + ev.clientY - startY });
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [setView],
+  );
 
   // The people list AND the clustering generation its ids belong to. The viewer can
   // stay open across a background re-cluster (which renumbers cluster ids), so both
@@ -202,6 +305,9 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   // the stage's coordinates (image offset within the padded, centered stage + the
   // object-fit contain offset, which is ~0 since the <img> shrink-wraps its image).
   const remeasure = useCallback(() => {
+    // Fit-only: getBoundingClientRect includes the zoom transform, so measuring
+    // while zoomed would corrupt the overlay geometry. Boxes only draw at fit.
+    if (zoomRef.current !== 1) return;
     const img = imgRef.current;
     const stage = stageRef.current;
     if (!img || !stage) return;
@@ -222,6 +328,10 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [remeasure]);
+  // A resize that happened while zoomed re-measures once we're back at fit.
+  useEffect(() => {
+    if (zoom === 1) remeasure();
+  }, [zoom, remeasure]);
 
   // Refetch the faces for the current photo (after a correction changes them).
   const refreshFaces = useCallback(() => {
@@ -363,12 +473,14 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       )}
 
       <div
-        className="viewer-stage"
+        className={`viewer-stage${zoom > 1 ? " zoomed" : ""}`}
         ref={stageRef}
         onClick={(e) => {
           e.stopPropagation();
           if (openFace !== null) setOpenFace(null); // click-away closes the menu
         }}
+        onDoubleClick={onStageDoubleClick}
+        onPointerDown={onStagePointerDown}
       >
         {loading && <span className="viewer-spinner" />}
         {shownId != null && (
@@ -378,6 +490,11 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
             className="viewer-img"
             alt={detail?.filename ?? ""}
             draggable={false}
+            style={
+              zoom !== 1
+                ? { transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }
+                : undefined
+            }
             onLoad={() => {
               setLoading(false);
               remeasure();
@@ -387,8 +504,8 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         )}
 
         {/* Face boxes, positioned over the displayed image content — only for the
-            photo actually on screen, and only while the overlay is shown. */}
-        {!loading && rect && showFaces && shownId === id &&
+            photo actually on screen, at fit, and while the overlay is shown. */}
+        {!loading && rect && showFaces && zoom === 1 && shownId === id &&
           faces.map((f) => {
             const box = {
               left: rect.left + f.x1 * rect.width,
@@ -462,8 +579,18 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
 
       {detail && shownId === id && (
         <div className="viewer-caption" onClick={(e) => e.stopPropagation()}>
+          <span className="viewer-counter">
+            {(current + 1).toLocaleString()} of {total.toLocaleString()} ·{" "}
+          </span>
           {when}
           <span className="viewer-filename"> · {detail.filename}</span>
+          <button
+            className="viewer-reveal"
+            title="Show this file in Finder"
+            onClick={() => revealInFinder(detail.path).catch(() => {})}
+          >
+            Show in Finder
+          </button>
         </div>
       )}
     </div>

@@ -94,11 +94,24 @@ function App() {
   // watches for a newly-qualified person to nudge. The first check seeds the
   // "already seen" set silently so the existing library doesn't toast on launch;
   // afterward, any unnamed cluster that crosses the floor gets celebrated once.
+  // The counts land in state at most ~2×/second: the raw events arrive per photo,
+  // and re-rendering the app per event starves hover/paint under a long backfill.
+  const facePendingRef = useRef<{ scanned: number; eligible: number } | null>(null);
+  const faceFlushTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onFaceProgress((p) => {
-      setFaceScanned(p.scanned);
-      setFaceEligible(p.eligible);
+      facePendingRef.current = { scanned: p.scanned, eligible: p.eligible };
+      if (faceFlushTimer.current == null) {
+        faceFlushTimer.current = window.setTimeout(() => {
+          faceFlushTimer.current = undefined;
+          const latest = facePendingRef.current;
+          if (latest) {
+            setFaceScanned(latest.scanned);
+            setFaceEligible(latest.eligible);
+          }
+        }, 500);
+      }
       const now = Date.now();
       if (now - lastPeopleCheckRef.current < NEW_PERSON_CHECK_MS) return;
       lastPeopleCheckRef.current = now;
@@ -122,7 +135,10 @@ function App() {
     }).then((fn) => {
       unlisten = fn;
     });
-    return () => unlisten?.();
+    return () => {
+      unlisten?.();
+      if (faceFlushTimer.current != null) window.clearTimeout(faceFlushTimer.current);
+    };
   }, []);
 
   // The nudge lingers, then fades on its own (a new one replaces it immediately).
@@ -133,14 +149,30 @@ function App() {
   }, [newPerson]);
 
   // Keep the "ready" counter live as thumbnails stream in (successes only).
+  // Coalesced: a cloud backfill streams these for hours, and one state update per
+  // event re-rendered the whole app per thumbnail (the hover-lag bug).
+  const readyPendingRef = useRef(0);
+  const readyFlushTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onThumbReady((d) => {
-      if (d.ok) setReady((r) => r + 1);
+      if (!d.ok) return;
+      readyPendingRef.current += 1;
+      if (readyFlushTimer.current == null) {
+        readyFlushTimer.current = window.setTimeout(() => {
+          readyFlushTimer.current = undefined;
+          const n = readyPendingRef.current;
+          readyPendingRef.current = 0;
+          setReady((r) => r + n);
+        }, 400);
+      }
     }).then((fn) => {
       unlisten = fn;
     });
-    return () => unlisten?.();
+    return () => {
+      unlisten?.();
+      if (readyFlushTimer.current != null) window.clearTimeout(readyFlushTimer.current);
+    };
   }, []);
 
   // Scan/rescan progress: grow the count live; on done, settle the truth and
@@ -200,6 +232,9 @@ function App() {
     return () => clearTimeout(t);
   }, [resetNote]);
 
+  // Stable prop for the memoized People — an inline lambda would defeat the memo.
+  const handleFocusConsumed = useCallback(() => setFocusClusterId(null), []);
+
   // Jump to the new person and open their name field straight away.
   const nameNewPerson = useCallback(() => {
     setNewPerson((p) => {
@@ -227,6 +262,22 @@ function App() {
   const activityLabel = activity
     ? `${activity.phase} · ${activity.done.toLocaleString()} of ${activity.of.toLocaleString()} · ${Math.round(activity.frac * 100)}%`
     : "";
+
+  // When a phase starts or changes, show the hover chip on its own for a few
+  // seconds — a 2px line whose meaning lives behind an undiscovered hover never
+  // tells a new user what the app is doing.
+  const phase = activity?.phase ?? null;
+  const prevPhaseRef = useRef<string | null>(null);
+  const [phaseFlash, setPhaseFlash] = useState(false);
+  useEffect(() => {
+    if (phase && phase !== prevPhaseRef.current) {
+      prevPhaseRef.current = phase;
+      setPhaseFlash(true);
+      const t = setTimeout(() => setPhaseFlash(false), 5000);
+      return () => clearTimeout(t);
+    }
+    if (!phase) prevPhaseRef.current = null;
+  }, [phase]);
 
   return (
     <div className="app">
@@ -389,7 +440,7 @@ function App() {
               className="hairline-fill"
               style={{ width: `${Math.round(activity.frac * 100)}%` }}
             />
-            <div className="hairline-tip" role="status">
+            <div className={`hairline-tip${phaseFlash ? " show" : ""}`} role="status">
               {activityLabel}
             </div>
           </>
@@ -398,10 +449,7 @@ function App() {
 
       {total > 0 ? (
         view === "people" ? (
-          <People
-            focusClusterId={focusClusterId}
-            onFocusConsumed={() => setFocusClusterId(null)}
-          />
+          <People focusClusterId={focusClusterId} onFocusConsumed={handleFocusConsumed} />
         ) : (
           // Discovery order while a scan runs (append-only, no reflow); snap to
           // the newest-first timeline otherwise. refreshKey forces a refetch
