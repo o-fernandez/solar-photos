@@ -396,6 +396,35 @@ export function notThisPerson(
   });
 }
 
+/** "Not this person" for a whole batch of candidate groups at once (the review
+ *  band's "none of these are them") — one undoable action. */
+export function notThisPersonMany(
+  personClusterId: number,
+  otherClusterIds: number[],
+  expectedGeneration?: number,
+): Promise<CorrectionUndo> {
+  return invoke("not_this_person_many", {
+    personClusterId,
+    otherClusterIds,
+    expectedGeneration: expectedGeneration ?? null,
+  });
+}
+
+/** "Someone else" without saying who: the group is none of the offered people.
+ *  Cannot-links it from each and confirms it as its own unnamed competitor — it
+ *  stops being suggested as any of them, and can be named later in People. */
+export function notThesePeople(
+  otherClusterId: number,
+  personClusterIds: number[],
+  expectedGeneration?: number,
+): Promise<CorrectionUndo> {
+  return invoke("not_these_people", {
+    otherClusterId,
+    personClusterIds,
+    expectedGeneration: expectedGeneration ?? null,
+  });
+}
+
 /** Fast "start people over": clear all names/groups/decisions, keep detected faces,
  *  re-cluster from scratch. Backs up the DB first; resolves to the backup path. */
 export function resetFaceDecisions(): Promise<string> {
@@ -481,6 +510,8 @@ export interface CorrectionUndo {
   /** Set when the correction created a new person (so the UI can focus it). */
   new_cluster_id: number | null;
   added_cannot_link: [number, number] | null;
+  /** Multi-pair form — a "neither of them" answer cannot-links each candidate. */
+  added_cannot_links?: [number, number][];
   /** Same-photo exceptions added by a "same person — collage" answer. */
   added_same_photo_ok: [number, number][];
 }
@@ -570,6 +601,7 @@ export function undoCorrection(undo: CorrectionUndo): Promise<void> {
     undo: {
       prior: undo.prior,
       added_cannot_link: undo.added_cannot_link,
+      added_cannot_links: undo.added_cannot_links ?? [],
       added_same_photo_ok: undo.added_same_photo_ok ?? [],
     },
   });

@@ -34,6 +34,7 @@ import {
   getReviewQueue,
   mergeClusters,
   nameCluster,
+  notThesePeople,
   notThisPerson,
   photoUrl,
   rejectMerge,
@@ -295,12 +296,41 @@ export default function ReviewFocus({
     );
   };
 
+  // "Just someone else": on a who-is-this card the truthful answer is often
+  // "neither of them, and I don't know who" — without this the only outlet was
+  // skipping, and the same card returned forever. Offered as the picker's default
+  // first row (while the query is empty), so S then Enter records it with no name;
+  // the group becomes an unnamed tile in People to name later, or never.
+  const showNeither = item?.kind === "who_is_this" && !pickQuery.trim();
+  const pickNeither = () => {
+    if (item?.kind !== "who_is_this") return;
+    const names = item.candidates.slice(0, 2).map((c) => c.name);
+    act(
+      async () => {
+        const tok = await notThesePeople(
+          item.cluster_id,
+          item.candidates.slice(0, 2).map((c) => c.into),
+          generation,
+        );
+        return () => undoCorrection(tok);
+      },
+      item.photos,
+      `Someone else — not ${names.join(" or ")}`,
+    );
+  };
+
   // ↑/↓ + Enter in the "someone else…" picker: Enter takes the highlighted row —
   // the TOP MATCH by default, so typing "Cami" ⏎ picks Camila instead of minting
   // a new person named "Cami". The "+ New person" row is the last row.
-  const pickRowCount = pickMatches.length + (pickQuery.trim() ? 1 : 0);
+  const pickOffset = showNeither ? 1 : 0;
+  const pickRowCount = pickOffset + pickMatches.length + (pickQuery.trim() ? 1 : 0);
   const pickNav = usePickerNav(pickRowCount, (i) => {
-    if (i < pickMatches.length) pickPerson(pickMatches[i]);
+    if (showNeither && i === 0) {
+      pickNeither();
+      return;
+    }
+    const k = i - pickOffset;
+    if (k < pickMatches.length) pickPerson(pickMatches[k]);
     else pickNewPerson(pickQuery.trim());
   });
 
@@ -955,11 +985,23 @@ export default function ReviewFocus({
           }}
         />
         <ul className="sb-matches">
+          {showNeither && (
+            <li
+              className={`sb-match sb-neither${pickNav.highlight === 0 ? " hi" : ""}`}
+              onMouseEnter={() => pickNav.setHighlight(0)}
+              onClick={pickNeither}
+            >
+              <span className="ns-name">Just someone else</span>
+              <span className="sb-neither-sub">
+                not them — leave unnamed, name them later in People if you like
+              </span>
+            </li>
+          )}
           {pickMatches.map((m, i) => (
             <li
               key={m.cluster_id}
-              className={`sb-match${pickNav.highlight === i ? " hi" : ""}`}
-              onMouseEnter={() => pickNav.setHighlight(i)}
+              className={`sb-match${pickNav.highlight === i + pickOffset ? " hi" : ""}`}
+              onMouseEnter={() => pickNav.setHighlight(i + pickOffset)}
               onClick={() => pickPerson(m)}
             >
               <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
@@ -969,8 +1011,8 @@ export default function ReviewFocus({
           ))}
           {pickQuery.trim() && (
             <li
-              className={`sb-match sb-new${pickNav.highlight === pickMatches.length ? " hi" : ""}`}
-              onMouseEnter={() => pickNav.setHighlight(pickMatches.length)}
+              className={`sb-match sb-new${pickNav.highlight === pickMatches.length + pickOffset ? " hi" : ""}`}
+              onMouseEnter={() => pickNav.setHighlight(pickMatches.length + pickOffset)}
               onClick={() => pickNewPerson(pickQuery.trim())}
             >
               + New person “{pickQuery.trim()}”

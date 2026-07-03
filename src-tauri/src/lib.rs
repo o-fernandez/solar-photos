@@ -578,6 +578,9 @@ struct CorrectionUndo {
     prior: Vec<db::FaceState>,
     new_cluster_id: Option<i64>,
     added_cannot_link: Option<(i64, i64)>,
+    /// Multi-pair form (a "neither of them" answer cannot-links against each
+    /// candidate); kept alongside the single-pair field the older paths use.
+    added_cannot_links: Vec<(i64, i64)>,
     added_same_photo_ok: Vec<(i64, i64)>,
 }
 
@@ -587,6 +590,7 @@ impl CorrectionUndo {
             prior,
             new_cluster_id: None,
             added_cannot_link: None,
+            added_cannot_links: Vec::new(),
             added_same_photo_ok: Vec::new(),
         }
     }
@@ -775,6 +779,9 @@ fn undo_correction(
         if let Some((a, b)) = undo.added_cannot_link {
             db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
         }
+        for &(a, b) in &undo.added_cannot_links {
+            db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
+        }
         db::remove_same_photo_ok(&conn, &undo.added_same_photo_ok).map_err(|e| e.to_string())?;
     }
     schedule_refold(app);
@@ -787,6 +794,8 @@ fn undo_correction(
 struct CorrectionUndoArg {
     prior: Vec<db::FaceState>,
     added_cannot_link: Option<(i64, i64)>,
+    #[serde(default)]
+    added_cannot_links: Vec<(i64, i64)>,
     #[serde(default)]
     added_same_photo_ok: Vec<(i64, i64)>,
 }
@@ -955,6 +964,83 @@ fn not_this_person(
         CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
     };
     prune_suggestion_cache(&state, &[person_cluster_id, other_cluster_id]);
+    schedule_refold(app);
+    Ok(undo)
+}
+
+/// "Someone else" WITHOUT saying who: the contested group is none of the offered
+/// candidates, and the user can't (or won't) name them right now. Cannot-link the
+/// group from every candidate and confirm it as its own durable *unnamed*
+/// competitor — it stops being suggested as any of them, pulls its look-alikes
+/// away, and sits in People as an unnamed tile to name later (or never). The
+/// answer that was missing between "it's X" and "skip forever".
+#[tauri::command]
+fn not_these_people(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    other_cluster_id: i64,
+    person_cluster_ids: Vec<i64>,
+    expected_generation: Option<i64>,
+) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
+    let mut touched = person_cluster_ids.clone();
+    touched.push(other_cluster_id);
+    let undo = {
+        let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
+        let other =
+            db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
+        let mut added = Vec::new();
+        for p in &person_cluster_ids {
+            let pid = db::ensure_identity_for_group(&conn, *p).map_err(|e| e.to_string())?;
+            if let Some(pair) =
+                record_cannot_link_if_new(&conn, other, pid).map_err(|e| e.to_string())?
+            {
+                added.push(pair);
+            }
+        }
+        db::confirm_identity_faces(&conn, other).map_err(|e| e.to_string())?;
+        CorrectionUndo { added_cannot_links: added, ..CorrectionUndo::faces_only(prior) }
+    };
+    prune_suggestion_cache(&state, &touched);
+    schedule_refold(app);
+    Ok(undo)
+}
+
+/// "Not this person" for a whole batch of candidate groups at once — the person
+/// page's review band offers "none of these are <name>". Same semantics as
+/// [`not_this_person`] per group (cannot-link + durable competitor), but captured
+/// as ONE undoable action, and the person's own face states are snapshotted once
+/// instead of per group.
+#[tauri::command]
+fn not_this_person_many(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    person_cluster_id: i64,
+    other_cluster_ids: Vec<i64>,
+    expected_generation: Option<i64>,
+) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
+    let mut touched = other_cluster_ids.clone();
+    touched.push(person_cluster_id);
+    let undo = {
+        let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
+        let person =
+            db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
+        let mut added = Vec::new();
+        for o in &other_cluster_ids {
+            let oid = db::ensure_identity_for_group(&conn, *o).map_err(|e| e.to_string())?;
+            if let Some(pair) =
+                record_cannot_link_if_new(&conn, person, oid).map_err(|e| e.to_string())?
+            {
+                added.push(pair);
+            }
+            db::confirm_identity_faces(&conn, oid).map_err(|e| e.to_string())?;
+        }
+        CorrectionUndo { added_cannot_links: added, ..CorrectionUndo::faces_only(prior) }
+    };
+    prune_suggestion_cache(&state, &touched);
     schedule_refold(app);
     Ok(undo)
 }
@@ -1928,6 +2014,8 @@ pub fn run() {
             absorb_clusters,
             reject_merge,
             not_this_person,
+            not_these_people,
+            not_this_person_many,
             reset_face_recognition,
             reset_face_decisions,
             recluster,

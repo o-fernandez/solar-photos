@@ -845,12 +845,42 @@ body,
   border-bottom: 1px solid #d3e8da;
 }
 .pr-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   font-size: 13px;
   color: #1c7a45;
   margin-bottom: 10px;
 }
 .pr-title b {
   font-weight: 500;
+}
+/* Whole-band answers — a dozen singleton chips is glanceable in one look. */
+.pr-bulk {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.pr-bulk-btn {
+  border: 1px solid #bcd8c6;
+  background: #ffffff;
+  color: #1c7a45;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 7px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.pr-bulk-btn:hover {
+  background: #daf0e2;
+}
+.pr-bulk-btn.no {
+  color: #a32d2d;
+  border-color: #e6bcbc;
+}
+.pr-bulk-btn.no:hover {
+  background: #fbecec;
 }
 .pr-row {
   display: flex;
@@ -1098,6 +1128,19 @@ body,
   color: #1a6fd0;
   border-top: 1px solid #eee;
   margin-top: 2px;
+}
+/* The picker's "neither of them, no name to give" escape — the default row. */
+.sb-neither {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  border-bottom: 1px solid #eee;
+  margin-bottom: 2px;
+  border-radius: 6px 6px 0 0;
+}
+.sb-neither-sub {
+  font-size: 11px;
+  color: #999;
 }
 
 /* Secondary toolbar button (Rescan, folders menu). */
@@ -1900,6 +1943,21 @@ body,
   .person-review .pr-n:hover {
     background: #3a2424;
   }
+  .person-review .pr-bulk-btn {
+    background: #2c2c2c;
+    border-color: #2f5a41;
+    color: #6fce97;
+  }
+  .person-review .pr-bulk-btn:hover {
+    background: #1f2b23;
+  }
+  .person-review .pr-bulk-btn.no {
+    color: #f09595;
+    border-color: #5a2f2f;
+  }
+  .person-review .pr-bulk-btn.no:hover {
+    background: #3a2424;
+  }
   .month-chip {
     background: #2c2c2c;
     border-color: #444;
@@ -2189,6 +2247,23 @@ body,
   flex-direction: column;
   align-items: center;
   gap: 8px;
+  width: min(340px, 100%);
+  margin: 0 auto;
+}
+/* Inside the review card the match list flows in-card, below the input. The
+   select-bar's upward popover escaped the card's scroll box and clipped (the
+   "Just someone else" row rendered outside the dialog). */
+.rf-picker .pname-input {
+  width: 100%;
+}
+.rf-picker .sb-matches {
+  position: static;
+  width: 100%;
+  min-width: 0;
+  margin-top: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: none;
 }
 .rf-done {
   text-align: center;

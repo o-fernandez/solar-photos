@@ -27,6 +27,7 @@ import {
   mergeClusters,
   nameCluster,
   notThisPerson,
+  notThisPersonMany,
   onClusterProgress,
   onThumbReady,
   reassignFacesToCluster,
@@ -67,10 +68,12 @@ function monthYear(ts: number): string {
 
 // A just-applied correction the user can still take back: the rows we optimistically
 // pulled from the grid, plus the backend token that restores them exactly.
+// `unresolve` re-shows review-band chips a bulk answer hid.
 interface PendingUndo {
   rows: PhotoRow[];
   undo: CorrectionUndo;
   label: string;
+  unresolve?: number[];
 }
 
 export default function PersonView({
@@ -311,6 +314,41 @@ export default function PersonView({
       });
   };
 
+  // Bulk answer for the whole band — a dozen 1-photo chips is glanceable in one
+  // look, and answering them one ✓ at a time read as manual labor. One action,
+  // one undo (which also re-shows the chips).
+  const resolveReviewAll = (keep: boolean) => {
+    if (!review || reviewLeft.length === 0) return;
+    const ids = reviewLeft.map((c) => c.cluster_id);
+    const who = name ?? review.name;
+    setReviewResolved((s) => new Set([...s, ...ids]));
+    (keep
+      ? absorbClusters(review.into, ids, review.generation)
+      : notThisPersonMany(review.into, ids, review.generation)
+    )
+      .then((tok) => {
+        if (keep) reloadPhotos();
+        setUndo({
+          rows: [],
+          undo: tok,
+          label: keep
+            ? `Added ${ids.length} groups to ${who}`
+            : `${ids.length} groups marked not ${who}`,
+          unresolve: ids,
+        });
+        if (undoTimer.current) window.clearTimeout(undoTimer.current);
+        undoTimer.current = window.setTimeout(() => setUndo(null), 8000);
+      })
+      .catch(() => {
+        setReviewResolved((s) => {
+          const next = new Set(s);
+          ids.forEach((id) => next.delete(id));
+          return next;
+        });
+        flashNotice("People were just reorganized — try that again.");
+      });
+  };
+
   // The people you can reassign a chunk *into* — every other person, biggest first —
   // plus the clustering generation their ids belong to. Both refresh when a
   // background re-cluster finishes (it renumbers cluster ids), so a move started
@@ -430,11 +468,20 @@ export default function PersonView({
 
   const doUndo = () => {
     if (!undo) return;
-    const { rows: removed, undo: tok } = undo;
+    const { rows: removed, undo: tok, unresolve } = undo;
     setUndo(null);
     undoCorrection(tok)
       .then(() => {
         setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
+        if (unresolve) {
+          setReviewResolved((s) => {
+            const next = new Set(s);
+            unresolve.forEach((id) => next.delete(id));
+            return next;
+          });
+          // A bulk "all are them" pulled photos in; refetch settles the grid.
+          reloadPhotos();
+        }
         loadLooks();
       })
       .catch(() => {});
@@ -786,8 +833,20 @@ export default function PersonView({
       {reviewLeft.length > 0 && (
         <div className="person-review">
           <div className="pr-title">
-            {reviewLeft.length.toLocaleString()} {reviewLeft.length === 1 ? "group" : "groups"} might
-            also be <b>{name ?? review!.name}</b> — check each
+            <span>
+              {reviewLeft.length.toLocaleString()} {reviewLeft.length === 1 ? "group" : "groups"}{" "}
+              might also be <b>{name ?? review!.name}</b> — check each
+            </span>
+            {reviewLeft.length > 1 && (
+              <span className="pr-bulk">
+                <button className="pr-bulk-btn" onClick={() => resolveReviewAll(true)}>
+                  All are {name ?? review!.name}
+                </button>
+                <button className="pr-bulk-btn no" onClick={() => resolveReviewAll(false)}>
+                  None are {name ?? review!.name}
+                </button>
+              </span>
+            )}
           </div>
           <div className="pr-row">
             {reviewLeft.map((c) => (
