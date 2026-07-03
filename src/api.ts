@@ -141,6 +141,10 @@ export function setFacesPaused(paused: boolean): Promise<void> {
   return invoke("set_faces_paused", { paused });
 }
 
+/** One person-group tile. `cluster_id` is the display-group key: negative for a
+ *  durable identity (a person — stable across every pass), positive for an
+ *  unassigned appearance cluster (renumbered only by a full re-cluster). Opaque
+ *  to the UI beyond that — pass it back to person/merge/name commands as-is. */
 export interface Cluster {
   cluster_id: number;
   count: number;
@@ -153,15 +157,17 @@ export function getClusters(): Promise<Cluster[]> {
   return invoke("get_clusters");
 }
 
-/** Name (or rename, or clear with "") a person-cluster. `expectedGeneration`
- *  guards the cluster id against a background re-cluster renumbering it between
- *  the people list loading and the name committing — naming confirms every face
- *  in the cluster, so acting on a stale id would mislabel a stranger durably. */
+/** Name (or rename, or clear with "") a person-group. Naming a fresh (positive)
+ *  group promotes it to a durable identity under a NEW negative key — the promise
+ *  resolves to the canonical key, which callers keeping the page open must adopt.
+ *  `expectedGeneration` guards a positive id against a background re-cluster
+ *  renumbering it between load and commit — naming confirms every face in the
+ *  group, so acting on a stale id would mislabel a stranger durably. */
 export function nameCluster(
   clusterId: number,
   name: string,
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<number> {
   return invoke("name_cluster", {
     clusterId,
     name,
@@ -453,7 +459,6 @@ export interface PhotoFace {
 /** A face's grouping before a correction — opaque to the UI, passed back to undo. */
 export interface FaceState {
   face_id: number;
-  cluster_id: number | null;
   identity_id: number | null;
   ignored: boolean;
   confirmed: boolean;

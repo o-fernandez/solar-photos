@@ -227,9 +227,11 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       if (face.cluster_id == null || !name) return;
       const prev = face.name ?? "";
       try {
-        await nameCluster(face.cluster_id, name, genRef.current);
+        // Naming may promote the group to a new (negative, stable) key — undo
+        // must rename THAT group, not the possibly-dead positive id.
+        const g = await nameCluster(face.cluster_id, name, genRef.current);
         flashUndo(`Named ${name}`, () =>
-          nameCluster(face.cluster_id!, prev, genRef.current).then(afterChange).catch(() => {}),
+          nameCluster(g, prev, genRef.current).then(afterChange).catch(() => {}),
         );
         afterChange();
       } catch {

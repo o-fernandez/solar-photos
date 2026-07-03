@@ -19,10 +19,20 @@ anything in `src-tauri/src/{cluster,recognition,db,lib}.rs` or `src/{People,Pers
 
 ## Data model
 
-- **cluster** — a group of faces produced by (re-)clustering. Cluster ids are
-  reassigned from scratch on every re-cluster; a "person tile" in the UI is a cluster.
-- **identity** — a durable person record (`identities` table). Survives re-clusters
-  and carries the name. A face's `identity_id` is the **must-link**.
+Two layers, joined by one derived key:
+
+- **cluster** (appearance layer) — a group of faces produced by unsupervised
+  (re-)clustering. Cluster ids belong to the clustering passes alone: corrections
+  and auto-folds never touch them, and they're renumbered only by a full
+  re-cluster (sweep-drain consolidation, reset, migration, the manual command).
+- **identity** (person layer) — a durable person record (`identities` table).
+  Survives everything and carries the name. A face's `identity_id` is its person;
+  when confirmed it's also the **must-link** the re-cluster honors.
+- **display group** = `COALESCE(-identity_id, cluster_id)` (`db::GROUP_EXPR`) —
+  what a "person tile" actually is. A face with an identity shows under the
+  **negative, forever-stable** key `-identity_id`; an unassigned face under its positive
+  appearance cluster. No merge ever has to be un-done to move a face between
+  tiles: only the identity layer is written.
 - **`faces.confirmed`** (0/1) — **the key flag.** `1` = the *user* vouched for this
   face (named / moved / merged). `0` = the machine auto-folded it (tentative).
   - Only **confirmed** faces are must-links (`confirmed_face_identities`) and anchor
@@ -30,44 +40,50 @@ anything in `src-tauri/src/{cluster,recognition,db,lib}.rs` or `src/{People,Pers
     they're re-decided every pass. This is what makes wrong folds self-correcting.
 - **cannot_link** — durable "these two identities are not the same person."
 
-## The pipeline (per re-cluster, `run_recluster`)
+## The two passes
 
-1. **Cluster** all faces by embedding (`cluster::recluster`, purity-biased
-   complete-linkage over a mutual-kNN graph, `TAU_LINK ≈ 0.5`), honoring:
-   - **must-links** from **confirmed** faces only, and
-   - **cannot-links** between identities.
-   Auto-folded (unconfirmed) faces are *free* here — they re-group by appearance.
-2. **Re-derive cluster names** from the durable **identity** whose confirmed faces
-   landed in each cluster (read fresh, post-clustering — so a name added *during*
-   the pass isn't wiped by a stale snapshot; that was a real bug once).
-3. **Auto-fold** (`auto_fold_confident`) — the competitive assignment (below).
+**Self-heal (`run_auto_fold`, the frequent one).** Naming / merging / absorbing /
+detaching trigger a **debounced** fold pass (`schedule_refold`, `REFOLD_DEBOUNCE`
+of quiet; plus the pending-rerun guard so rapid actions aren't dropped). It wipes
+every *tentative* identity assignment and re-derives them competitively against
+the confirmed anchors (`auto_fold_confident`). Because a fold writes only
+`identity_id` — never `cluster_id` — this is a cheap identity-layer pass: naming
+a second look-alike re-decides the tentative faces and ejects the first person's
+wrongly-folded ones with **no re-cluster at all**.
 
-Naming / merging / absorbing / detaching all trigger a **debounced** re-cluster
-(`schedule_recluster`, `RECLUSTER_DEBOUNCE` of quiet; plus the pending-rerun guard so
-rapid actions aren't dropped). That re-cluster is what makes the system **self-heal**:
-naming a second look-alike frees the tentative faces and re-decides them, ejecting
-the first person's wrongly-folded faces.
+**Re-cluster (`run_recluster`, the rare one).** Rebuilds the appearance layer from
+embeddings (`cluster::recluster`, purity-biased complete-linkage over a mutual-kNN
+graph, `TAU_LINK ≈ 0.5`), honoring **must-links** from confirmed faces and
+**cannot-links** between identities (named pairs implicitly). Runs on sweep-drain
+consolidation, reset, migrations, and the manual command — never as the price of a
+correction. Identity groups (names, confirmations, tiles) are keyed by durable
+identity ids and pass through untouched; it ends with a fold pass so tentative
+assignments reflect the fresh clusters.
 
 ### Suggestion cache + generation guard
 
-Merge suggestions and growth cards are **computed once at the end of each clustering
-pass** (`refresh_suggestion_cache`, on the pass's own thread + connection) and served
+Merge suggestions and growth cards are **computed once at the end of each pass**
+(`refresh_suggestion_cache`, on the pass's own thread + connection) and served
 from a cached snapshot — never recomputed per People-tab open (the old way held the
-shared DB lock through seconds of matrix math, stalling every avatar request). Each
-pass bumps a monotonic **cluster generation**; suggestion payloads carry it, and the
-suggestion-driven mutations (`merge_clusters`, `absorb_clusters`, `not_this_person`,
-`reject_merge`) verify it via `ensure_generation`. This closes a real corruption bug:
-cluster ids are renumbered by every re-cluster, so acting on a card computed before
-one completed used to confirm/merge whatever cluster *now* held the stale id.
+shared DB lock through seconds of matrix math, stalling every avatar request). The
+monotonic **cluster generation** bumps only when a re-cluster renumbers the
+positive appearance keys; payloads carry it and mutations verify it via
+`ensure_generation`. Identity keys are negative and never invalidated, so with the
+two-layer model the guard only ever fires around the rare consolidation pass —
+mid-review folds no longer strand a session.
 
 ## Competitive assignment (the intelligence)
 
-`cluster_identity_matches` scores every candidate cluster against **each confirmed
-identity's** dense-core anchor (`identity_candidates`), best-first. Then per cluster:
+`cluster_identity_matches` scores every candidate group against **each confirmed
+identity's** dense-core anchor (`identity_candidates`), best-first. Candidates are
+the *positive* groups only — a negative group IS a person (or competitor), and
+identities merge only by explicit user action. Then per candidate:
 
 - Assign to the **decisively best** identity: top match must clear `AUTO_FOLD_MIN`
   **and** beat the runner-up by `AUTO_FOLD_MARGIN`. A **near-tie** (two babies both
-  plausible) is **ambiguous → left for review, never guessed.**
+  plausible) is **ambiguous → left for review, never guessed.** The assignment sets
+  `identity_id` (tentative, `confirmed = 0`) and nothing else — the cluster keeps
+  its id, so the next pass can re-decide it for free.
 - **Two floors, on purpose:**
   - `COMPETITOR_MIN` (=1): any confirmed group can **compete** — push a look-alike
     *off* someone (into review). Cheap, safe, and lets a one-group "not X" defend
@@ -174,20 +190,20 @@ competitor); `not_this_person` is the shortcut that mints an unnamed competitor 
 | `LOOK_TAU` | 0.5 | looks: leader-cluster threshold (raw, no merge pass) |
 | `LOOK_ABS_MIN` / `MAX_LOOKS` | 10 / 8 | absolute look floor / genuine looks shown |
 | `LOOK_FLAG_ABS` / `LOOK_FLAG_MARGIN` | 0.5 / 0.08 | when to flag a look as another person |
-| `RECLUSTER_DEBOUNCE` | 4s | quiet period before a correction's re-cluster runs |
+| `REFOLD_DEBOUNCE` | 4s | quiet period before a correction's self-heal fold runs |
 
 ## Known limitations / future work
 
-- **Two *confirmed* people whose faces are embedding-adjacent can still share a
-  cluster.** Must-links pull each person together but don't push two people *apart*.
-  Fix: treat distinctly-named identities as implicitly cannot-linked during clustering.
-- **Naming triggers a full re-cluster** (seconds on 30k). That's the price of
-  self-heal; the debounce batches a burst of corrections into one pass, and the
-  suggestion cache means the UI no longer pays for it per tab-open, but each pass is
-  still a full rebuild. The real fix remains **identity-centric grouping**: auto-fold
-  sets `identity_id` for display without merging `cluster_id` — then self-heal is a
-  cheap re-derive, no full re-cluster, and cluster ids stop being ephemeral (which
-  would retire the generation guard too).
+- ~~Naming triggers a full re-cluster~~ — **done** (2026-07): identity-centric
+  grouping landed. Auto-fold writes `identity_id` only, self-heal is a cheap
+  re-derive, and the appearance layer is rebuilt only on consolidation. Two
+  embedding-adjacent confirmed people can still share an *appearance* cluster, but
+  the display splits them by identity, so nothing user-visible mixes.
+- **`cluster_identity_matches` is O(identities × library)** — every confirmed
+  identity (including each unnamed "not X" competitor, which lives forever) costs a
+  full-library clone + anchor matmul per fold pass. Fine at today's counts; the fix
+  when it bites is building the candidate matrix once and scoring all anchors
+  against it in one pass, plus expiring competitors whose faces were since claimed.
 - **Competition favors larger exemplar sets** (uses best-match `max_sim`). A person
   with few confirmed faces can lose their own faces to a person with many. Confirming
   a few more usually tips it; a size-invariant metric (centroid / kNN vote) is the

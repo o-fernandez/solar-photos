@@ -96,6 +96,10 @@ export default function PersonView({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [name, setName] = useState(cluster.name);
+  // The person's current group key. Naming a fresh (positive, appearance) group
+  // promotes it to a durable identity under a NEW negative key; the backend
+  // returns the canonical key so the open page keeps following the same person.
+  const [groupId, setGroupId] = useState(cluster.cluster_id);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [undo, setUndo] = useState<PendingUndo | null>(null);
   // A transient message (no Undo) — e.g. a correction refused because a background
@@ -149,7 +153,7 @@ export default function PersonView({
   // Reload this person's photo set from the backend — after a correction made in
   // the open photo (Lightbox) changes who's in it.
   const reloadPhotos = useCallback(() => {
-    getPersonPhotos(cluster.cluster_id)
+    getPersonPhotos(groupId)
       .then((r) => {
         r.forEach((row) => {
           if (row.status === STATUS_READY) readyRef.current.add(row.id);
@@ -158,18 +162,18 @@ export default function PersonView({
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
-  }, [cluster.cluster_id]);
+  }, [groupId]);
 
   // Load (and reload) this person's "looks" — the appearance sub-clusters. Refreshed
   // after any correction, since moving faces changes the grouping (and clears a flag).
   const loadLooks = useCallback(() => {
-    getPersonLooks(cluster.cluster_id)
+    getPersonLooks(groupId)
       .then((l) => {
         setLooks(l);
         setSelectedLook((cur) => (cur != null && cur >= l.length ? null : cur));
       })
       .catch(() => {});
-  }, [cluster.cluster_id]);
+  }, [groupId]);
 
   // Load this person's photos + looks once on mount (the whole set is known — no paging).
   useEffect(() => {
@@ -243,21 +247,21 @@ export default function PersonView({
     const s = q.trim().toLowerCase();
     if (!s) return [];
     return people
-      .filter((c) => c.cluster_id !== cluster.cluster_id && c.name && c.name.toLowerCase().includes(s))
+      .filter((c) => c.cluster_id !== groupId && c.name && c.name.toLowerCase().includes(s))
       .slice(0, 5);
   };
   const exactNameMatch = (q: string): Cluster | undefined => {
     const s = q.trim().toLowerCase();
     if (!s) return undefined;
     return people.find(
-      (c) => c.cluster_id !== cluster.cluster_id && c.name != null && c.name.toLowerCase() === s,
+      (c) => c.cluster_id !== groupId && c.name != null && c.name.toLowerCase() === s,
     );
   };
   // Fold this whole person into another (picked, or typed as an exact match), then
   // leave the page — this cluster is now part of the other.
   const mergeThisInto = (target: Cluster) => {
     setEditing(false);
-    mergeClusters(target.cluster_id, cluster.cluster_id, genRef.current)
+    mergeClusters(target.cluster_id, groupId, genRef.current)
       .then(onBack)
       .catch(() => flashNotice("People were just reorganized — try that again."));
   };
@@ -270,8 +274,11 @@ export default function PersonView({
       mergeThisInto(match);
       return;
     }
-    nameCluster(cluster.cluster_id, value, genRef.current)
-      .then(() => setName(value || null))
+    nameCluster(groupId, value, genRef.current)
+      .then((g) => {
+        setGroupId(g);
+        setName(value || null);
+      })
       .catch(() => flashNotice("People were just reorganized — try that again."));
   };
 
@@ -368,7 +375,7 @@ export default function PersonView({
       setRows((rs) => rs.filter((r) => !idSet.has(r.id)));
       clearSelection();
       try {
-        const faceIds = await faceIdsForPhotos(photoIds, cluster.cluster_id);
+        const faceIds = await faceIdsForPhotos(photoIds, groupId);
         const tok = await run(faceIds);
         setUndo({ rows: removed, undo: tok, label });
         if (undoTimer.current) window.clearTimeout(undoTimer.current);
@@ -395,7 +402,7 @@ export default function PersonView({
         );
       }
     },
-    [cluster.cluster_id, loadLooks, reloadPhotos, flashNotice],
+    [groupId, loadLooks, reloadPhotos, flashNotice],
   );
 
   const doUndo = () => {
@@ -414,13 +421,13 @@ export default function PersonView({
   const moveToPerson = (target: Cluster) =>
     applyCorrection(
       selectedIds,
-      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, target.cluster_id, genRef.current),
+      (fids) => reassignFacesToCluster(fids, groupId, target.cluster_id, genRef.current),
       `Moved to ${target.name}`,
     );
   const moveToNewPerson = (newName?: string) =>
     applyCorrection(
       selectedIds,
-      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName, genRef.current),
+      (fids) => reassignFacesToNewPerson(fids, groupId, newName, genRef.current),
       newName ? `Moved to ${newName}` : "Moved to a new person",
     );
   const ignoreSelected = () =>
@@ -446,7 +453,7 @@ export default function PersonView({
     endLook();
     applyCorrection(
       ids,
-      (fids) => reassignFacesToCluster(fids, cluster.cluster_id, targetCluster, genRef.current),
+      (fids) => reassignFacesToCluster(fids, groupId, targetCluster, genRef.current),
       label,
     );
   };
@@ -460,7 +467,7 @@ export default function PersonView({
     endLook();
     applyCorrection(
       ids,
-      (fids) => reassignFacesToNewPerson(fids, cluster.cluster_id, newName, genRef.current),
+      (fids) => reassignFacesToNewPerson(fids, groupId, newName, genRef.current),
       newName ? `Moved to ${newName}` : "Moved to a new person",
     );
   };
@@ -478,18 +485,18 @@ export default function PersonView({
   const keepLook = () => {
     if (!activeLook || activeLook.likely_other_cluster == null) return;
     endLook();
-    rejectMerge(cluster.cluster_id, activeLook.likely_other_cluster).then(loadLooks).catch(() => {});
+    rejectMerge(groupId, activeLook.likely_other_cluster).then(loadLooks).catch(() => {});
   };
 
   // Named people other than the one we're viewing, filtered by a typeahead — shared by
   // the multi-select move picker and the per-look move picker.
   const filterPeople = (q: string) =>
     people
-      .filter((c) => c.cluster_id !== cluster.cluster_id && c.name)
+      .filter((c) => c.cluster_id !== groupId && c.name)
       .filter((c) => (q.trim() ? c.name!.toLowerCase().includes(q.trim().toLowerCase()) : true))
       .slice(0, 6);
-  const pickMatches = useMemo(() => filterPeople(pickQuery), [people, pickQuery, cluster.cluster_id]); // eslint-disable-line react-hooks/exhaustive-deps
-  const lookPickMatches = useMemo(() => filterPeople(lookPickQuery), [people, lookPickQuery, cluster.cluster_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pickMatches = useMemo(() => filterPeople(pickQuery), [people, pickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const lookPickMatches = useMemo(() => filterPeople(lookPickQuery), [people, lookPickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const header = (
     <div className="person-header">

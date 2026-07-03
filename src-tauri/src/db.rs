@@ -83,6 +83,8 @@ pub fn init(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
          CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
          CREATE TABLE IF NOT EXISTS cluster_names (
+            -- legacy (pre identity-centric grouping); names now live on
+            -- identities. Kept so a downgrade doesn't lose the schema; unused.
             cluster_id INTEGER PRIMARY KEY,
             name       TEXT NOT NULL
          );
@@ -92,10 +94,10 @@ pub fn init(conn: &Connection) -> Result<()> {
          );",
     )?;
     // Durable person records. Unlike cluster ids — which are reassigned from
-    // scratch on every re-cluster — an identity id is permanent, so it can carry
+    // scratch on every re-cluster — an identity id is permanent, so it carries
     // the user's decisions (this is so-and-so; these groups are the same person)
-    // across re-clusters. A face's `identity_id` is the must-link: every face
-    // sharing one is forced into a single cluster no matter what the embeddings do.
+    // across re-clusters. A face's `identity_id` is both its display group (see
+    // GROUP_EXPR below) and, when confirmed, the must-link a re-cluster honors.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS identities (
             id   INTEGER PRIMARY KEY,
@@ -110,6 +112,11 @@ pub fn init(conn: &Connection) -> Result<()> {
     // Migration for libraries created before identities existed.
     let _ = conn.execute("ALTER TABLE faces ADD COLUMN identity_id INTEGER", []);
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_faces_identity ON faces(identity_id);")?;
+    // The display-group key (see the "Display groups" section below): expression
+    // index so per-person queries don't scan the whole faces table.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_faces_group ON faces(COALESCE(-identity_id, cluster_id));",
+    )?;
     // User-confirmed exceptions to the same-photo rule: face-id pairs that share a
     // photo but ARE one person — a collage, a mirror, a photo-booth strip. Granted
     // from the review question ("same photo — same person?"), per pair, so one
@@ -123,8 +130,8 @@ pub fn init(conn: &Connection) -> Result<()> {
          );",
     )?;
     // `ignored` faces are excluded from People for good (a stranger, a poster, a
-    // reflection) — they keep cluster_id = NULL like a detach, but the flag marks
-    // the exclusion as intentional and permanent so the overlay never re-draws them.
+    // reflection). They KEEP their appearance cluster_id — so an undo restores
+    // them exactly — but every group query filters them out via `ignored = 0`.
     let _ = conn.execute("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0", []);
     // `confirmed` marks faces the *user* vouched for (named / moved / merged), as
     // opposed to ones the machine auto-folded in. Only confirmed faces are must-links
@@ -222,12 +229,31 @@ fn decode_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// (cluster_id, photo_id, embedding) for every already-clustered face — used to
-/// rebuild the in-memory cluster index at startup (photo id feeds the same-photo
-/// exclusion during incremental assignment).
+// ---------------------------------------------------------------------------
+// Display groups. A face shows under `COALESCE(-identity_id, cluster_id)`:
+//   * **identity** (negative key, `-identity_id`) — the durable person. Stable
+//     across every pass, because identity ids never change.
+//   * **appearance cluster** (positive key, `cluster_id`) — the unsupervised
+//     grouping. Renumbered only by a full re-cluster.
+// Auto-fold and corrections write ONLY the identity layer; `cluster_id` belongs
+// to the clustering passes alone (the batch re-cluster + the incremental index).
+// That split is what makes self-heal a cheap re-derive — nothing ever has to be
+// un-merged — and what makes a person's group id safe to hold in the UI: a
+// positive key can only go stale across a (rare) re-cluster, and a negative key
+// never does. Ignored faces keep their cluster_id (so undo is exact) but are
+// excluded from every group query via `ignored = 0`.
+// ---------------------------------------------------------------------------
+
+/// The display-group key expression (documented above).
+pub const GROUP_EXPR: &str = "COALESCE(-identity_id, cluster_id)";
+
+/// (cluster_id, photo_id, embedding) for every in-pool face — used to rebuild
+/// the in-memory cluster index at startup (photo id feeds the same-photo
+/// exclusion during incremental assignment). Appearance layer, not groups.
 pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f32>)>> {
-    let mut stmt = conn
-        .prepare("SELECT cluster_id, photo_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let mut stmt = conn.prepare(
+        "SELECT cluster_id, photo_id, embedding FROM faces WHERE cluster_id IS NOT NULL AND ignored = 0",
+    )?;
     let rows = stmt.query_map([], |r| {
         let cid: i64 = r.get(0)?;
         let pid: i64 = r.get(1)?;
@@ -244,9 +270,9 @@ pub fn clustered_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f32>
 pub fn multi_face_boxes(conn: &Connection) -> Result<Vec<(i64, i64, f32, f32, f32, f32)>> {
     let mut stmt = conn.prepare(
         "SELECT photo_id, id, x1, y1, x2, y2 FROM faces
-         WHERE cluster_id IS NOT NULL
+         WHERE cluster_id IS NOT NULL AND ignored = 0
            AND photo_id IN (
-             SELECT photo_id FROM faces WHERE cluster_id IS NOT NULL
+             SELECT photo_id FROM faces WHERE cluster_id IS NOT NULL AND ignored = 0
              GROUP BY photo_id HAVING COUNT(*) > 1)
          ORDER BY photo_id",
     )?;
@@ -256,12 +282,13 @@ pub fn multi_face_boxes(conn: &Connection) -> Result<Vec<(i64, i64, f32, f32, f3
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// (cluster_id, photo_id) for every clustered face — for co-occurrence vetoes on
+/// (group, photo_id) for every in-pool face — for co-occurrence vetoes on
 /// suggestions and auto-fold (a candidate group photographed alongside the person
 /// cannot BE the person).
 pub fn cluster_photo_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
-    let mut stmt = conn
-        .prepare("SELECT cluster_id, photo_id FROM faces WHERE cluster_id IS NOT NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {GROUP_EXPR}, photo_id FROM faces WHERE cluster_id IS NOT NULL AND ignored = 0"
+    ))?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -295,32 +322,33 @@ pub fn add_same_photo_ok(conn: &Connection, pairs: &[(i64, i64)]) -> Result<()> 
     Ok(())
 }
 
-/// Face pairs across two clusters that share a photo: `(photo_id, face_in_a,
+/// Face pairs across two groups that share a photo: `(photo_id, face_in_a,
 /// face_in_b)`. These are the pairs the same-photo rule blocks — and the ones a
 /// "same person (collage)" answer marks as exceptions.
 pub fn cooccurring_face_pairs(
     conn: &Connection,
-    cluster_a: i64,
-    cluster_b: i64,
+    group_a: i64,
+    group_b: i64,
 ) -> Result<Vec<(i64, i64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT f1.photo_id, f1.id, f2.id FROM faces f1
          JOIN faces f2 ON f2.photo_id = f1.photo_id
-         WHERE f1.cluster_id = ?1 AND f2.cluster_id = ?2",
+         WHERE COALESCE(-f1.identity_id, f1.cluster_id) = ?1
+           AND COALESCE(-f2.identity_id, f2.cluster_id) = ?2
+           AND f1.ignored = 0 AND f2.ignored = 0",
     )?;
-    let rows = stmt.query_map(rusqlite::params![cluster_a, cluster_b], |r| {
+    let rows = stmt.query_map(rusqlite::params![group_a, group_b], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// (face_id, embedding) for every face that still belongs to a cluster — the input
-/// to a full [`crate::cluster::recluster`]. We deliberately skip NULL-cluster faces:
-/// those were detached by "not this person" and must stay out (a re-cluster must not
-/// resurrect them).
+/// (face_id, embedding) for every in-pool face — the input to a full
+/// [`crate::cluster::recluster`]. Ignored faces stay out (a re-cluster must not
+/// resurrect them); NULL-cluster rows are legacy out-of-pool state.
 pub fn all_face_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let mut stmt = conn
+        .prepare("SELECT id, embedding FROM faces WHERE cluster_id IS NOT NULL AND ignored = 0")?;
     let rows = stmt.query_map([], |r| {
         let id: i64 = r.get(0)?;
         let blob: Vec<u8> = r.get(1)?;
@@ -329,11 +357,12 @@ pub fn all_face_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// (face_id, cluster_id, embedding) for every clustered face — the input to
-/// face-to-face merge-suggestion evidence.
+/// (face_id, group, embedding) for every in-pool face — the input the
+/// suggestion/fold engines reason over (display groups, not appearance).
 pub fn face_cluster_embeddings(conn: &Connection) -> Result<Vec<(i64, i64, Vec<f32>)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, cluster_id, embedding FROM faces WHERE cluster_id IS NOT NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, {GROUP_EXPR}, embedding FROM faces WHERE cluster_id IS NOT NULL AND ignored = 0"
+    ))?;
     let rows = stmt.query_map([], |r| {
         let id: i64 = r.get(0)?;
         let cid: i64 = r.get(1)?;
@@ -358,43 +387,24 @@ pub fn set_face_clusters(conn: &mut Connection, pairs: &[(i64, i64)]) -> Result<
     Ok(())
 }
 
-/// Replace the whole `cluster_names` table with `(cluster_id, name)` pairs — used
-/// after a re-cluster to re-anchor each surviving name to its new cluster id. Done
-/// in one transaction so People never sees a half-named state.
-pub fn replace_cluster_names(conn: &mut Connection, names: &[(i64, String)]) -> Result<()> {
-    let tx = conn.transaction()?;
-    {
-        tx.execute("DELETE FROM cluster_names", [])?;
-        let mut ins = tx.prepare(
-            "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
-             ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
-        )?;
-        for (cluster_id, name) in names {
-            ins.execute(rusqlite::params![cluster_id, name])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-/// The highest-confidence face ids for a cluster (detector `score` desc) — the
+/// The highest-confidence face ids for a group (detector `score` desc) — the
 /// example faces shown on a merge card so one glance decides.
-pub fn top_face_ids(conn: &Connection, cluster_id: i64, limit: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM faces WHERE cluster_id = ?1 ORDER BY score DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![cluster_id, limit], |r| r.get(0))?;
+pub fn top_face_ids(conn: &Connection, group: i64, limit: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM faces WHERE {GROUP_EXPR} = ?1 AND ignored = 0 ORDER BY score DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![group, limit], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Every face id in a cluster, best (highest score) first. Backs the "Who is this?"
+/// Every face id in a group, best (highest score) first. Backs the "Who is this?"
 /// split grid, where the user tags each contested face as one candidate or the other,
-/// so — unlike [`top_face_ids`] — it must return the whole cluster, not a sample.
-pub fn cluster_face_ids(conn: &Connection, cluster_id: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM faces WHERE cluster_id = ?1 ORDER BY score DESC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![cluster_id], |r| r.get(0))?;
+/// so — unlike [`top_face_ids`] — it must return the whole group, not a sample.
+pub fn cluster_face_ids(conn: &Connection, group: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM faces WHERE {GROUP_EXPR} = ?1 AND ignored = 0 ORDER BY score DESC"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![group], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -430,18 +440,6 @@ pub fn clear_face_decisions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The clusters an identity's faces currently sit in, largest first. The first is
-/// the natural "into" target when absorbing look-alike groups.
-pub fn clusters_of_identity(conn: &Connection, identity_id: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT cluster_id, COUNT(*) c FROM faces
-         WHERE identity_id = ?1 AND cluster_id IS NOT NULL
-         GROUP BY cluster_id ORDER BY c DESC",
-    )?;
-    let rows = stmt.query_map([identity_id], |r| r.get::<_, i64>(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Read an app-level key/value flag (e.g. "have we run the one-time re-cluster").
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
@@ -459,8 +457,9 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// One person's group: cluster id, face count, a cover face (highest-confidence
-/// detection), and a name if it's been named. Biggest groups first.
+/// One person-group's tile: its group key (kept in the `cluster_id` field for
+/// wire compatibility), face count, a cover face (highest-confidence detection),
+/// and the identity's name when the group is a person. Biggest first.
 #[derive(serde::Serialize)]
 pub struct ClusterRow {
     pub cluster_id: i64,
@@ -470,15 +469,19 @@ pub struct ClusterRow {
 }
 
 pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.cluster_id, COUNT(*) AS c,
-                (SELECT id FROM faces f2 WHERE f2.cluster_id = f.cluster_id ORDER BY score DESC LIMIT 1),
-                (SELECT name FROM cluster_names cn WHERE cn.cluster_id = f.cluster_id)
-         FROM faces f
-         WHERE f.cluster_id IS NOT NULL
-         GROUP BY f.cluster_id
-         ORDER BY c DESC",
-    )?;
+    // With exactly one MAX() aggregate, SQLite guarantees the bare columns (`id`
+    // and the correlated name subquery) come from the max-score row — the cover.
+    // The name is per-identity, so any row of the group yields the same value.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {GROUP_EXPR} AS g, COUNT(*) AS c,
+                id,
+                (SELECT name FROM identities i WHERE i.id = faces.identity_id),
+                MAX(score)
+         FROM faces
+         WHERE cluster_id IS NOT NULL AND ignored = 0
+         GROUP BY g
+         ORDER BY c DESC"
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok(ClusterRow {
             cluster_id: r.get(0)?,
@@ -490,118 +493,122 @@ pub fn clusters_overview(conn: &Connection) -> Result<Vec<ClusterRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The cluster of an existing person by name (case-insensitive), if one exists — so
-/// "move to a new person: Mía" merges into the real Mía instead of minting a duplicate.
-pub fn cluster_for_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+/// The group of an existing person by name (case-insensitive), if one exists — so
+/// "move to a new person: Mía" merges into the real Mía instead of minting a
+/// duplicate. Only identities that still hold faces count: a ghost name left by a
+/// merged-away person must not resurrect them.
+pub fn group_for_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
-            "SELECT cluster_id FROM cluster_names WHERE lower(name) = lower(?1) LIMIT 1",
+            "SELECT -id FROM identities
+             WHERE lower(name) = lower(?1)
+               AND EXISTS (SELECT 1 FROM faces WHERE identity_id = identities.id AND ignored = 0)
+             LIMIT 1",
             [name.trim()],
             |r| r.get(0),
         )
         .ok())
 }
 
-/// Name (or rename) a cluster. Empty name clears it. Naming also confirms an
-/// identity: it binds every face in the cluster to one durable `identity_id` (so
-/// the name — and the grouping — survives the next re-cluster) and stores the name
-/// on that identity.
-pub fn name_cluster(conn: &Connection, cluster_id: i64, name: &str) -> Result<()> {
+/// Name (or rename) a person-group. Empty name clears it. Naming a positive
+/// (appearance) group first promotes it to a durable identity — from then on the
+/// tile lives under the stable negative key, which is returned so callers holding
+/// the old positive key can follow the person. Naming vouches for the group's
+/// current contents: its faces become confirmed exemplars (anchor + must-links),
+/// the label the magnet learns from.
+pub fn name_group(conn: &Connection, group: i64, name: &str) -> Result<i64> {
     let name = name.trim();
     if name.is_empty() {
-        conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [cluster_id])?;
-        if let Some(id) = identity_of_cluster(conn, cluster_id)? {
+        if let Some(id) = identity_of_group(conn, group)? {
             conn.execute("UPDATE identities SET name = NULL WHERE id = ?1", [id])?;
         }
-        return Ok(());
+        return Ok(group);
     }
-    conn.execute(
-        "INSERT INTO cluster_names (cluster_id, name) VALUES (?1, ?2)
-         ON CONFLICT(cluster_id) DO UPDATE SET name = excluded.name",
-        rusqlite::params![cluster_id, name],
-    )?;
-    let id = ensure_identity_for_cluster(conn, cluster_id)?;
+    let id = ensure_identity_for_group(conn, group)?;
     conn.execute("UPDATE identities SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])?;
-    // Naming a cluster vouches for its current contents — they become confirmed
-    // exemplars (must-links + anchor), the label the magnet learns from. Scoped to
-    // faces bound to THIS identity: confirming a stray face another person's
-    // identity still owns would mint bogus exemplars for *them*.
-    conn.execute(
-        "UPDATE faces SET confirmed = 1 WHERE cluster_id = ?1 AND identity_id = ?2",
-        rusqlite::params![cluster_id, id],
-    )?;
-    Ok(())
+    confirm_identity_faces(conn, id)?;
+    Ok(-id)
 }
 
-/// True if the cluster holds faces the user confirmed under an identity other
-/// than `identity` — i.e. absorbing or offering it would swallow (part of) a
-/// different person. `identity = None` means any confirmed identity is foreign.
-pub fn cluster_has_foreign_confirmed(
-    conn: &Connection,
-    cluster_id: i64,
-    identity: Option<i64>,
-) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM faces
-         WHERE cluster_id = ?1 AND confirmed = 1
-           AND identity_id IS NOT NULL AND identity_id IS NOT ?2",
-        rusqlite::params![cluster_id, identity],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
+/// The display name of a group: a named identity's name. Positive (appearance)
+/// groups are by definition unnamed.
+pub fn group_name(conn: &Connection, group: i64) -> Result<Option<String>> {
+    if group >= 0 {
+        return Ok(None);
+    }
+    let name: Option<String> = conn
+        .query_row("SELECT name FROM identities WHERE id = ?1", [-group], |r| r.get(0))
+        .unwrap_or(None);
+    Ok(name)
 }
 
-/// Like [`cluster_has_foreign_confirmed`], but only *named* identities count — a
-/// real person the user labeled. Faces confirmed under an unnamed competitor
-/// (bookkeeping minted by a rejection) don't block an explicit assignment: the
-/// user's direct judgment on the faces outranks that bookkeeping.
-pub fn cluster_has_named_foreign_confirmed(
+/// Mint a brand-new (unnamed) durable identity — the person record behind a
+/// "move to a new person" split.
+pub fn new_identity(conn: &Connection) -> Result<i64> {
+    conn.execute("INSERT INTO identities (name) VALUES (NULL)", [])?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// True if the group IS a different *named* person with user-confirmed evidence —
+/// absorbing or merging it away would swallow someone the user labeled. Positive
+/// (appearance) groups hold no identity faces, so they never block; neither do
+/// unnamed competitors (bookkeeping minted by a rejection) — the user's explicit
+/// assignment outranks that bookkeeping.
+pub fn group_is_other_named_person(
     conn: &Connection,
-    cluster_id: i64,
+    group: i64,
     identity: Option<i64>,
 ) -> Result<bool> {
+    if group >= 0 || identity == Some(-group) {
+        return Ok(false);
+    }
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM faces f JOIN identities i ON i.id = f.identity_id
-         WHERE f.cluster_id = ?1 AND f.confirmed = 1
-           AND i.name IS NOT NULL AND f.identity_id IS NOT ?2",
-        rusqlite::params![cluster_id, identity],
+         WHERE f.identity_id = ?1 AND f.confirmed = 1 AND i.name IS NOT NULL",
+        [-group],
         |r| r.get(0),
     )?;
     Ok(n > 0)
 }
 
-/// Rebind a cluster's faces confirmed under *unnamed* identities to `new_identity`.
-/// Used when the user explicitly assigns the cluster to a person: the unnamed
+/// Rebind a group's faces confirmed under *unnamed* identities to `new_identity`.
+/// Used when the user explicitly assigns the group to a person: the unnamed
 /// competitor was minted by an earlier rejection, and without this adoption the
 /// assignment would be refused forever (the stuck-card loop).
-pub fn adopt_unnamed_confirmed(
-    conn: &Connection,
-    cluster_id: i64,
-    new_identity: i64,
-) -> Result<()> {
+pub fn adopt_unnamed_confirmed(conn: &Connection, group: i64, new_identity: i64) -> Result<()> {
     conn.execute(
-        "UPDATE faces SET identity_id = ?2
-         WHERE cluster_id = ?1 AND confirmed = 1 AND identity_id != ?2
-           AND identity_id IN (SELECT id FROM identities WHERE name IS NULL)",
-        rusqlite::params![cluster_id, new_identity],
+        &format!(
+            "UPDATE faces SET identity_id = ?2
+             WHERE {GROUP_EXPR} = ?1 AND confirmed = 1 AND identity_id != ?2
+               AND identity_id IN (SELECT id FROM identities WHERE name IS NULL)"
+        ),
+        rusqlite::params![group, new_identity],
     )?;
     Ok(())
 }
 
-/// Mark a cluster's faces as user-confirmed (exemplars + must-links) under the
+/// Mark a group's faces as user-confirmed (exemplars + must-links) under the
 /// identity they're being vouched as: unclaimed faces and that identity's own.
 /// A face bound to a *different* identity is untouched — confirming it here would
 /// mint bogus exemplars for the other person. Used before absorbs/merges/rejects
 /// so the vouched-for faces become sticky, not auto-ejectable.
-pub fn confirm_cluster_faces(
-    conn: &Connection,
-    cluster_id: i64,
-    identity: Option<i64>,
-) -> Result<()> {
+pub fn confirm_group_faces(conn: &Connection, group: i64, identity: Option<i64>) -> Result<()> {
     conn.execute(
-        "UPDATE faces SET confirmed = 1
-         WHERE cluster_id = ?1 AND (identity_id IS NULL OR identity_id IS ?2)",
-        rusqlite::params![cluster_id, identity],
+        &format!(
+            "UPDATE faces SET confirmed = 1
+             WHERE {GROUP_EXPR} = ?1 AND (identity_id IS NULL OR identity_id IS ?2) AND ignored = 0"
+        ),
+        rusqlite::params![group, identity],
+    )?;
+    Ok(())
+}
+
+/// Mark every face currently under an identity as user-confirmed — the "you
+/// vouched for this tile's contents" primitive behind naming and merging.
+pub fn confirm_identity_faces(conn: &Connection, identity: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE faces SET confirmed = 1 WHERE identity_id = ?1 AND ignored = 0",
+        [identity],
     )?;
     Ok(())
 }
@@ -659,78 +666,72 @@ pub fn fold_eligible_identities(conn: &Connection, min_count: i64) -> Result<Vec
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Clusters that hold a confirmed face — the "owned" people-clusters auto-fold must
-/// never fold *into* another (it would merge two confirmed people).
-pub fn confirmed_clusters(conn: &Connection) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT cluster_id FROM faces WHERE confirmed = 1 AND cluster_id IS NOT NULL",
-    )?;
-    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// Merge cluster `from` into `into`: reassign its faces and drop its name. The
-/// surviving cluster keeps `into`'s name and identity. The merge is recorded
-/// durably: the absorbed faces end up under `into`'s identity, a must-link the
-/// next re-cluster honors (so you never have to merge the same two people twice).
+/// Merge a group into an identity: rebind its faces so they display under the
+/// person — no cluster ids move. Rebound: unclaimed faces, faces carrying the
+/// from-group's own identity (the user just vouched they're the same person),
+/// and tentative machine labels. A face the user confirmed under any *other*
+/// identity is never rebound (the Mía/Camila rule) — structurally rare now that
+/// groups are identity-keyed, but kept as defense in depth. `confirmed` is not
+/// set here; callers decide what the user actually vouched for.
 ///
-/// Identities are resolved BEFORE any face moves. The old version derived the
-/// winner from the *combined* cluster's plurality and rebound every face to it —
-/// so merging a big cluster into a small one let the big side hijack the result,
-/// rebinding even faces the user had confirmed under a different identity (the
-/// Mía/Camila incident: Mía's own confirmed faces became "Camila", and Mía
-/// vanished). Now a face confirmed under a different identity is never rebound.
-pub fn merge_clusters(conn: &Connection, into: i64, from: i64) -> Result<()> {
-    let from_identity = identity_of_cluster(conn, from)?;
-    let into_identity = ensure_identity_for_cluster(conn, into)?;
+/// If the from-side was a *named* identity that ends up empty, its name is
+/// cleared — a ghost name would otherwise hijack later merge-by-name lookups.
+pub fn merge_group_into_identity(conn: &Connection, into_identity: i64, from: i64) -> Result<()> {
+    let from_identity = if from < 0 { Some(-from) } else { None };
     conn.execute(
-        "UPDATE faces SET cluster_id = ?1 WHERE cluster_id = ?2",
-        rusqlite::params![into, from],
+        &format!(
+            "UPDATE faces SET identity_id = ?1
+             WHERE {GROUP_EXPR} = ?2 AND ignored = 0
+               AND (identity_id IS NULL OR identity_id IS ?3 OR confirmed = 0)"
+        ),
+        rusqlite::params![into_identity, from, from_identity],
     )?;
-    conn.execute("DELETE FROM cluster_names WHERE cluster_id = ?1", [from])?;
-    // Bind the combined cluster to `into`'s identity: unclaimed faces, faces that
-    // carried `from`'s identity (the user just vouched they're the same person),
-    // and tentative machine labels. Confirmed faces of any *other* identity stay.
-    conn.execute(
-        "UPDATE faces SET identity_id = ?1
-         WHERE cluster_id = ?2
-           AND (identity_id IS NULL OR identity_id = ?3 OR confirmed = 0)",
-        rusqlite::params![into_identity, into, from_identity],
-    )?;
+    if let Some(fid) = from_identity {
+        conn.execute(
+            "UPDATE identities SET name = NULL
+             WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM faces WHERE identity_id = ?1)",
+            [fid],
+        )?;
+    }
     Ok(())
 }
 
-/// The identity bound to a cluster, if any (the one most of its faces carry).
-pub fn identity_of_cluster(conn: &Connection, cluster_id: i64) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT identity_id FROM faces
-             WHERE cluster_id = ?1 AND identity_id IS NOT NULL
-             GROUP BY identity_id ORDER BY COUNT(*) DESC LIMIT 1",
-            [cluster_id],
-            |r| r.get(0),
-        )
-        .ok())
+/// Tentatively assign an appearance cluster's unclaimed faces to an identity —
+/// the auto-fold write. `confirmed` stays 0 so the next self-heal pass is free to
+/// re-decide it, and `cluster_id` is untouched so nothing ever needs un-merging.
+pub fn assign_cluster_to_identity(conn: &Connection, cluster_id: i64, identity: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE faces SET identity_id = ?2
+         WHERE cluster_id = ?1 AND identity_id IS NULL AND ignored = 0",
+        rusqlite::params![cluster_id, identity],
+    )?)
 }
 
-/// Get (or create) the identity for a cluster and bind the cluster's faces to it.
-/// Reuses an existing identity already present on the cluster so repeated
-/// naming/merging doesn't spawn duplicates. Binding never touches a face the user
-/// confirmed under a *different* identity — a cluster can (transiently) hold two
-/// people's confirmed faces, and stamping the plurality identity over the
-/// minority's steals them (see `merge_clusters`).
-pub fn ensure_identity_for_cluster(conn: &Connection, cluster_id: i64) -> Result<i64> {
-    let id = match identity_of_cluster(conn, cluster_id)? {
-        Some(id) => id,
-        None => {
-            conn.execute("INSERT INTO identities (name) VALUES (NULL)", [])?;
-            conn.last_insert_rowid()
-        }
-    };
+/// The identity behind a group key. Negative keys ARE identities; positive keys
+/// are appearance clusters, which by construction hold only identity-less faces.
+pub fn identity_of_group(conn: &Connection, group: i64) -> Result<Option<i64>> {
+    if group >= 0 {
+        return Ok(None);
+    }
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM identities WHERE id = ?1", [-group], |_| Ok(true))
+        .unwrap_or(false);
+    Ok(if exists { Some(-group) } else { None })
+}
+
+/// Get (or create) the durable identity behind a group. A negative key already is
+/// one; a positive (appearance) key mints a fresh identity and binds the group's
+/// faces to it — from then on the tile lives under the stable negative key, so
+/// callers must not reuse the old positive key afterwards.
+pub fn ensure_identity_for_group(conn: &Connection, group: i64) -> Result<i64> {
+    if group < 0 {
+        return Ok(-group);
+    }
+    let id = new_identity(conn)?;
     conn.execute(
         "UPDATE faces SET identity_id = ?1
-         WHERE cluster_id = ?2 AND (identity_id IS NULL OR confirmed = 0)",
-        rusqlite::params![id, cluster_id],
+         WHERE cluster_id = ?2 AND identity_id IS NULL AND ignored = 0",
+        rusqlite::params![id, group],
     )?;
     Ok(id)
 }
@@ -742,17 +743,8 @@ pub fn named_identities(conn: &Connection) -> Result<Vec<(i64, String)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Record that two clusters are *not* the same person (from a declined merge),
-/// promoting each side to a durable identity so the barrier survives re-clusters.
-/// Stored as an unordered identity pair.
-pub fn add_cannot_link(conn: &Connection, into: i64, from: i64) -> Result<()> {
-    let a = ensure_identity_for_cluster(conn, into)?;
-    let b = ensure_identity_for_cluster(conn, from)?;
-    add_cannot_link_ids(conn, a, b)
-}
-
-/// Record a cannot-link directly between two **identity** ids (a < b normalized).
-/// Used by reassign, where both identities already exist.
+/// Record a cannot-link between two **identity** ids (a < b normalized) — the
+/// durable "not the same person" barrier.
 pub fn add_cannot_link_ids(conn: &Connection, a: i64, b: i64) -> Result<()> {
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     conn.execute(
@@ -772,16 +764,16 @@ pub fn cannot_link_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
 /// Every photo containing this person, newest first — the same ordering as the
 /// timeline, so the person page reads as a filtered timeline. One row per photo
 /// (a photo with two of their faces still appears once).
-pub fn person_photos(conn: &Connection, cluster_id: i64) -> Result<Vec<PhotoRow>> {
+pub fn person_photos(conn: &Connection, group: i64) -> Result<Vec<PhotoRow>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.thumb_status, COALESCE(p.taken_ts, p.mtime) AS ts
          FROM photos p
          JOIN faces f ON f.photo_id = p.id
-         WHERE f.cluster_id = ?1
+         WHERE COALESCE(-f.identity_id, f.cluster_id) = ?1 AND f.ignored = 0
          GROUP BY p.id
          ORDER BY ts DESC, p.id DESC",
     )?;
-    let rows = stmt.query_map([cluster_id], |r| {
+    let rows = stmt.query_map([group], |r| {
         Ok(PhotoRow {
             id: r.get(0)?,
             status: r.get(1)?,
@@ -792,17 +784,17 @@ pub fn person_photos(conn: &Connection, cluster_id: i64) -> Result<Vec<PhotoRow>
 }
 
 /// (face_id, photo_id, ts, detector_score, embedding) for every face in a person's
-/// cluster — the input to the person-page "looks" (intra-identity sub-clustering).
+/// group — the input to the person-page "looks" (intra-identity sub-clustering).
 /// Ordered oldest-first so the look grouping is stable and reads chronologically.
-pub fn person_faces(conn: &Connection, cluster_id: i64) -> Result<Vec<(i64, i64, i64, f32, Vec<f32>)>> {
+pub fn person_faces(conn: &Connection, group: i64) -> Result<Vec<(i64, i64, i64, f32, Vec<f32>)>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.photo_id, COALESCE(p.taken_ts, p.mtime) AS ts, f.score, f.embedding
          FROM faces f
          JOIN photos p ON p.id = f.photo_id
-         WHERE f.cluster_id = ?1
+         WHERE COALESCE(-f.identity_id, f.cluster_id) = ?1 AND f.ignored = 0
          ORDER BY ts ASC, f.id ASC",
     )?;
-    let rows = stmt.query_map([cluster_id], |r| {
+    let rows = stmt.query_map([group], |r| {
         let blob: Vec<u8> = r.get(4)?;
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, decode_embedding(&blob)))
     })?;
@@ -812,12 +804,13 @@ pub fn person_faces(conn: &Connection, cluster_id: i64) -> Result<Vec<(i64, i64,
 // ---------------------------------------------------------------------------
 // Face corrections — the shared primitive behind reassign / ignore, acting on a
 // set of face ids. The person page and the in-photo overlay differ only in how
-// they pick that set. Every correction touches `identity_id` (the durable
-// must-link), never just `cluster_id`, so it survives the next re-cluster.
+// they pick that set. Corrections write ONLY the identity layer (identity_id /
+// confirmed / ignored) — never `cluster_id`, which belongs to the clustering
+// passes — so they survive every re-cluster by construction.
 // ---------------------------------------------------------------------------
 
 /// A face within one photo, for the in-photo overlay: its id, bounding box, and
-/// the person it currently belongs to (cluster id + name, if named). Ignored
+/// the person it currently belongs to (group key + name, if named). Ignored
 /// faces are omitted — we excluded them on purpose, so we don't redraw them.
 #[derive(serde::Serialize)]
 pub struct PhotoFace {
@@ -832,8 +825,8 @@ pub struct PhotoFace {
 
 pub fn faces_in_photo(conn: &Connection, photo_id: i64) -> Result<Vec<PhotoFace>> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.cluster_id,
-                (SELECT name FROM cluster_names cn WHERE cn.cluster_id = f.cluster_id),
+        "SELECT f.id, COALESCE(-f.identity_id, f.cluster_id),
+                (SELECT name FROM identities i WHERE i.id = f.identity_id),
                 f.x1, f.y1, f.x2, f.y2
          FROM faces f
          WHERE f.photo_id = ?1 AND f.ignored = 0
@@ -858,11 +851,11 @@ pub fn faces_in_photo(conn: &Connection, photo_id: i64) -> Result<Vec<PhotoFace>
 /// for it. `confirmed` must round-trip: corrections set it, so an undo that left
 /// it behind would promote a machine guess to a user-confirmed must-link (and
 /// anchor exemplar) under the restored identity — vouching forged by an action
-/// the user took back.
+/// the user took back. `cluster_id` is NOT captured: corrections never change the
+/// appearance layer, and restoring a pre-re-cluster id would corrupt it.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FaceState {
     pub face_id: i64,
-    pub cluster_id: Option<i64>,
     pub identity_id: Option<i64>,
     pub ignored: bool,
     #[serde(default)]
@@ -880,17 +873,16 @@ pub fn capture_face_states(conn: &Connection, face_ids: &[i64]) -> Result<Vec<Fa
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT id, cluster_id, identity_id, ignored, confirmed FROM faces WHERE id IN ({})",
+        "SELECT id, identity_id, ignored, confirmed FROM faces WHERE id IN ({})",
         placeholders(face_ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(face_ids.iter()), |r| {
         Ok(FaceState {
             face_id: r.get(0)?,
-            cluster_id: r.get(1)?,
-            identity_id: r.get(2)?,
-            ignored: r.get::<_, i64>(3)? != 0,
-            confirmed: r.get::<_, i64>(4)? != 0,
+            identity_id: r.get(1)?,
+            ignored: r.get::<_, i64>(2)? != 0,
+            confirmed: r.get::<_, i64>(3)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -901,11 +893,10 @@ pub fn restore_face_states(conn: &mut Connection, states: &[FaceState]) -> Resul
     let tx = conn.transaction()?;
     {
         let mut up = tx.prepare(
-            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = ?3, confirmed = ?4 WHERE id = ?5",
+            "UPDATE faces SET identity_id = ?1, ignored = ?2, confirmed = ?3 WHERE id = ?4",
         )?;
         for s in states {
             up.execute(rusqlite::params![
-                s.cluster_id,
                 s.identity_id,
                 s.ignored as i64,
                 s.confirmed as i64,
@@ -917,23 +908,23 @@ pub fn restore_face_states(conn: &mut Connection, states: &[FaceState]) -> Resul
     Ok(())
 }
 
-/// The face ids belonging to `cluster_id` within any of `photo_ids` — resolves a
+/// The face ids belonging to `group` within any of `photo_ids` — resolves a
 /// person-page multi-selection (one cell per photo) to the actual faces to act on.
 pub fn face_ids_in_photos_for_cluster(
     conn: &Connection,
     photo_ids: &[i64],
-    cluster_id: i64,
+    group: i64,
 ) -> Result<Vec<i64>> {
     if photo_ids.is_empty() {
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT id FROM faces WHERE cluster_id = ?1 AND photo_id IN ({})",
+        "SELECT id FROM faces WHERE {GROUP_EXPR} = ?1 AND ignored = 0 AND photo_id IN ({})",
         placeholders(photo_ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(photo_ids.len() + 1);
-    params.push(&cluster_id);
+    params.push(&group);
     for id in photo_ids {
         params.push(id);
     }
@@ -941,48 +932,37 @@ pub fn face_ids_in_photos_for_cluster(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Next free transient cluster id — for splitting faces off into a brand-new
-/// person before the next re-cluster re-numbers everything anyway.
-pub fn next_cluster_id(conn: &Connection) -> Result<i64> {
-    // MAX over an empty/all-NULL column yields a single NULL row, read as None.
-    let max: Option<i64> = conn.query_row("SELECT MAX(cluster_id) FROM faces", [], |r| r.get(0))?;
-    Ok(max.unwrap_or(0) + 1)
-}
-
-/// Move a set of faces onto a person: set their cluster and durable identity in
-/// one transaction (and clear any `ignored` flag). The identity binding is the
-/// must-link that makes the move survive re-clustering.
-pub fn set_faces_person(
-    conn: &mut Connection,
-    face_ids: &[i64],
-    cluster_id: i64,
-    identity_id: i64,
-) -> Result<()> {
+/// Move a set of faces onto a person: bind their durable identity and confirm
+/// them in one transaction (a deliberate move is a user label — sticky exemplar
+/// + must-link), clearing any `ignored` flag. The appearance `cluster_id` is
+/// untouched: display follows the identity.
+pub fn set_faces_person(conn: &mut Connection, face_ids: &[i64], identity_id: i64) -> Result<()> {
     if face_ids.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
     {
-        // A deliberate move is a user label: confirm it (sticky exemplar, must-link).
         let mut up = tx.prepare(
-            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = 0, confirmed = 1 WHERE id = ?3",
+            "UPDATE faces SET identity_id = ?1, ignored = 0, confirmed = 1 WHERE id = ?2",
         )?;
         for id in face_ids {
-            up.execute(rusqlite::params![cluster_id, identity_id, id])?;
+            up.execute(rusqlite::params![identity_id, id])?;
         }
     }
     tx.commit()?;
     Ok(())
 }
 
-/// Ignore a set of faces: drop them from People for good. Cluster and identity go
-/// NULL and `ignored` is set, so they leave every grouping and the overlay.
+/// Ignore a set of faces: drop them from People for good. The identity unbinds
+/// and `ignored` is set; the appearance `cluster_id` is deliberately KEPT so an
+/// undo restores the face to exactly its group (every group query filters
+/// `ignored = 0`, so the face still leaves every grouping and the overlay).
 pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> Result<()> {
     if face_ids.is_empty() {
         return Ok(());
     }
     let sql = format!(
-        "UPDATE faces SET cluster_id = NULL, identity_id = NULL, ignored = 1 WHERE id IN ({})",
+        "UPDATE faces SET identity_id = NULL, confirmed = 0, ignored = 1 WHERE id IN ({})",
         placeholders(face_ids.len())
     );
     conn.execute(&sql, rusqlite::params_from_iter(face_ids.iter()))?;
@@ -990,24 +970,19 @@ pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> Result<()> {
 }
 
 /// Detach faces from their person without saying who they are: clear the identity
-/// must-link and scatter each into its own fresh cluster (starting at `base_cluster`),
-/// so the next re-cluster re-homes each by appearance. Unlike `ignore_faces` they stay
-/// in the pool (cluster_id non-NULL), and unlike a new-person split they're not forced
-/// together. Backs "not this person / not <name>".
-pub fn detach_faces(conn: &mut Connection, face_ids: &[i64], base_cluster: i64) -> Result<()> {
+/// binding so each falls back to its appearance cluster, where the next self-heal
+/// pass re-homes it competitively. Unlike `ignore_faces` they stay in the pool,
+/// and unlike a new-person split they're not forced together. Backs "not this
+/// person / not <name>".
+pub fn detach_faces(conn: &Connection, face_ids: &[i64]) -> Result<()> {
     if face_ids.is_empty() {
         return Ok(());
     }
-    let tx = conn.transaction()?;
-    {
-        let mut up = tx.prepare(
-            "UPDATE faces SET cluster_id = ?1, identity_id = NULL, ignored = 0, confirmed = 0 WHERE id = ?2",
-        )?;
-        for (i, id) in face_ids.iter().enumerate() {
-            up.execute(rusqlite::params![base_cluster + i as i64, id])?;
-        }
-    }
-    tx.commit()?;
+    let sql = format!(
+        "UPDATE faces SET identity_id = NULL, ignored = 0, confirmed = 0 WHERE id IN ({})",
+        placeholders(face_ids.len())
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(face_ids.iter()))?;
     Ok(())
 }
 
@@ -1373,107 +1348,135 @@ mod tests {
             .unwrap()
     }
 
-    /// The Mía/Camila incident: merging a BIG cluster into a small one must not let
-    /// the big side's plurality hijack the small side's confirmed identity. The old
-    /// code re-derived the combined cluster's identity after the move and rebound
-    /// every face to it — Mía's own confirmed faces became "Camila" and Mía
-    /// vanished from the grid.
+    fn group_of_face(conn: &Connection, face: i64) -> Option<i64> {
+        conn.query_row(
+            &format!("SELECT {GROUP_EXPR} FROM faces WHERE id = ?1"),
+            [face],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn confirmed_of(conn: &Connection, face: i64) -> bool {
+        conn.query_row("SELECT confirmed FROM faces WHERE id = ?1", [face], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+            != 0
+    }
+
+    /// Display groups: identity faces show under the (stable, negative) identity
+    /// key; identity-less faces under their appearance cluster. One appearance
+    /// cluster holding two people's confirmed faces therefore renders as two
+    /// person tiles plus the unclaimed remainder — the Mía/Camila mixing class
+    /// is structurally impossible at the display layer.
     #[test]
-    fn merge_transfers_from_side_but_never_steals_other_confirmed() {
+    fn overview_groups_by_identity_then_cluster() {
+        let conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Mía'), (2, 'Camila');")
+            .unwrap();
+        insert_face(&conn, 1, 10, Some(1), true);
+        insert_face(&conn, 2, 10, Some(1), false); // tentative fold onto Mía
+        insert_face(&conn, 3, 10, Some(2), true); // Camila, same appearance cluster
+        insert_face(&conn, 4, 10, None, false); // unclaimed remainder
+        insert_face(&conn, 5, 20, None, false); // another pure cluster
+
+        let rows = clusters_overview(&conn).unwrap();
+        let find = |g: i64| rows.iter().find(|r| r.cluster_id == g);
+        let mia = find(-1).expect("Mía's group");
+        assert_eq!((mia.count, mia.name.as_deref()), (2, Some("Mía")));
+        let camila = find(-2).expect("Camila's group");
+        assert_eq!((camila.count, camila.name.as_deref()), (1, Some("Camila")));
+        assert_eq!(find(10).expect("remainder").count, 1);
+        assert_eq!(find(20).expect("pure cluster").count, 1);
+    }
+
+    /// merge_group_into_identity moves the from-group's own + tentative faces,
+    /// never another person's confirmed faces, never any cluster_id — and clears
+    /// the ghost name of a named identity it emptied.
+    #[test]
+    fn merge_transfers_group_and_clears_ghost_name() {
         let conn = test_conn();
         conn.execute_batch(
             "INSERT INTO identities (id, name) VALUES (1, 'Mía'), (2, 'Camila'), (3, 'Lianny');",
         )
         .unwrap();
-        // Mía: 2 confirmed faces in cluster 10. A stray confirmed Lianny face also
-        // sits in cluster 10 (transient states like this exist mid-correction).
-        insert_face(&conn, 1, 10, Some(1), true);
-        insert_face(&conn, 2, 10, Some(1), true);
-        insert_face(&conn, 8, 10, Some(3), true);
-        // Camila: 5 confirmed faces in cluster 20 (the bigger side), plus one
-        // tentative machine-labeled face.
+        insert_face(&conn, 1, 10, Some(1), true); // Mía
+        insert_face(&conn, 8, 10, Some(3), true); // Lianny, same appearance cluster
         for f in 3..=7 {
-            insert_face(&conn, f, 20, Some(2), true);
+            insert_face(&conn, f, 20, Some(2), true); // Camila confirmed
         }
-        insert_face(&conn, 9, 20, Some(2), false);
+        insert_face(&conn, 9, 20, Some(2), false); // tentative Camila
 
-        // Explicit user merge: fold Camila's cluster INTO Mía's.
-        merge_clusters(&conn, 10, 20).unwrap();
+        merge_group_into_identity(&conn, 1, -2).unwrap();
 
-        // Mía's confirmed faces keep HER identity (the old code flipped them to 2).
-        assert_eq!(identity_of_face(&conn, 1), Some(1));
-        assert_eq!(identity_of_face(&conn, 2), Some(1));
-        // The from-side faces transfer to Mía — that's what the merge means.
         for f in [3, 4, 5, 6, 7, 9] {
             assert_eq!(identity_of_face(&conn, f), Some(1), "face {f} should now be Mía");
         }
-        // The stray confirmed Lianny face is untouched — never stolen by a merge.
-        assert_eq!(identity_of_face(&conn, 8), Some(3));
+        assert_eq!(identity_of_face(&conn, 8), Some(3), "Lianny never stolen");
+        // cluster_id untouched everywhere (appearance layer is sacred).
+        let c: i64 = conn
+            .query_row("SELECT cluster_id FROM faces WHERE id = 3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(c, 20);
+        // Camila's identity emptied → her ghost name is cleared so merge-by-name
+        // can't resurrect her.
+        let name: Option<String> = conn
+            .query_row("SELECT name FROM identities WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, None);
+        assert_eq!(group_for_name(&conn, "Camila").unwrap(), None);
     }
 
-    /// ensure_identity_for_cluster must bind unclaimed/tentative faces without
-    /// re-stamping faces the user confirmed under a different identity.
+    /// ensure_identity_for_group: a negative key passes through; a positive key
+    /// mints a fresh identity and binds only the group's (identity-less) faces.
     #[test]
-    fn ensure_identity_leaves_foreign_confirmed_faces_alone() {
+    fn ensure_identity_for_groups() {
         let conn = test_conn();
-        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
-            .unwrap();
-        insert_face(&conn, 1, 10, Some(1), true); // Omar, confirmed (plurality)
-        insert_face(&conn, 2, 10, Some(1), true);
-        insert_face(&conn, 6, 10, Some(1), true);
-        insert_face(&conn, 3, 10, None, false); // unclaimed
-        insert_face(&conn, 4, 10, Some(2), true); // Kevin, confirmed — must survive
-        insert_face(&conn, 5, 10, Some(2), false); // tentative Kevin — rebindable
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar');").unwrap();
+        insert_face(&conn, 1, 10, Some(1), true);
+        insert_face(&conn, 2, 10, None, false); // remainder of the same cluster
 
-        let id = ensure_identity_for_cluster(&conn, 10).unwrap();
-        assert_eq!(id, 1, "plurality identity is reused, no duplicate minted");
-        assert_eq!(identity_of_face(&conn, 3), Some(1));
-        assert_eq!(identity_of_face(&conn, 5), Some(1));
-        assert_eq!(identity_of_face(&conn, 4), Some(2), "confirmed Kevin face stolen");
+        assert_eq!(ensure_identity_for_group(&conn, -1).unwrap(), 1);
+        let minted = ensure_identity_for_group(&conn, 10).unwrap();
+        assert_ne!(minted, 1, "a positive group mints a fresh identity");
+        assert_eq!(identity_of_face(&conn, 2), Some(minted));
+        assert_eq!(group_of_face(&conn, 2), Some(-minted), "tile moves to the stable key");
+        assert_eq!(identity_of_face(&conn, 1), Some(1), "Omar's face untouched");
     }
 
-    /// cluster_has_foreign_confirmed: the absorb-path guard.
+    /// group_is_other_named_person: only a named identity with confirmed evidence
+    /// blocks; positive groups and unnamed competitors never do.
     #[test]
-    fn foreign_confirmed_detection() {
+    fn other_named_person_guard() {
         let conn = test_conn();
-        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, NULL);")
             .unwrap();
-        insert_face(&conn, 1, 10, Some(2), true);
-        insert_face(&conn, 2, 20, Some(1), true);
-        insert_face(&conn, 3, 30, None, false);
-        // Cluster 10 holds Kevin-confirmed: foreign to Omar (1) and to "no identity".
-        assert!(cluster_has_foreign_confirmed(&conn, 10, Some(1)).unwrap());
-        assert!(cluster_has_foreign_confirmed(&conn, 10, None).unwrap());
-        assert!(!cluster_has_foreign_confirmed(&conn, 10, Some(2)).unwrap());
-        // Cluster 30 has no confirmed faces at all.
-        assert!(!cluster_has_foreign_confirmed(&conn, 30, Some(1)).unwrap());
+        insert_face(&conn, 1, 10, Some(1), true); // Omar, confirmed
+        insert_face(&conn, 2, 20, Some(2), true); // unnamed competitor, confirmed
+        insert_face(&conn, 3, 30, None, false); // pure cluster
+
+        assert!(group_is_other_named_person(&conn, -1, Some(2)).unwrap());
+        assert!(group_is_other_named_person(&conn, -1, None).unwrap());
+        assert!(!group_is_other_named_person(&conn, -1, Some(1)).unwrap(), "own identity");
+        assert!(!group_is_other_named_person(&conn, -2, Some(1)).unwrap(), "unnamed competitor");
+        assert!(!group_is_other_named_person(&conn, 30, Some(1)).unwrap(), "pure cluster");
     }
 
     /// Undo must restore `confirmed` exactly. An auto-folded face (confirmed = 0)
     /// moved by the user (which confirms it) and then un-done must return to
     /// UNCONFIRMED under its old identity — leaving confirmed = 1 behind would
-    /// mint a bogus user-vouched exemplar for the old identity out of an action
-    /// the user reverted (and the reverse: undoing a detach must re-vouch).
+    /// mint a bogus user-vouched exemplar out of an action the user took back.
     #[test]
     fn undo_restores_confirmed_flag() {
         let mut conn = test_conn();
         conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
             .unwrap();
-        // Face 1: tentatively auto-folded to Omar. Face 2: user-confirmed Omar.
-        insert_face(&conn, 1, 10, Some(1), false);
-        insert_face(&conn, 2, 10, Some(1), true);
+        insert_face(&conn, 1, 10, Some(1), false); // tentative fold onto Omar
+        insert_face(&conn, 2, 10, Some(1), true); // user-confirmed Omar
         let prior = capture_face_states(&conn, &[1, 2]).unwrap();
 
-        // Move both to Kevin (a user label — sets confirmed = 1 on both), then
-        // detach face 2 style-check: set_faces_person is the confirming path.
-        set_faces_person(&mut conn, &[1, 2], 20, 2).unwrap();
-        let confirmed_of = |conn: &Connection, id: i64| -> bool {
-            conn.query_row("SELECT confirmed FROM faces WHERE id = ?1", [id], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap()
-                != 0
-        };
+        set_faces_person(&mut conn, &[1, 2], 2).unwrap();
         assert!(confirmed_of(&conn, 1) && confirmed_of(&conn, 2));
 
         restore_face_states(&mut conn, &prior).unwrap();
@@ -1483,14 +1486,35 @@ mod tests {
         assert!(confirmed_of(&conn, 2), "user-vouched face must stay confirmed");
     }
 
+    /// Detach returns a face to its appearance cluster; ignore hides it from every
+    /// group query while keeping cluster_id, so an undo restores it exactly.
+    #[test]
+    fn detach_and_ignore_preserve_appearance() {
+        let mut conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar');").unwrap();
+        insert_face(&conn, 1, 10, Some(1), true);
+
+        detach_faces(&conn, &[1]).unwrap();
+        assert_eq!(identity_of_face(&conn, 1), None);
+        assert_eq!(group_of_face(&conn, 1), Some(10), "falls back to its appearance cluster");
+
+        let prior = capture_face_states(&conn, &[1]).unwrap();
+        ignore_faces(&conn, &[1]).unwrap();
+        assert!(clusters_overview(&conn).unwrap().iter().all(|r| r.cluster_id != 10));
+        assert!(top_face_ids(&conn, 10, 5).unwrap().is_empty());
+
+        restore_face_states(&mut conn, &prior).unwrap();
+        assert_eq!(group_of_face(&conn, 1), Some(10));
+        assert_eq!(top_face_ids(&conn, 10, 5).unwrap(), vec![1]);
+    }
+
     /// The same-photo exception round-trip: the pairs the rule blocks are exactly
     /// the ones a "same person (collage)" answer whitelists.
     #[test]
     fn same_photo_exception_roundtrip() {
         let conn = test_conn();
-        // Photo 9 holds face 1 (cluster 10) and face 2 (cluster 20) — a collage
-        // split. Photo 8 holds an unrelated pair in the same clusters.
-        conn.execute("UPDATE faces SET photo_id = photo_id", []).unwrap(); // no-op guard
+        // Photo 9 holds face 1 (group 10) and face 2 (group 20) — a collage
+        // split. Photos 8/7 hold an unrelated face in each group.
         conn.execute(
             "INSERT INTO faces (id, photo_id, x1, y1, x2, y2, score, embedding, cluster_id)
              VALUES (1, 9, 0,0,1,1, 0.9, x'00', 10), (2, 9, 2,2,3,3, 0.9, x'00', 20),

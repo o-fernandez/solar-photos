@@ -156,8 +156,8 @@ pub const LOOK_FLAG_MARGIN: f32 = 0.08; // …and beat its match to *this* perso
 /// sub-clusters to filter by, and — where a look matches a different confirmed person
 /// better than this one — a one-click "move the batch" repair. Empty (no strip) unless
 /// there are at least two looks worth showing.
-pub fn person_looks(conn: &Connection, cluster_id: i64) -> Result<Vec<PersonLook>, String> {
-    let faces = db::person_faces(conn, cluster_id).map_err(|e| e.to_string())?;
+pub fn person_looks(conn: &Connection, group: i64) -> Result<Vec<PersonLook>, String> {
+    let faces = db::person_faces(conn, group).map_err(|e| e.to_string())?;
     if faces.len() < 16 {
         return Ok(Vec::new());
     }
@@ -168,9 +168,9 @@ pub fn person_looks(conn: &Connection, cluster_id: i64) -> Result<Vec<PersonLook
     // transitively and collapses the strip to a single suppressed blob.
     let groups = cluster::group_looks(&embs, LOOK_TAU);
 
-    // This person's own reference: their anchor if named (robust to a little pollution),
-    // else the dominant look's centroid.
-    let own_identity = db::identity_of_cluster(&conn, cluster_id).ok().flatten();
+    // This person's own reference: their anchor if they're an identity (robust to
+    // a little pollution), else the dominant look's centroid.
+    let own_identity = if group < 0 { Some(-group) } else { None };
     let centroids: Vec<Vec<f32>> = groups
         .iter()
         .map(|g| mean_normalized(&g.iter().map(|&i| embs[i].clone()).collect::<Vec<_>>()))
@@ -213,10 +213,8 @@ pub fn person_looks(conn: &Connection, cluster_id: i64) -> Result<Vec<PersonLook
         if a.len() < MIN_ANCHOR {
             continue;
         }
-        let cl = db::clusters_of_identity(&conn, id).map_err(|e| e.to_string())?.into_iter().next();
-        if let Some(cl) = cl {
-            others.push(Other { name, cluster: cl, anchor: mean_normalized(&anchor_core(a)) });
-        }
+        // The move target is the identity's own (stable) group key.
+        others.push(Other { name, cluster: -id, anchor: mean_normalized(&anchor_core(a)) });
     }
 
     let mut looks: Vec<PersonLook> = Vec::new();
@@ -370,10 +368,16 @@ pub fn compute_merge_suggestions(
             let (ca, cb) = (info[&e.a], info[&e.b]);
             if ca.count >= cb.count { (ca, cb) } else { (cb, ca) }
         };
+        // Merging two *named* people is only ever the explicit rename/typeahead
+        // path — a one-keypress card that folds Kevin into Omar (and orphans a
+        // name) must never be generated.
+        if big.name.is_some() && small.name.is_some() {
+            continue;
+        }
         // Skip a pair the user has already declared "not the same".
         if let (Ok(Some(ia)), Ok(Some(ib))) = (
-            db::identity_of_cluster(conn, big.cluster_id),
-            db::identity_of_cluster(conn, small.cluster_id),
+            db::identity_of_group(conn, big.cluster_id),
+            db::identity_of_group(conn, small.cluster_id),
         ) {
             let key = if ia < ib { (ia, ib) } else { (ib, ia) };
             if blocked.contains(&key) {
@@ -387,8 +391,8 @@ pub fn compute_merge_suggestions(
                 // A pair whose "same person" answer would be refused (the fragment
                 // belongs to another *named* person) must never become a card — an
                 // unanswerable question is a stuck one.
-                let into_ident = db::identity_of_cluster(conn, big.cluster_id)?;
-                if db::cluster_has_named_foreign_confirmed(conn, small.cluster_id, into_ident)? {
+                let into_ident = db::identity_of_group(conn, big.cluster_id)?;
+                if db::group_is_other_named_person(conn, small.cluster_id, into_ident)? {
                     continue;
                 }
                 if let Ok(pairs) = db::cooccurring_face_pairs(conn, big.cluster_id, small.cluster_id)
@@ -538,7 +542,7 @@ pub struct ReviewQueue {
 pub struct IdentityGrowth {
     pub identity_id: i64,
     pub name: String,
-    /// The cluster everything folds into (the identity's largest current cluster).
+    /// The group everything folds into: the identity's own stable group key.
     pub into: i64,
     /// Example faces of the confirmed person, for the card.
     pub anchor_faces: Vec<i64>,
@@ -593,19 +597,9 @@ pub fn compute_identity_growth(
         return Ok((Vec::new(), Vec::new()));
     }
     let all_faces = db::face_cluster_embeddings(conn)?;
-    let blocked: std::collections::HashSet<(i64, i64)> =
-        db::cannot_link_pairs(conn)?.into_iter().collect();
-    // How well every cluster matches each confirmed identity (incl. "not X" splits) —
-    // so we don't suggest a cluster that's decisively someone else's.
+    // How well every candidate matches each confirmed identity (incl. "not X"
+    // splits) — so we don't suggest a group that's decisively someone else's.
     let matches = cluster_identity_matches(conn)?;
-    // Clusters holding anyone's *confirmed* faces are never growth candidates. An
-    // identity's own clusters are already excluded below, so anything left in this
-    // set belongs to a different person (or a "not X" competitor) — offering it as
-    // a bulk merge is how Camila's whole cluster once became "5 strong matches for
-    // Mía" and got absorbed. Merging two named people stays possible, but only via
-    // the explicit rename/typeahead path, never a one-click suggestion.
-    let confirmed_clusters: std::collections::HashSet<i64> =
-        db::confirmed_clusters(conn)?.into_iter().collect();
     // Co-occurrence veto for candidates (see auto_fold_confident).
     let (cluster_photos, identity_photos) = cooccurrence_maps(conn)?;
 
@@ -629,17 +623,12 @@ pub fn compute_identity_growth(
         }
         // Match against the anchor's dominant core, not a possibly-polluted full set.
         let core = anchor_core(anchor);
-        // The clusters this identity already occupies are excluded from the search;
-        // the largest is the fold-in target.
-        let own: Vec<i64> = db::clusters_of_identity(conn, identity_id)?;
-        let into = match own.first() {
-            Some(&c) => c,
-            None => continue,
-        };
-        let own_set: std::collections::HashSet<i64> = own.iter().cloned().collect();
+        // The fold-in target is the identity's own (stable) group key; its own
+        // faces are excluded from the candidate search by that same key.
+        let into = -identity_id;
         let others: Vec<(i64, i64, Vec<f32>)> = all_faces
             .iter()
-            .filter(|(_, c, _)| !own_set.contains(c))
+            .filter(|(_, g, _)| *g != into)
             .cloned()
             .collect();
 
@@ -648,17 +637,15 @@ pub fn compute_identity_growth(
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
         let mut candidates = Vec::new();
         for c in cands {
-            if confirmed_clusters.contains(&c.cluster_id) {
-                continue; // someone's confirmed group — never offered for absorption
+            // A negative group IS a person (or a "not X" competitor): identities
+            // merge only by explicit user action, never via a growth card. This
+            // also subsumes the old cannot-link check — a rejected group is a
+            // confirmed competitor, i.e. a negative group, and lands here.
+            if c.cluster_id < 0 {
+                continue;
             }
             if cooccurs(&cluster_photos, c.cluster_id, &identity_photos, identity_id) {
                 continue; // photographed together — cannot be this person
-            }
-            if let Ok(Some(other_id)) = db::identity_of_cluster(conn, c.cluster_id) {
-                let key = if identity_id < other_id { (identity_id, other_id) } else { (other_id, identity_id) };
-                if blocked.contains(&key) {
-                    continue;
-                }
             }
             // Competitive: skip a cluster a confirmed competitor matches decisively
             // better — it's someone else's, so don't keep offering it as this person.
@@ -779,49 +766,6 @@ pub fn compute_identity_growth(
         });
     }
     Ok((out, who))
-}
-
-/// Rewrite `assignments` (face → fresh cluster id) so every face sharing an
-/// `identity_id` lands in one cluster. Union-find over the new cluster ids: faces
-/// of the same identity union their clusters, then every face is remapped to its
-/// component root. Identities are disjoint, so this only ever *joins* groups the
-/// user confirmed — it never splits or crosses people.
-pub fn apply_must_links(face_identity: &[(i64, i64)], assignments: &mut [(i64, i64)]) {
-    use std::collections::HashMap;
-    let face_to_cluster: HashMap<i64, i64> = assignments.iter().cloned().collect();
-    let mut parent: HashMap<i64, i64> = HashMap::new();
-    fn find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
-        let mut r = x;
-        while let Some(&p) = parent.get(&r) {
-            if p == r {
-                break;
-            }
-            r = p;
-        }
-        r
-    }
-    let mut ident_first: HashMap<i64, i64> = HashMap::new();
-    for (face, ident) in face_identity {
-        let Some(&c) = face_to_cluster.get(face) else { continue };
-        parent.entry(c).or_insert(c);
-        match ident_first.get(ident) {
-            None => {
-                ident_first.insert(*ident, c);
-            }
-            Some(&first) => {
-                let (ra, rb) = (find(&mut parent, first), find(&mut parent, c));
-                if ra != rb {
-                    parent.insert(ra, rb);
-                }
-            }
-        }
-    }
-    if parent.is_empty() {
-        return;
-    }
-    for a in assignments.iter_mut() {
-        a.1 = find(&mut parent, a.1);
-    }
 }
 
 /// Normalize every engine's suggestions into the single payoff-sorted review queue
@@ -949,7 +893,7 @@ pub fn anchor_core(embs: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
 pub fn cluster_identity_matches(
     conn: &Connection,
 ) -> anyhow::Result<std::collections::HashMap<i64, Vec<(i64, f32)>>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     let all_faces = db::face_cluster_embeddings(conn)?;
     let mut per_cluster: HashMap<i64, Vec<(i64, f32)>> = HashMap::new();
     for identity_id in db::confirmed_identity_ids(conn)? {
@@ -958,10 +902,11 @@ pub fn cluster_identity_matches(
             continue; // no confirmed evidence to compete with
         }
         let core = anchor_core(anchor);
-        let own: HashSet<i64> =
-            db::clusters_of_identity(conn, identity_id)?.into_iter().collect();
-        let others: Vec<(i64, i64, Vec<f32>)> =
-            all_faces.iter().filter(|(_, c, _)| !own.contains(c)).cloned().collect();
+        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
+            .iter()
+            .filter(|(_, g, _)| *g != -identity_id)
+            .cloned()
+            .collect();
         for c in cluster::identity_candidates(&core, &others) {
             per_cluster.entry(c.cluster_id).or_default().push((identity_id, c.max_sim));
         }
@@ -985,11 +930,11 @@ pub fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
     // Wipe the machine's previous tentative labels and re-derive them from scratch —
     // competitively — against the *confirmed* exemplars. This is what makes a wrong fold
     // self-correcting: nothing auto is welded on, so every pass reconsiders it against
-    // whatever people (and "not X" competitors) you've since confirmed.
+    // whatever people (and "not X" competitors) you've since confirmed. Because a fold
+    // writes only `identity_id` — never `cluster_id` — this whole pass is a cheap
+    // re-derive: no clusters have to be un-merged, no re-cluster has to run.
     db::clear_unconfirmed_identities(conn)?;
 
-    // A person's own cluster (holds their confirmed faces) is never a fold target.
-    let confirmed_clusters: HashSet<i64> = db::confirmed_clusters(conn)?.into_iter().collect();
     // Only identities with enough confirmed evidence may *claim* a cluster; a thin
     // competitor can still win the ranking (and thereby push a face off someone else)
     // but can't silently absorb it — that face just stays unassigned for review.
@@ -1003,11 +948,11 @@ pub fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
     // Assign each candidate to the identity it matches *decisively* best: the top match
     // must clear AUTO_FOLD_MIN and beat the runner-up by AUTO_FOLD_MARGIN. A near-tie
     // (two babies both plausible) is ambiguous — left unassigned for the review path,
-    // never guessed. Confirmed people-clusters are never folded away.
+    // never guessed.
     let mut folded = 0usize;
     for (cid, m) in matches {
-        if confirmed_clusters.contains(&cid) {
-            continue;
+        if cid < 0 {
+            continue; // a person / competitor group — never folded away automatically
         }
         let (best_id, best_sim) = m[0];
         if best_sim < AUTO_FOLD_MIN {
@@ -1022,12 +967,7 @@ pub fn auto_fold_confident(conn: &Connection) -> anyhow::Result<usize> {
         if cooccurs(&cluster_photos, cid, &identity_photos, best_id) {
             continue; // photographed together — two people, never fold
         }
-        let into = match db::clusters_of_identity(conn, best_id)?.first() {
-            Some(&c) => c,
-            None => continue,
-        };
-        if cid != into {
-            db::merge_clusters(conn, into, cid)?;
+        if db::assign_cluster_to_identity(conn, cid, best_id)? > 0 {
             folded += 1;
         }
     }
@@ -1095,7 +1035,8 @@ mod tests {
 
     /// Omar (4 confirmed exemplars) decisively matches a free look-alike cluster:
     /// auto-fold must absorb it — tentatively (confirmed stays 0, so the next pass
-    /// can still re-decide it).
+    /// can still re-decide it) and WITHOUT touching the appearance layer (nothing
+    /// ever needs un-merging).
     #[test]
     fn auto_fold_absorbs_decisive_match() {
         let conn = test_conn();
@@ -1111,13 +1052,71 @@ mod tests {
         let folded = auto_fold_confident(&conn).unwrap();
         assert_eq!(folded, 1, "the free cluster should fold into Omar");
         for f in 11..14 {
-            assert_eq!(cluster_of_face(&conn, f), Some(1));
-            assert_eq!(identity_of_face(&conn, f), Some(1));
+            assert_eq!(identity_of_face(&conn, f), Some(1), "displays under Omar");
+            assert_eq!(cluster_of_face(&conn, f), Some(2), "appearance cluster untouched");
             let confirmed: i64 = conn
                 .query_row("SELECT confirmed FROM faces WHERE id = ?1", [f], |r| r.get(0))
                 .unwrap();
             assert_eq!(confirmed, 0, "auto-folds are tentative, never welded on");
         }
+    }
+
+    /// The self-heal promise, with no re-cluster anywhere: a cluster tentatively
+    /// folded onto Omar is re-decided — and ejected to Kevin — the moment Kevin's
+    /// confirmed anchor matches it decisively better. Appearance ids never move.
+    #[test]
+    fn refold_ejects_wrong_tentative_fold() {
+        // A face part-way between Omar (axis 0) and a distinct axis-7 component:
+        // ~0.65 to Omar (foldable when unopposed), ~1.0 to its own kind.
+        fn mix(k: usize) -> Vec<f32> {
+            let mut v = vec![0.0f32; 16];
+            v[0] = 0.65;
+            v[7] = 0.76;
+            v[1 + k] += 0.02 * (k as f32 + 1.0);
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / n).collect()
+        }
+        let conn = test_conn();
+        conn.execute("INSERT INTO identities (id, name) VALUES (1, 'Omar')", []).unwrap();
+        for k in 0..4 {
+            add_photo(&conn, 1 + k as i64);
+            add_face(&conn, 1 + k as i64, 1 + k as i64, 1, Some(1), true, &near(0, k));
+        }
+        for k in 0..3 {
+            add_photo(&conn, 11 + k as i64);
+            add_face(&conn, 11 + k as i64, 11 + k as i64, 2, None, false, &mix(k));
+        }
+        auto_fold_confident(&conn).unwrap();
+        assert_eq!(identity_of_face(&conn, 11), Some(1), "unopposed, the fold goes to Omar");
+
+        // Kevin arrives: 4 confirmed faces of the candidate's own kind.
+        conn.execute("INSERT INTO identities (id, name) VALUES (2, 'Kevin')", []).unwrap();
+        for k in 0..4 {
+            add_photo(&conn, 21 + k as i64);
+            add_face(&conn, 21 + k as i64, 21 + k as i64, 3, Some(2), true, &mix(k));
+        }
+        auto_fold_confident(&conn).unwrap();
+        for f in 11..14 {
+            assert_eq!(identity_of_face(&conn, f), Some(2), "re-decided: ejected to Kevin");
+            assert_eq!(cluster_of_face(&conn, f), Some(2), "appearance cluster untouched");
+        }
+    }
+
+    /// The display invariant behind retiring most of the generation machinery: a
+    /// full re-cluster may renumber every appearance id, but a person's group is
+    /// keyed by their durable identity and survives verbatim.
+    #[test]
+    fn identity_groups_survive_appearance_renumbering() {
+        let mut conn = test_conn();
+        conn.execute("INSERT INTO identities (id, name) VALUES (1, 'Omar')", []).unwrap();
+        for k in 0..3 {
+            add_photo(&conn, 1 + k as i64);
+            add_face(&conn, 1 + k as i64, 1 + k as i64, 5, Some(1), true, &near(0, k));
+        }
+        db::set_face_clusters(&mut conn, &[(1, 99), (2, 99), (3, 42)]).unwrap();
+        let rows = db::clusters_overview(&conn).unwrap();
+        let omar = rows.iter().find(|r| r.cluster_id == -1).expect("Omar's stable group");
+        assert_eq!((omar.count, omar.name.as_deref()), (3, Some("Omar")));
     }
 
     /// Two confirmed people with (synthetically) identical anchors both match the
@@ -1155,6 +1154,7 @@ mod tests {
         }
         let folded = auto_fold_confident(&conn).unwrap();
         assert_eq!(folded, 0, "a thin competitor must not vacuum up a cluster");
+        assert_eq!(identity_of_face(&conn, 11), None);
         assert_eq!(cluster_of_face(&conn, 11), Some(2));
     }
 
@@ -1174,6 +1174,7 @@ mod tests {
         add_face(&conn, 12, 12, 2, None, false, &near(0, 6));
         let folded = auto_fold_confident(&conn).unwrap();
         assert_eq!(folded, 0, "a co-occurring cluster must never fold in");
+        assert_eq!(identity_of_face(&conn, 11), None);
         assert_eq!(cluster_of_face(&conn, 11), Some(2));
     }
 
@@ -1274,14 +1275,4 @@ mod tests {
         assert!(core.iter().all(|e| e[0] > 0.9), "the outlier must be dropped");
     }
 
-    /// Must-links: every face confirmed under one identity lands in one cluster,
-    /// however the unsupervised pass split them; unrelated faces are untouched.
-    #[test]
-    fn must_links_unify_a_confirmed_identity() {
-        let face_identity = vec![(1i64, 7i64), (2, 7)];
-        let mut assignments = vec![(1i64, 10i64), (2, 20), (3, 30)];
-        apply_must_links(&face_identity, &mut assignments);
-        assert_eq!(assignments[0].1, assignments[1].1, "identity 7's faces must co-cluster");
-        assert_eq!(assignments[2].1, 30, "unrelated faces keep their cluster");
-    }
 }

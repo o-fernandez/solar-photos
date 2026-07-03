@@ -36,9 +36,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use db::Job;
 use thumbs::ThumbQueue;
 use recognition::{
-    apply_must_links, auto_fold_confident, build_review_queue, compute_identity_growth,
-    compute_merge_suggestions, photo_constraints, IdentityGrowth, MergeSuggestion, PersonLook,
-    ReviewItem, ReviewQueue,
+    auto_fold_confident, build_review_queue, compute_identity_growth, compute_merge_suggestions,
+    photo_constraints, IdentityGrowth, MergeSuggestion, PersonLook, ReviewItem, ReviewQueue,
 };
 
 /// How many concurrent cloud downloads we allow. Bounded so a slow network
@@ -68,26 +67,29 @@ struct AppState {
     /// Guards against two re-clusters running at once (migration + manual + sweep).
     reclustering: Arc<AtomicBool>,
     /// Set when a re-cluster is requested while one is already running, so the request
-    /// isn't dropped — the running pass re-runs once on finish (e.g. naming several
-    /// people in a row each needs its fold applied).
+    /// isn't dropped — the running pass re-runs once on finish.
     recluster_pending: Arc<AtomicBool>,
-    /// Monotonic clustering generation: bumped whenever a pass rewrites clusters
-    /// (re-cluster or auto-fold). Cluster ids are ephemeral — a re-cluster renumbers
-    /// them all — so suggestion payloads carry the generation they were computed at,
-    /// and suggestion-driven mutations verify it (see `ensure_generation`).
+    /// Set when a self-heal fold is requested while a fold/re-cluster is already
+    /// running, so the correction that requested it still gets its re-derive.
+    fold_pending: Arc<AtomicBool>,
+    /// Monotonic clustering generation: bumped ONLY when a full re-cluster renumbers
+    /// the positive (appearance) group keys. Identity groups (negative keys) are
+    /// durable and never invalidated, and fold passes move no ids at all — so
+    /// suggestion payloads carry the generation they were computed at, and mutations
+    /// verify it (see `ensure_generation`) against genuinely rare renumbering.
     cluster_gen: Arc<AtomicI64>,
     /// People suggestions computed at the end of the last clustering pass (see
     /// `refresh_suggestion_cache`). The get_* commands read this instantly instead of
     /// recomputing full-library passes per tab-open while holding the DB lock.
     suggestion_cache: Arc<Mutex<SuggestionCache>>,
-    /// Debounce token for `schedule_recluster`: only the newest pending request fires.
+    /// Debounce token for `schedule_refold`: only the newest pending request fires.
     recluster_epoch: Arc<AtomicU64>,
     /// True while a focus-review session is open. The debounced self-heal pass is
-    /// held during a session — it renumbers cluster ids and would invalidate the
-    /// remaining cards mid-answer; answers apply instantly either way.
+    /// held during a session — it re-derives tentative folds, which would change the
+    /// remaining cards' contents mid-answer; answers apply instantly either way.
     review_active: Arc<AtomicBool>,
-    /// Set when a due re-cluster was held by an active review session, so it runs
-    /// as soon as the session ends.
+    /// Set when a due self-heal pass was held by an active review session, so it
+    /// runs as soon as the session ends.
     recluster_deferred: Arc<AtomicBool>,
 }
 
@@ -461,18 +463,18 @@ fn name_cluster(
     cluster_id: i64,
     name: String,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     ensure_generation(&state, expected_generation)?;
-    {
+    let group = {
         let conn = state.conn.lock().unwrap();
-        db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
-    }
-    // Confirming a person adds an exemplar, which can re-home other people's
-    // wrongly-folded look-alikes — so re-cluster + re-fold competitively (self-heal).
+        db::name_group(&conn, cluster_id, &name).map_err(|e| e.to_string())?
+    };
+    // Confirming a person adds exemplars, which can re-home other people's
+    // wrongly-folded look-alikes — so re-derive the folds competitively (self-heal).
     if !name.trim().is_empty() {
-        schedule_recluster(app);
+        schedule_refold(app);
     }
-    Ok(())
+    Ok(group)
 }
 
 #[tauri::command]
@@ -486,20 +488,28 @@ fn merge_clusters(
     ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
-        // A user merge vouches for BOTH sides as one person — confirm both (sticky
-        // exemplars + must-links). Confirming only `from` let the next re-cluster
-        // split an unnamed `into`'s free faces right back off, and the same "same
-        // person?" card returned — the "didn't my answer register?" bug.
+        // If exactly one side carries a name, that side survives — folding a named
+        // person INTO an unnamed pile would silently un-name them.
+        let (into, from) = if db::group_name(&conn, from).map_err(|e| e.to_string())?.is_some()
+            && db::group_name(&conn, into).map_err(|e| e.to_string())?.is_none()
+        {
+            (from, into)
+        } else {
+            (into, from)
+        };
+        // A user merge vouches for BOTH sides as one person — everything under the
+        // surviving identity is confirmed (sticky exemplars + must-links) after the
+        // fold. Confirming only one side let the next pass split the other right
+        // back off, and the same "same person?" card returned — the "didn't my
+        // answer register?" bug.
         let into_identity =
-            db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
-        let from_identity = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, into, Some(into_identity)).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, from, from_identity).map_err(|e| e.to_string())?;
-        db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+            db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
+        db::merge_group_into_identity(&conn, into_identity, from).map_err(|e| e.to_string())?;
+        db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
     }
     prune_suggestion_cache(&state, &[into, from]);
-    // The merge added exemplars — re-cluster + re-fold competitively (self-heal).
-    schedule_recluster(app);
+    // The merge added exemplars — re-derive the folds competitively (self-heal).
+    schedule_refold(app);
     Ok(())
 }
 
@@ -585,9 +595,11 @@ fn reassign_faces_to_cluster(
     let mut conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     // Both sides become durable identities; record "not the same" between them.
-    let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
-    let target_id = db::ensure_identity_for_cluster(&conn, target_cluster_id).map_err(|e| e.to_string())?;
-    db::set_faces_person(&mut conn, &face_ids, target_cluster_id, target_id).map_err(|e| e.to_string())?;
+    let source_id =
+        db::ensure_identity_for_group(&conn, source_cluster_id).map_err(|e| e.to_string())?;
+    let target_id =
+        db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
+    db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
     let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
     Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added })
 }
@@ -605,30 +617,31 @@ fn reassign_faces_to_new_person(
     ensure_generation(&state, expected_generation)?;
     let mut conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-    let source_id = db::ensure_identity_for_cluster(&conn, source_cluster_id).map_err(|e| e.to_string())?;
+    let source_id =
+        db::ensure_identity_for_group(&conn, source_cluster_id).map_err(|e| e.to_string())?;
     // If the typed name is already a person, merge into them instead of minting a
     // duplicate — moving "this is someone else: Mía" twice shouldn't make two Mías.
     let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(nm) = trimmed {
-        if let Some(target) = db::cluster_for_name(&conn, nm).map_err(|e| e.to_string())? {
+        if let Some(target) = db::group_for_name(&conn, nm).map_err(|e| e.to_string())? {
             if target != source_cluster_id {
-                let target_id = db::ensure_identity_for_cluster(&conn, target).map_err(|e| e.to_string())?;
-                db::set_faces_person(&mut conn, &face_ids, target, target_id).map_err(|e| e.to_string())?;
+                let target_id =
+                    db::ensure_identity_for_group(&conn, target).map_err(|e| e.to_string())?;
+                db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
                 let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
                 return Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added });
             }
         }
     }
-    let new_cluster = db::next_cluster_id(&conn).map_err(|e| e.to_string())?;
-    // Mint the identity on the (empty) new cluster, then bind the faces to both —
-    // so the split person is a durable identity that survives the next re-cluster.
-    let new_id = db::ensure_identity_for_cluster(&conn, new_cluster).map_err(|e| e.to_string())?;
-    db::set_faces_person(&mut conn, &face_ids, new_cluster, new_id).map_err(|e| e.to_string())?;
+    // Mint the durable identity for the split person and bind the faces to it —
+    // the new tile lives under the identity's stable (negative) group key.
+    let new_id = db::new_identity(&conn).map_err(|e| e.to_string())?;
+    db::set_faces_person(&mut conn, &face_ids, new_id).map_err(|e| e.to_string())?;
     if let Some(nm) = trimmed {
-        db::name_cluster(&conn, new_cluster, nm).map_err(|e| e.to_string())?;
+        let _ = db::name_group(&conn, -new_id, nm).map_err(|e| e.to_string())?;
     }
     let added = record_cannot_link_if_new(&conn, source_id, new_id).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo { prior, new_cluster_id: Some(new_cluster), added_cannot_link: added })
+    Ok(CorrectionUndo { prior, new_cluster_id: Some(-new_id), added_cannot_link: added })
 }
 
 /// Every face in a cluster (face ids, best first) — backs the "Who is this?" split
@@ -664,11 +677,10 @@ fn confirm_faces_into_cluster(
         let mut conn = state.conn.lock().unwrap();
         let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
         let target_id =
-            db::ensure_identity_for_cluster(&conn, target_cluster_id).map_err(|e| e.to_string())?;
-        db::set_faces_person(&mut conn, &face_ids, target_cluster_id, target_id)
-            .map_err(|e| e.to_string())?;
+            db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
+        db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
         drop(conn);
-        schedule_recluster(app);
+        schedule_refold(app);
         Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
     }
 }
@@ -685,12 +697,11 @@ fn ignore_faces(
     Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
 }
 
-/// "Not this person" without naming who they are: detach the faces from their current
-/// person and let each re-home by appearance. Distinct from "move to a new person"
-/// (which forces them together) and "ignore" (which hides them) — here they scatter
-/// and the re-cluster re-groups them wherever they belong (possibly several people, or
-/// none). Kicks a re-cluster so it happens now. Returns prior state for a best-effort
-/// undo (a full undo would need the pre-detach clustering, which the re-cluster rewrote).
+/// "Not this person" without naming who they are: unbind the faces from their
+/// current person and let the self-heal pass re-home each by appearance (possibly
+/// several people, or none). Distinct from "move to a new person" (which forces
+/// them together) and "ignore" (which hides them). Returns prior state for exact
+/// undo — nothing but the identity layer moved.
 #[tauri::command]
 fn detach_faces(
     app: tauri::AppHandle,
@@ -698,13 +709,12 @@ fn detach_faces(
     face_ids: Vec<i64>,
 ) -> Result<CorrectionUndo, String> {
     let undo = {
-        let mut conn = state.conn.lock().unwrap();
+        let conn = state.conn.lock().unwrap();
         let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-        let base = db::next_cluster_id(&conn).map_err(|e| e.to_string())?;
-        db::detach_faces(&mut conn, &face_ids, base).map_err(|e| e.to_string())?;
+        db::detach_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
         CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None }
     };
-    schedule_recluster(app);
+    schedule_refold(app);
     Ok(undo)
 }
 
@@ -806,31 +816,32 @@ fn absorb_clusters(
     touched.push(into);
     {
         let conn = state.conn.lock().unwrap();
-        let into_identity = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
+        let into_identity =
+            db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
         for from in clusters {
             if from == into {
                 continue;
             }
             // Defense in depth (the suggestion pass already filters these): never
-            // absorb a group holding a different *named* person's confirmed faces.
-            // Unnamed-competitor confirmations are adopted — the user is explicitly
-            // assigning this group, which outranks that bookkeeping.
-            if db::cluster_has_named_foreign_confirmed(&conn, from, into_identity)
+            // absorb a group that IS a different named person. Unnamed-competitor
+            // confirmations are adopted instead — the user is explicitly assigning
+            // this group, which outranks that bookkeeping.
+            if db::group_is_other_named_person(&conn, from, Some(into_identity))
                 .map_err(|e| e.to_string())?
             {
                 continue;
             }
-            if let Some(ii) = into_identity {
-                db::adopt_unnamed_confirmed(&conn, from, ii).map_err(|e| e.to_string())?;
-            }
-            // The user vouched for each absorbed group — confirm before folding in.
-            db::confirm_cluster_faces(&conn, from, into_identity).map_err(|e| e.to_string())?;
-            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+            db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
+            // The user vouched for each absorbed group — confirm, then fold in.
+            db::confirm_group_faces(&conn, from, Some(into_identity))
+                .map_err(|e| e.to_string())?;
+            db::merge_group_into_identity(&conn, into_identity, from)
+                .map_err(|e| e.to_string())?;
         }
     }
     prune_suggestion_cache(&state, &touched);
-    // Bulk-merging added exemplars — re-cluster + re-fold competitively (self-heal).
-    schedule_recluster(app);
+    // Bulk-merging added exemplars — re-derive the folds competitively (self-heal).
+    schedule_refold(app);
     Ok(())
 }
 
@@ -851,11 +862,11 @@ fn reject_merge(
     ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
-        db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())?;
-        let ia = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
-        let ib = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, into, ia).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, from, ib).map_err(|e| e.to_string())?;
+        let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
+        let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
+        db::add_cannot_link_ids(&conn, ia, ib).map_err(|e| e.to_string())?;
+        db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
+        db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
     }
     prune_suggestion_cache(&state, &[into, from]);
     Ok(())
@@ -879,14 +890,15 @@ fn not_this_person(
         let conn = state.conn.lock().unwrap();
         // Mint identities for both sides + cannot-link, then confirm the rejected group
         // so it's a durable, competing exemplar (not wiped as a tentative machine label).
-        db::add_cannot_link(&conn, person_cluster_id, other_cluster_id).map_err(|e| e.to_string())?;
-        let other_identity =
-            db::identity_of_cluster(&conn, other_cluster_id).map_err(|e| e.to_string())?;
-        db::confirm_cluster_faces(&conn, other_cluster_id, other_identity)
-            .map_err(|e| e.to_string())?;
+        let person =
+            db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
+        let other =
+            db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
+        db::add_cannot_link_ids(&conn, person, other).map_err(|e| e.to_string())?;
+        db::confirm_identity_faces(&conn, other).map_err(|e| e.to_string())?;
     }
     prune_suggestion_cache(&state, &[person_cluster_id, other_cluster_id]);
-    schedule_recluster(app);
+    schedule_refold(app);
     Ok(())
 }
 
@@ -908,43 +920,42 @@ fn resolve_same_photo(
     {
         let conn = state.conn.lock().unwrap();
         if same_person {
-            let into_identity =
-                db::ensure_identity_for_cluster(&conn, into).map_err(|e| e.to_string())?;
-            // Only a *named* other person blocks the assignment. Unnamed
-            // competitors (minted by earlier rejections) are adopted instead —
-            // refusing on them made this card unanswerable forever: every click
-            // failed, the queue refreshed, and the same card came back on top.
-            if db::cluster_has_named_foreign_confirmed(&conn, from, Some(into_identity))
-                .map_err(|e| e.to_string())?
-            {
-                return Err("that group already belongs to another named person".into());
-            }
+            // Resolve the blocked face pairs BEFORE any identity minting shifts
+            // the positive group key out from under `cooccurring_face_pairs`.
             let pairs: Vec<(i64, i64)> = db::cooccurring_face_pairs(&conn, into, from)
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|(_, a, b)| (a, b))
                 .collect();
+            let into_identity =
+                db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
+            // Only a *named* other person blocks the assignment. Unnamed
+            // competitors (minted by earlier rejections) are adopted instead —
+            // refusing on them made this card unanswerable forever: every click
+            // failed, the queue refreshed, and the same card came back on top.
+            if db::group_is_other_named_person(&conn, from, Some(into_identity))
+                .map_err(|e| e.to_string())?
+            {
+                return Err("that group already belongs to another named person".into());
+            }
             db::add_same_photo_ok(&conn, &pairs).map_err(|e| e.to_string())?;
             db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
-            // Confirm both sides so the merge survives re-clustering (see
-            // merge_clusters), then fold.
-            db::confirm_cluster_faces(&conn, into, Some(into_identity))
+            db::merge_group_into_identity(&conn, into_identity, from)
                 .map_err(|e| e.to_string())?;
-            db::confirm_cluster_faces(&conn, from, Some(into_identity))
-                .map_err(|e| e.to_string())?;
-            db::merge_clusters(&conn, into, from).map_err(|e| e.to_string())?;
+            // Vouch for the united person so the pairing survives self-heal.
+            db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
         } else {
             // Two look-alikes: durable cannot-link, both sides durable competitors
             // (same rationale as reject_merge — unconfirmed bindings evaporate).
-            db::add_cannot_link(&conn, into, from).map_err(|e| e.to_string())?;
-            let ia = db::identity_of_cluster(&conn, into).map_err(|e| e.to_string())?;
-            let ib = db::identity_of_cluster(&conn, from).map_err(|e| e.to_string())?;
-            db::confirm_cluster_faces(&conn, into, ia).map_err(|e| e.to_string())?;
-            db::confirm_cluster_faces(&conn, from, ib).map_err(|e| e.to_string())?;
+            let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
+            let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
+            db::add_cannot_link_ids(&conn, ia, ib).map_err(|e| e.to_string())?;
+            db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
+            db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
         }
     }
     prune_suggestion_cache(&state, &[into, from]);
-    schedule_recluster(app);
+    schedule_refold(app);
     Ok(())
 }
 
@@ -995,6 +1006,11 @@ const FACES_ALIGNED_FLAG: &str = "faces_aligned_v2";
 /// Set once HEIC faces have been re-detected from the correctly-oriented decode.
 /// Bumping this string re-runs the orientation repair (see the migration in `setup`).
 const HEIC_ORIENT_FLAG: &str = "heic_orient_v1";
+/// Set once the library has been re-clustered under identity-centric grouping.
+/// Before it, auto-folds physically merged clusters, so the appearance layer of an
+/// existing library carries welded multi-person piles; one full re-cluster rebuilds
+/// it pure (display groups are identity-keyed and unaffected throughout).
+const GROUPING_FLAG: &str = "identity_grouping_v1";
 
 /// Progress of a background re-cluster. `running` flips false when it finishes, so
 /// the People view can reload exactly once (and never mid-rebuild → no reflow).
@@ -1005,13 +1021,15 @@ struct ClusterProgress {
 }
 
 /// Recompute the suggestion caches (pairwise merges + identity growth) after a
-/// clustering pass, and bump the cluster generation. Runs on the pass's background
-/// thread with its own connection, so the UI's shared connection is never held
-/// through the matrix math (the old per-tab-open compute stalled every avatar
-/// request behind that lock). The get_* commands then serve instant reads.
+/// clustering pass. Runs on the pass's background thread with its own connection,
+/// so the UI's shared connection is never held through the matrix math (the old
+/// per-tab-open compute stalled every avatar request behind that lock). The get_*
+/// commands then serve instant reads. Stamps the CURRENT generation: only a full
+/// re-cluster (which renumbers positive appearance keys) bumps it — a fold pass
+/// changes group memberships but moves no ids, so cards stay actionable across it.
 fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     let state = app.state::<AppState>();
-    let generation = state.cluster_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let generation = state.cluster_gen.load(Ordering::SeqCst);
     let (mut merges, twins) = compute_merge_suggestions(conn).unwrap_or_default();
     let (mut growth, who) = compute_identity_growth(conn).unwrap_or_default();
     for s in &mut merges {
@@ -1026,12 +1044,12 @@ fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth, queue };
 }
 
-/// Guard for suggestion-driven mutations. Cluster ids are reassigned from scratch by
-/// every re-cluster, so a card computed before one completes may now point at a
-/// different group of faces — acting on it would confirm/merge the wrong people
-/// (durably: absorbing writes confirmed must-links). The payload carries the
-/// generation it was computed at; on mismatch we refuse and the frontend refreshes.
-/// `None` (paths not fed by suggestions, e.g. the name typeahead) is not checked.
+/// Guard for mutations holding positive (appearance) group keys: a full re-cluster
+/// reassigns those from scratch, so a card computed before one completes may now
+/// point at a different group of faces — acting on it would confirm/merge the wrong
+/// people (durably). Identity keys (negative) never go stale, and fold passes move
+/// no ids, so with identity-centric grouping this guard only ever fires around the
+/// rare consolidation re-cluster. `None` is not checked.
 /// Drop cached suggestions touching any of these clusters, immediately after a user
 /// decision lands. The full cache only refreshes when the (debounced) clustering
 /// pass completes seconds later; until then the stale cards would re-offer
@@ -1081,14 +1099,15 @@ fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), Stri
 }
 
 /// How long a burst of corrections may extend before the self-heal pass runs.
-const RECLUSTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
+const REFOLD_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// Debounced [`run_recluster`]: a correction's DB writes apply immediately, but the
-/// expensive re-cluster waits for a quiet moment, so a review session (answer,
+/// Debounced [`run_auto_fold`]: a correction's DB writes apply immediately, but the
+/// self-heal re-derive waits for a quiet moment, so a review session (answer,
 /// answer, answer) pays for one pass instead of one per click. Each call supersedes
-/// any still-pending one. Reset, startup, and the sweep-drain consolidation still
-/// call [`run_recluster`] directly — they're one-shot, not bursts.
-fn schedule_recluster(app: AppHandle) {
+/// any still-pending one. This is the cheap identity-layer pass — the full
+/// re-cluster now runs only when the appearance layer itself must change (sweep
+/// drain, reset, migration, the manual command), never as the price of a rename.
+fn schedule_refold(app: AppHandle) {
     let state = app.state::<AppState>();
     let epoch = state.recluster_epoch.clone();
     let review_active = state.review_active.clone();
@@ -1096,50 +1115,56 @@ fn schedule_recluster(app: AppHandle) {
     let mine = epoch.fetch_add(1, Ordering::SeqCst) + 1;
     drop(state);
     std::thread::spawn(move || {
-        std::thread::sleep(RECLUSTER_DEBOUNCE);
+        std::thread::sleep(REFOLD_DEBOUNCE);
         if epoch.load(Ordering::SeqCst) == mine {
-            // Mid-review-session: hold the pass (it renumbers the session's cards);
-            // set_review_active(false) fires it the moment the session ends.
+            // Mid-review-session: hold the pass (it re-derives folds under the
+            // session's remaining cards); set_review_active(false) fires it the
+            // moment the session ends.
             if review_active.load(Ordering::SeqCst) {
                 deferred.store(true, Ordering::SeqCst);
                 return;
             }
-            run_recluster(app);
+            run_auto_fold(app);
         }
     });
 }
 
-/// Focus-review session lifecycle: while active, due re-clusters are deferred so
-/// the session's cards stay valid; ending the session runs any deferred pass.
+/// Focus-review session lifecycle: while active, due self-heal passes are deferred
+/// so the session's cards stay valid; ending the session runs any deferred pass.
 #[tauri::command]
 fn set_review_active(app: tauri::AppHandle, state: tauri::State<'_, AppState>, active: bool) {
     state.review_active.store(active, Ordering::SeqCst);
     if !active && state.recluster_deferred.swap(false, Ordering::SeqCst) {
-        schedule_recluster(app);
+        schedule_refold(app);
     }
 }
 
 /// Run [`auto_fold_confident`] in the background (Principle 1: off the UI thread),
-/// then signal the People view to refresh via `cluster-progress`. Cheap next to a
-/// full re-cluster — just anchor matching and merges — so it's fine to fire after
-/// every naming/merge. Shares the re-cluster guard, so it never overlaps one.
+/// then signal the People view to refresh via `cluster-progress`. This IS the
+/// self-heal pass now: it re-derives every tentative identity assignment against
+/// the current confirmed exemplars, at identity-layer cost (anchor matmuls), with
+/// no re-cluster. Shares the re-cluster guard so the two never overlap; a request
+/// arriving while busy is queued via `fold_pending` so corrections aren't dropped.
 fn run_auto_fold(app: AppHandle) {
     let state = app.state::<AppState>();
     if state.reclustering.swap(true, Ordering::SeqCst) {
-        return; // a re-cluster or fold is already running
+        state.fold_pending.store(true, Ordering::SeqCst);
+        return;
     }
     let db_path = state.db_path.clone();
     let reclustering = state.reclustering.clone();
+    let fold_pending = state.fold_pending.clone();
     drop(state);
 
     std::thread::spawn(move || {
         background_qos();
+        let app_for_rerun = app.clone();
         let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
         let folded = (|| -> anyhow::Result<usize> {
             let conn = db::open(&db_path)?;
             let n = auto_fold_confident(&conn)?;
-            // Clusters may have changed — recompute the suggestion caches (and bump
-            // the generation) before the UI is told to reload.
+            // Memberships may have changed — recompute the suggestion caches
+            // before the UI is told to reload.
             refresh_suggestion_cache(&app, &conn);
             Ok(n)
         })();
@@ -1148,13 +1173,19 @@ fn run_auto_fold(app: AppHandle) {
         }
         let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
         reclustering.store(false, Ordering::SeqCst);
+        // A fold was requested while we ran — honor it so its corrections land.
+        if fold_pending.swap(false, Ordering::SeqCst) {
+            run_auto_fold(app_for_rerun);
+        }
     });
 }
 
 /// Re-cluster every face from scratch, in the background (Principle 1: off the UI
-/// thread, no focus steal). Order-independent and purity-biased. Names are carried
-/// across by re-anchoring each to the new cluster holding the plurality of its old
-/// faces. A guard prevents overlap; progress streams via `cluster-progress`.
+/// thread, no focus steal). Order-independent and purity-biased. This rebuilds the
+/// *appearance* layer only: identity groups (names, confirmations, the tiles the
+/// user curated) are keyed by durable identity ids and pass through untouched — no
+/// name re-anchoring, no must-link welding. A guard prevents overlap; progress
+/// streams via `cluster-progress`.
 fn run_recluster(app: AppHandle) {
     let state = app.state::<AppState>();
     if state.reclustering.swap(true, Ordering::SeqCst) {
@@ -1166,19 +1197,20 @@ fn run_recluster(app: AppHandle) {
     let db_path = state.db_path.clone();
     let reclustering = state.reclustering.clone();
     let recluster_pending = state.recluster_pending.clone();
+    let fold_pending = state.fold_pending.clone();
     recluster_pending.store(false, Ordering::SeqCst);
     let app_for_rerun = app.clone();
     drop(state);
 
     std::thread::spawn(move || {
         background_qos();
-        use std::collections::HashMap;
         let _ = app.emit("cluster-progress", ClusterProgress { running: true, fraction: 0.0 });
         let result = (|| -> anyhow::Result<()> {
             let mut conn = db::open(&db_path)?;
             let faces = db::all_face_embeddings(&conn)?;
             if faces.is_empty() {
                 db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
+                db::set_meta(&conn, GROUPING_FLAG, "1")?;
                 return Ok(());
             }
 
@@ -1220,64 +1252,24 @@ fn run_recluster(app: AppHandle) {
             // Throttle progress events to ~every 2% so we don't flood the channel.
             let app2 = app.clone();
             let mut last = 0.0f32;
-            let mut assignments = cluster::recluster(&faces, &constraints, |f| {
+            let assignments = cluster::recluster(&faces, &constraints, |f| {
                 if f - last >= 0.02 || f >= 1.0 {
                     last = f;
                     let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
                 }
             });
-            // Honor must-links: every face the user *confirmed* under one identity is
-            // forced into one cluster, however the embeddings split it. This is what
-            // makes a confirmed merge durable — the re-cluster can no longer undo it.
-            apply_must_links(&db::confirmed_face_identities(&conn)?, &mut assignments);
             db::set_face_clusters(&mut conn, &assignments)?;
-
-            // Re-derive each cluster's display name from the durable *identity* whose
-            // confirmed faces landed in it — read fresh here (post-clustering), so a
-            // name added while this pass ran is honored, not wiped by a stale snapshot.
-            // (Names live on the identity; cluster_names is just a per-cluster cache.)
-            let new_of: HashMap<i64, i64> = assignments.iter().cloned().collect();
-            let named_idents: HashMap<i64, String> =
-                db::named_identities(&conn)?.into_iter().collect();
-            let mut tally: HashMap<i64, HashMap<i64, usize>> = HashMap::new(); // identity -> cluster -> n
-            for (face, ident) in db::confirmed_face_identities(&conn)? {
-                if named_idents.contains_key(&ident) {
-                    if let Some(&newc) = new_of.get(&face) {
-                        *tally.entry(ident).or_default().entry(newc).or_insert(0) += 1;
-                    }
-                }
-            }
-            // Two identities can (transiently) have their plurality in the SAME new
-            // cluster — e.g. after a merge that combined two named people. Assign
-            // greedily by descending confirmed-face count, one name per cluster and
-            // one cluster per identity, so the runner-up re-anchors to its next-best
-            // cluster instead of being silently overwritten (the old ON CONFLICT
-            // upsert ate a name and the person vanished from the grid).
-            let mut claims: Vec<(usize, i64, i64)> = Vec::new(); // (count, identity, cluster)
-            for (ident, m) in tally {
-                for (newc, n) in m {
-                    claims.push((n, ident, newc));
-                }
-            }
-            claims.sort_by(|a, b| b.0.cmp(&a.0));
-            let mut cluster_taken: std::collections::HashSet<i64> = std::collections::HashSet::new();
-            let mut ident_named: std::collections::HashSet<i64> = std::collections::HashSet::new();
-            let mut names: Vec<(i64, String)> = Vec::new();
-            for (_, ident, newc) in claims {
-                if ident_named.contains(&ident) || cluster_taken.contains(&newc) {
-                    continue;
-                }
-                ident_named.insert(ident);
-                cluster_taken.insert(newc);
-                names.push((newc, named_idents[&ident].clone()));
-            }
-            db::replace_cluster_names(&mut conn, &names)?;
-            // Now that clusters and names are settled, reunite each confirmed person's
-            // scattered look-alike fragments automatically (see `auto_fold_confident`).
+            // The positive (appearance) keys were just renumbered — the only event
+            // that can invalidate a group id the UI holds — so this is the one
+            // place the generation bumps. Identity keys pass through untouched:
+            // names, confirmations and tiles need no re-anchoring at all.
+            app.state::<AppState>().cluster_gen.fetch_add(1, Ordering::SeqCst);
+            // Re-derive the tentative folds against the fresh appearance layer
+            // (see `auto_fold_confident`).
             let _ = auto_fold_confident(&conn)?;
             db::set_meta(&conn, RECLUSTER_FLAG, "1")?;
-            // Everything is renumbered — recompute the suggestion caches (and bump
-            // the generation) before the UI is told to reload.
+            db::set_meta(&conn, GROUPING_FLAG, "1")?;
+            // Recompute the suggestion caches before the UI is told to reload.
             refresh_suggestion_cache(&app, &conn);
             Ok(())
         })();
@@ -1286,9 +1278,13 @@ fn run_recluster(app: AppHandle) {
         }
         let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
         reclustering.store(false, Ordering::SeqCst);
-        // A fold was requested while we ran — honor it now so nothing is dropped.
+        // Anything requested while we ran — honor it now so nothing is dropped.
+        // (A queued fold after a re-cluster is cheap belt-and-braces: the pass
+        // above already re-derived folds, but a correction may have landed since.)
         if recluster_pending.swap(false, Ordering::SeqCst) {
             run_recluster(app_for_rerun);
+        } else if fold_pending.swap(false, Ordering::SeqCst) {
+            run_auto_fold(app_for_rerun);
         }
     });
 }
@@ -1684,11 +1680,11 @@ pub fn run() {
             }
 
             // Has the one-time migration off the old greedy clustering run yet?
+            // And has the appearance layer been rebuilt pure since identity-centric
+            // grouping landed (older auto-folds physically welded clusters)?
             // (Checked now, before `conn` moves into the shared state.)
-            let needs_recluster = db::get_meta(&conn, RECLUSTER_FLAG)
-                .ok()
-                .flatten()
-                .is_none();
+            let needs_recluster = db::get_meta(&conn, RECLUSTER_FLAG).ok().flatten().is_none()
+                || db::get_meta(&conn, GROUPING_FLAG).ok().flatten().is_none();
 
             // A download interrupted by a previous quit is no longer running;
             // reset those placeholders so they show as cloud again (and can be
@@ -1800,6 +1796,7 @@ pub fn run() {
                 faces_paused,
                 reclustering: Arc::new(AtomicBool::new(false)),
                 recluster_pending: Arc::new(AtomicBool::new(false)),
+                fold_pending: Arc::new(AtomicBool::new(false)),
                 cluster_gen: Arc::new(AtomicI64::new(0)),
                 suggestion_cache: Arc::new(Mutex::new(SuggestionCache::default())),
                 recluster_epoch: Arc::new(AtomicU64::new(0)),
