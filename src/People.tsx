@@ -15,6 +15,7 @@ import PersonView from "./PersonView";
 import ReviewFocus from "./ReviewFocus";
 import {
   faceCropUrl,
+  getClusterGeneration,
   getClusters,
   getFaceProgress,
   getIdentityGrowth,
@@ -103,6 +104,10 @@ export default function People({
   const editingRef = useRef<number | null>(editing);
   editingRef.current = editing;
   const lastReloadRef = useRef(0);
+  // The clustering generation the loaded cluster ids belong to. Passed into
+  // naming/merging so the backend refuses an action whose id outlived a
+  // re-cluster (naming confirms the whole cluster — the wrong one, durably).
+  const genRef = useRef(0);
 
   const reload = useCallback(() => {
     // All three are instant reads now — the heavy suggestion passes run in the
@@ -110,6 +115,11 @@ export default function People({
     getClusters().then(setClusters).catch(() => {});
     getIdentityGrowth().then(setGrowth).catch(() => {});
     getReviewQueue().then(setQueue).catch(() => {});
+    getClusterGeneration()
+      .then((g) => {
+        genRef.current = g;
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -222,9 +232,11 @@ export default function People({
   // to pull in any remaining look-alikes (Direction B's batch fold).
   const mergeInto = (self: Cluster, target: Cluster) => {
     setEditing(null);
-    mergeClusters(target.cluster_id, self.cluster_id)
+    // On refusal (stale generation — people were reorganized under us), reload so
+    // the grid shows current ids instead of silently looking like a no-op.
+    mergeClusters(target.cluster_id, self.cluster_id, genRef.current)
       .then(reload)
-      .catch(() => {});
+      .catch(() => reload());
   };
 
   // Enter/blur on the name field: an exact match to an existing person merges; any
@@ -235,12 +247,16 @@ export default function People({
     const match = name ? exactNameMatch(self, name) : undefined;
     if (match) {
       markHintDone();
-      mergeClusters(match.cluster_id, self.cluster_id).then(reload).catch(() => {});
+      mergeClusters(match.cluster_id, self.cluster_id, genRef.current)
+        .then(reload)
+        .catch(() => reload());
       return;
     }
     if (name || self.name) {
       if (name) markHintDone();
-      nameCluster(self.cluster_id, name).then(reload).catch(() => {});
+      nameCluster(self.cluster_id, name, genRef.current)
+        .then(reload)
+        .catch(() => reload());
     }
   };
 

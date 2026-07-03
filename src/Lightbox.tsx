@@ -12,12 +12,14 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   faceCropUrl,
+  getClusterGeneration,
   getClusters,
   getFacesInPhoto,
   getPhotoDetail,
   ignoreFaces,
   mergeClusters,
   nameCluster,
+  onClusterProgress,
   photoUrl,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
@@ -101,8 +103,28 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     return () => window.removeEventListener("keydown", onKey);
   }, [go, onClose, openFace]);
 
+  // The people list AND the clustering generation its ids belong to. The viewer can
+  // stay open across a background re-cluster (which renumbers cluster ids), so both
+  // refresh when one finishes; every cluster-targeting mutation passes the generation
+  // so a stale id is refused instead of naming/merging whatever cluster now holds it.
+  const genRef = useRef(0);
   useEffect(() => {
-    getClusters().then(setPeople).catch(() => {});
+    const refreshPeople = () => {
+      getClusters().then(setPeople).catch(() => {});
+      getClusterGeneration()
+        .then((g) => {
+          genRef.current = g;
+        })
+        .catch(() => {});
+    };
+    refreshPeople();
+    let unlisten: (() => void) | undefined;
+    onClusterProgress((p) => {
+      if (!p.running) refreshPeople();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
   }, []);
 
   // Resolve the current photo's id + detail + faces, and prefetch neighbors.
@@ -174,6 +196,14 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     onCorrection?.();
   }, [refreshFaces, onCorrection]);
 
+  // On refusal (almost always a stale generation — a background re-cluster
+  // renumbered ids under the open viewer), say so and refresh instead of failing
+  // silently: a swallowed "Move to X" reads as "my correction didn't register".
+  const flashRefused = useCallback(() => {
+    flashUndo("People were just reorganized — try that again.", null);
+    afterChange();
+  }, [flashUndo, afterChange]);
+
   // A face-level correction (reassign / ignore) — reversible via its undo token.
   const applyToFace = useCallback(
     async (run: () => Promise<CorrectionUndo>, label: string) => {
@@ -183,10 +213,10 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         flashUndo(label, () => undoCorrection(tok).then(afterChange).catch(() => {}));
         afterChange();
       } catch {
-        /* leave the overlay as-is on failure */
+        flashRefused();
       }
     },
-    [flashUndo, afterChange],
+    [flashUndo, afterChange, flashRefused],
   );
 
   // Cluster-level: name this person, or merge their group into an existing person —
@@ -197,30 +227,30 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       if (face.cluster_id == null || !name) return;
       const prev = face.name ?? "";
       try {
-        await nameCluster(face.cluster_id, name);
+        await nameCluster(face.cluster_id, name, genRef.current);
         flashUndo(`Named ${name}`, () =>
-          nameCluster(face.cluster_id!, prev).then(afterChange).catch(() => {}),
+          nameCluster(face.cluster_id!, prev, genRef.current).then(afterChange).catch(() => {}),
         );
         afterChange();
       } catch {
-        /* no-op */
+        flashRefused();
       }
     },
-    [flashUndo, afterChange],
+    [flashUndo, afterChange, flashRefused],
   );
   const mergeThisPerson = useCallback(
     async (face: PhotoFace, target: Cluster) => {
       setOpenFace(null);
       if (face.cluster_id == null) return;
       try {
-        await mergeClusters(target.cluster_id, face.cluster_id);
+        await mergeClusters(target.cluster_id, face.cluster_id, genRef.current);
         flashUndo(`Merged into ${target.name}`, null); // a merge isn't cleanly reversible
         afterChange();
       } catch {
-        /* no-op */
+        flashRefused();
       }
     },
-    [flashUndo, afterChange],
+    [flashUndo, afterChange, flashRefused],
   );
 
   const doUndo = () => {
@@ -319,13 +349,25 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
                     onMergePerson={(target) => mergeThisPerson(f, target)}
                     onReassignExisting={(target) =>
                       applyToFace(
-                        () => reassignFacesToCluster([f.face_id], f.cluster_id!, target.cluster_id),
+                        () =>
+                          reassignFacesToCluster(
+                            [f.face_id],
+                            f.cluster_id!,
+                            target.cluster_id,
+                            genRef.current,
+                          ),
                         `Moved to ${target.name}`,
                       )
                     }
                     onReassignNew={(name) =>
                       applyToFace(
-                        () => reassignFacesToNewPerson([f.face_id], f.cluster_id!, name),
+                        () =>
+                          reassignFacesToNewPerson(
+                            [f.face_id],
+                            f.cluster_id!,
+                            name,
+                            genRef.current,
+                          ),
                         name ? `Moved to ${name}` : "Moved to a new person",
                       )
                     }

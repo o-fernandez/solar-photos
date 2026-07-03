@@ -161,7 +161,7 @@ export default function ReviewFocus({
   const pickNewPerson = (name: string) => {
     if (pickTargetCluster == null || !name.trim()) return;
     // Naming the cluster mints the person directly (and schedules the re-cluster).
-    act(() => nameCluster(pickTargetCluster, name.trim()), pickPhotos);
+    act(() => nameCluster(pickTargetCluster, name.trim(), generation), pickPhotos);
   };
 
   // "Some are each": the contested cluster genuinely holds both candidates. Load its

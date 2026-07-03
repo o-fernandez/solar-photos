@@ -257,7 +257,9 @@ export default function PersonView({
   // leave the page — this cluster is now part of the other.
   const mergeThisInto = (target: Cluster) => {
     setEditing(false);
-    mergeClusters(target.cluster_id, cluster.cluster_id).then(onBack).catch(() => {});
+    mergeClusters(target.cluster_id, cluster.cluster_id, genRef.current)
+      .then(onBack)
+      .catch(() => flashNotice("People were just reorganized — try that again."));
   };
 
   const commitName = () => {
@@ -268,8 +270,9 @@ export default function PersonView({
       mergeThisInto(match);
       return;
     }
-    nameCluster(cluster.cluster_id, value).catch(() => {});
-    setName(value || null);
+    nameCluster(cluster.cluster_id, value, genRef.current)
+      .then(() => setName(value || null))
+      .catch(() => flashNotice("People were just reorganized — try that again."));
   };
 
   // Review-tail decisions (the "N more might also be this person" band). "Yes" folds

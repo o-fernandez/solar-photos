@@ -153,9 +153,20 @@ export function getClusters(): Promise<Cluster[]> {
   return invoke("get_clusters");
 }
 
-/** Name (or rename, or clear with "") a person-cluster. */
-export function nameCluster(clusterId: number, name: string): Promise<void> {
-  return invoke("name_cluster", { clusterId, name });
+/** Name (or rename, or clear with "") a person-cluster. `expectedGeneration`
+ *  guards the cluster id against a background re-cluster renumbering it between
+ *  the people list loading and the name committing — naming confirms every face
+ *  in the cluster, so acting on a stale id would mislabel a stranger durably. */
+export function nameCluster(
+  clusterId: number,
+  name: string,
+  expectedGeneration?: number,
+): Promise<void> {
+  return invoke("name_cluster", {
+    clusterId,
+    name,
+    expectedGeneration: expectedGeneration ?? null,
+  });
 }
 
 /** Merge one cluster into another (folds `from`'s faces into `into`).

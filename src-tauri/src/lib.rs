@@ -425,13 +425,20 @@ fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>
     db::clusters_overview(&conn).map_err(|e| e.to_string())
 }
 
+/// Naming is the highest-stakes mutation — it confirms every face in the cluster
+/// as user-vouched exemplars — and the cluster id was loaded from an earlier
+/// people list, so it needs the same staleness guard as the suggestion paths: a
+/// re-cluster between load and commit renumbers ids, and naming whatever cluster
+/// now holds the stale id would durably confirm a stranger's faces under the name.
 #[tauri::command]
 fn name_cluster(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     cluster_id: i64,
     name: String,
+    expected_generation: Option<i64>,
 ) -> Result<(), String> {
+    ensure_generation(&state, expected_generation)?;
     {
         let conn = state.conn.lock().unwrap();
         db::name_cluster(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
