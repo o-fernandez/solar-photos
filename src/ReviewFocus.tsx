@@ -124,6 +124,28 @@ export default function ReviewFocus({
     attempt();
   }, [onClose]);
 
+  // A stale-generation refusal means clustering moved on — refetch and continue.
+  // Any OTHER backend refusal (e.g. "that group already belongs to another named
+  // person") used to be swallowed into the same "reorganized" flow, which read as
+  // a lie and re-showed the unanswerable card; now it's said out loud and the
+  // card is skipped.
+  const flashNote = useCallback((msg: string) => {
+    setNote(msg);
+    window.setTimeout(() => setNote(null), 4000);
+  }, []);
+  const handleRefusal = useCallback(
+    (e: unknown, skip: () => void) => {
+      const msg = String(e ?? "");
+      if (/stale|reorganiz/i.test(msg)) {
+        refresh();
+      } else {
+        flashNote(msg || "Couldn't apply that.");
+        skip();
+      }
+    },
+    [refresh, flashNote],
+  );
+
   // Run one answer: count it, advance on success, refresh-and-continue on refusal.
   const act = useCallback(
     (run: () => Promise<unknown>, photos: number) => {
@@ -133,9 +155,9 @@ export default function ReviewFocus({
           setSettled((s) => s + photos);
           advance();
         })
-        .catch(() => refresh());
+        .catch((e) => handleRefusal(e, advance));
     },
-    [advance, refresh],
+    [advance, handleRefusal],
   );
 
   // The named people the "someone else…" picker offers (excluding the proposed one).
@@ -257,18 +279,22 @@ export default function ReviewFocus({
 
   // One strong-batch / twin-pair chip answered: run it, tally it, and advance when
   // the card empties. Chip actions don't use `act` — the card stays for the rest.
+  // A non-stale refusal hides the chip WITHOUT counting it: the backend says the
+  // question can't be answered as asked, so re-offering it forever helps no one.
   const chipAct = (run: () => Promise<unknown>, chipId: number, photos: number, total: number) => {
+    const hideChip = () =>
+      setChipDone((d) => {
+        const next = new Set(d).add(chipId);
+        if (next.size >= total) advance();
+        return next;
+      });
     run()
       .then(() => {
         setAnswered((a) => a + 1);
         setSettled((s) => s + photos);
-        setChipDone((d) => {
-          const next = new Set(d).add(chipId);
-          if (next.size >= total) advance();
-          return next;
-        });
+        hideChip();
       })
-      .catch(() => refresh());
+      .catch((e) => handleRefusal(e, hideChip));
   };
 
   const keyHint = (k: string) => <span className="rf-key">{k}</span>;

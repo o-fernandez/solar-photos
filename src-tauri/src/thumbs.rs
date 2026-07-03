@@ -61,9 +61,9 @@ struct Inner {
     /// What the user is looking at right now — drained before `normal`.
     priority: VecDeque<i64>,
     priority_set: HashSet<i64>,
-    /// Jobs a worker has taken but not yet finished. Lets `enqueue` /
-    /// `replace_pending` avoid re-queueing a download that's already in flight
-    /// (the cloud lane re-reports the same visible ids on every scroll tick).
+    /// Jobs a worker has taken but not yet finished. Lets `enqueue` avoid
+    /// re-queueing a download that's already in flight (the cloud lane re-reports
+    /// the same visible ids on every scroll tick).
     in_flight: HashSet<i64>,
     /// Set on shutdown so workers can exit their loop.
     shutdown: bool,
@@ -107,26 +107,6 @@ impl ThumbQueue {
         for id in ids {
             if inner.jobs.contains_key(&id) && inner.priority_set.insert(id) {
                 inner.priority.push_back(id);
-            }
-        }
-        drop(inner);
-        self.available.notify_all();
-    }
-
-    /// Replace the *entire* pending set with exactly these jobs. Used by the
-    /// cloud lane: as the user scrolls, we want to download only what's currently
-    /// visible and abandon cloud fetches they scrolled past before we started
-    /// them. Jobs already taken by a worker (a download in flight) keep running.
-    pub fn replace_pending(&self, jobs: Vec<Job>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.jobs.clear();
-        inner.normal.clear();
-        inner.priority.clear();
-        inner.priority_set.clear();
-        for job in jobs {
-            if !inner.jobs.contains_key(&job.id) && !inner.in_flight.contains(&job.id) {
-                inner.normal.push_back(job.id);
-                inner.jobs.insert(job.id, job);
             }
         }
         drop(inner);

@@ -39,6 +39,10 @@ import {
 const SWEEP_FLOOR = 8; // min photos for an *unnamed* cluster to show mid-sweep
 const SETTLED_FLOOR = 2; // below this, settled clusters move to the "more" section
 const MID_SWEEP_REFRESH_MS = 20_000; // how often to re-pull the grid while scanning
+// The "more" section reveals tiles a page at a time: purity-bias means thousands
+// of small groups is the NORMAL settled state, and mounting them all at once
+// (each firing a face-crop request) chokes the DOM at scale (Principle 6).
+const MORE_PAGE = 120;
 
 // A few example faces from the queue's top item, for the Review entry card.
 function queueFaces(q: ReviewQueue): number[] {
@@ -97,8 +101,8 @@ export default function People({
   // Sweep progress (null until first read); drives the "Finding people…" readout
   // and decides whether we're still in the noisy mid-sweep phase.
   const [faceProg, setFaceProg] = useState<FaceProgress | null>(null);
-  // Whether the settled "more" (small/singleton) section is expanded.
-  const [showMore, setShowMore] = useState(false);
+  // How many of the settled "more" (small/singleton) tiles are revealed (0 = collapsed).
+  const [moreShown, setMoreShown] = useState(0);
   // Latest `editing` + last mid-sweep reload time, read inside the progress
   // subscription without making it re-subscribe on every keystroke.
   const editingRef = useRef<number | null>(editing);
@@ -456,11 +460,24 @@ export default function People({
 
       {tail.length > 0 && (
         <>
-          <button className="more-toggle" onClick={() => setShowMore((s) => !s)}>
-            {showMore ? "Hide" : "More"} — {tail.length.toLocaleString()} small{" "}
+          <button
+            className="more-toggle"
+            onClick={() => setMoreShown((n) => (n === 0 ? MORE_PAGE : 0))}
+          >
+            {moreShown > 0 ? "Hide" : "More"} — {tail.length.toLocaleString()} small{" "}
             {tail.length === 1 ? "group" : "groups"}
           </button>
-          {showMore && <div className="people-grid">{tail.map(renderTile)}</div>}
+          {moreShown > 0 && (
+            <>
+              <div className="people-grid">{tail.slice(0, moreShown).map(renderTile)}</div>
+              {moreShown < tail.length && (
+                <button className="more-toggle" onClick={() => setMoreShown((n) => n + MORE_PAGE)}>
+                  Show {Math.min(MORE_PAGE, tail.length - moreShown).toLocaleString()} more —{" "}
+                  {(tail.length - moreShown).toLocaleString()} left
+                </button>
+              )}
+            </>
+          )}
         </>
       )}
     </div>

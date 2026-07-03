@@ -1050,8 +1050,7 @@ pub fn delete_faces_for_photos(conn: &Connection, photo_ids: &[i64]) -> Result<(
     if photo_ids.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
-    let sql = format!("DELETE FROM faces WHERE photo_id IN ({placeholders})");
+    let sql = format!("DELETE FROM faces WHERE photo_id IN ({})", placeholders(photo_ids.len()));
     conn.execute(&sql, rusqlite::params_from_iter(photo_ids.iter()))?;
     Ok(())
 }
@@ -1072,8 +1071,7 @@ pub fn face_ids_of_photos(conn: &Connection, photo_ids: &[i64]) -> Result<Vec<i6
     if photo_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id FROM faces WHERE photo_id IN ({placeholders})");
+    let sql = format!("SELECT id FROM faces WHERE photo_id IN ({})", placeholders(photo_ids.len()));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(photo_ids.iter()), |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1088,9 +1086,9 @@ pub fn rearm_photos_for_redetect(conn: &Connection, photo_ids: &[i64]) -> Result
         return Ok(());
     }
     delete_faces_for_photos(conn, photo_ids)?;
-    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
+    let ph = placeholders(photo_ids.len());
     conn.execute(
-        &format!("UPDATE photos SET faces_scanned = 0 WHERE id IN ({placeholders})"),
+        &format!("UPDATE photos SET faces_scanned = 0 WHERE id IN ({ph})"),
         rusqlite::params_from_iter(photo_ids.iter()),
     )?;
     // Only re-queue photos that already have a local thumbnail; leave cloud-only
@@ -1098,7 +1096,7 @@ pub fn rearm_photos_for_redetect(conn: &Connection, photo_ids: &[i64]) -> Result
     conn.execute(
         &format!(
             "UPDATE photos SET thumb_status = {STATUS_PENDING} \
-             WHERE thumb_status = {STATUS_READY} AND id IN ({placeholders})"
+             WHERE thumb_status = {STATUS_READY} AND id IN ({ph})"
         ),
         rusqlite::params_from_iter(photo_ids.iter()),
     )?;
@@ -1285,8 +1283,10 @@ pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>>
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id, thumb_status, path FROM photos WHERE id IN ({placeholders})");
+    let sql = format!(
+        "SELECT id, thumb_status, path FROM photos WHERE id IN ({})",
+        placeholders(ids.len())
+    );
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(ids.iter());
     let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -1329,8 +1329,10 @@ pub fn set_status_many(conn: &Connection, ids: &[i64], status: i64) -> Result<()
     if ids.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
-    let sql = format!("UPDATE photos SET thumb_status = {status} WHERE id IN ({placeholders})");
+    let sql = format!(
+        "UPDATE photos SET thumb_status = {status} WHERE id IN ({})",
+        placeholders(ids.len())
+    );
     let params = rusqlite::params_from_iter(ids.iter());
     conn.execute(&sql, params)?;
     Ok(())

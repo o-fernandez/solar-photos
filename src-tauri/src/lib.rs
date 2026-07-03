@@ -142,6 +142,15 @@ fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
     }
 }
 
+/// Remove the cached cover-crop files for a set of faces. Call BEFORE deleting the
+/// face rows (the crop path is keyed by face id, found via the rows) — pruned and
+/// removed photos used to leave their crops on disk forever.
+fn delete_face_crop_files(faces_dir: &Path, face_ids: &[i64]) {
+    for &fid in face_ids {
+        let _ = std::fs::remove_file(faces::face_crop_path(faces_dir, fid));
+    }
+}
+
 /// Quietly download every cloud-only photo in the background, working through the
 /// library in id order so the user doesn't have to scroll everywhere to trigger
 /// on-demand fetches. Uses the same cloud queue as the on-demand path — the
@@ -194,6 +203,7 @@ fn rescan_all(app: AppHandle) {
     let db_path = state.db_path.clone();
     let cache_dir = state.cache_dir.clone();
     let preview_dir = state.preview_dir.clone();
+    let faces_dir = state.faces_dir.clone();
     let queue = state.local_queue.clone();
     let rescanning = state.rescanning.clone();
     drop(state);
@@ -217,7 +227,7 @@ fn rescan_all(app: AppHandle) {
                 continue;
             }
             let app = app.clone();
-            if scan::run_scan(&db_path, root, gen, queue.clone(), move |found, _| {
+            if scan::run_scan(&db_path, root, gen, queue.clone(), &preview_dir, &faces_dir, move |found, _| {
                 let _ = app.emit("scan-progress", ScanProgress { found, done: false });
             })
             .is_err()
@@ -229,6 +239,9 @@ fn rescan_all(app: AppHandle) {
         if let Ok(conn) = db::open(&db_path) {
             if all_roots_ok {
                 let removed = db::take_unseen(&conn, gen).unwrap_or_default();
+                // Crops first — they're found via the face rows about to go.
+                let face_ids = db::face_ids_of_photos(&conn, &removed).unwrap_or_default();
+                delete_face_crop_files(&faces_dir, &face_ids);
                 let _ = db::delete_faces_for_photos(&conn, &removed);
                 delete_cache_files(&cache_dir, &preview_dir, &removed);
             }
@@ -295,12 +308,14 @@ fn add_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: St
     }
     let db_path = state.db_path.clone();
     let queue = state.local_queue.clone();
+    let preview_dir = state.preview_dir.clone();
+    let faces_dir = state.faces_dir.clone();
     std::thread::spawn(move || {
         let gen = now_gen();
         let progress = |found: i64, done: bool| {
             let _ = app.emit("scan-progress", ScanProgress { found, done });
         };
-        if let Err(e) = scan::run_scan(&db_path, &path, gen, queue, progress) {
+        if let Err(e) = scan::run_scan(&db_path, &path, gen, queue, &preview_dir, &faces_dir, progress) {
             eprintln!("scan failed: {e}");
             let _ = app.emit("scan-progress", ScanProgress { found: 0, done: true });
         }
@@ -328,6 +343,9 @@ fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path:
     let removed = {
         let conn = state.conn.lock().unwrap();
         let ids = db::remove_root(&conn, &path).unwrap_or_default();
+        // Crops first — they're found via the face rows about to go.
+        let face_ids = db::face_ids_of_photos(&conn, &ids).unwrap_or_default();
+        delete_face_crop_files(&state.faces_dir, &face_ids);
         let _ = db::delete_faces_for_photos(&conn, &ids);
         ids
     };
@@ -395,8 +413,8 @@ fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, i
     drop(conn);
 
     // Enqueue any not yet in the queue, then bump all visible cloud photos to
-    // the priority lane so they load before the background backfill.
-    // (Unlike replace_pending, this leaves backfill items in the normal lane.)
+    // the priority lane so they load before the background backfill (which stays
+    // queued in the normal lane rather than being dropped).
     let cloud_ids: Vec<i64> = cloud_jobs.iter().map(|j| j.id).collect();
     state.cloud_queue.enqueue(cloud_jobs);
     state.cloud_queue.set_priority(cloud_ids);
@@ -496,14 +514,23 @@ fn get_person_photos(
     db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
 }
 
-/// The person's "looks" strip (see `recognition::person_looks`).
+/// The person's "looks" strip (see `recognition::person_looks`). Runs on a
+/// blocking-pool thread with its OWN connection: the leader-clustering over a big
+/// person's thousands of embeddings takes real time, and computing it while
+/// holding the shared UI connection stalled every avatar request behind the lock
+/// (the same disease the suggestion cache cured for the People tab).
 #[tauri::command]
-fn get_person_looks(
+async fn get_person_looks(
     state: tauri::State<'_, AppState>,
     cluster_id: i64,
 ) -> Result<Vec<PersonLook>, String> {
-    let conn = state.conn.lock().unwrap();
-    recognition::person_looks(&conn, cluster_id)
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        recognition::person_looks(&conn, cluster_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The faces detected in one photo, with the person each belongs to — backs the
