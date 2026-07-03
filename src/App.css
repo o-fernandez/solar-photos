@@ -1632,7 +1632,10 @@ body,
   .name-suggest-item:hover {
     background: #2f3a49;
   }
-  .ns-name {
+  /* Only the dark picker (.name-suggest) wants light names. On the white pickers
+     (.face-menu, .sb-matches) .ns-name must stay dark, or names wash out to
+     near-white on white in OS dark mode. */
+  .name-suggest .ns-name {
     color: #ededed;
   }
   .ns-face {

@@ -98,6 +98,10 @@ export default function PersonView({
   const [name, setName] = useState(cluster.name);
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [undo, setUndo] = useState<PendingUndo | null>(null);
+  // A transient message (no Undo) — e.g. a correction refused because a background
+  // re-cluster renumbered ids since the page loaded; the user just retries.
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | undefined>(undefined);
   // Photo ids the user has multi-selected for a bulk correction.
   const [selected, setSelected] = useState<Set<number>>(new Set());
   // Whether the "move to which person?" picker is open, and its typeahead text.
@@ -303,7 +307,7 @@ export default function PersonView({
   // the backend's generation check instead of landing on the wrong person.
   const genRef = useRef<number>(0);
   useEffect(() => {
-    const load = () => {
+    const refreshIds = () => {
       getClusters().then(setPeople).catch(() => {});
       getClusterGeneration()
         .then((g) => {
@@ -311,15 +315,23 @@ export default function PersonView({
         })
         .catch(() => {});
     };
-    load();
+    refreshIds();
     let unlisten: (() => void) | undefined;
     onClusterProgress((p) => {
-      if (!p.running) load();
+      if (!p.running) {
+        // A background re-cluster finished — it renumbered cluster ids and may have
+        // moved faces in or out of this person. Refresh the id/generation AND the
+        // shown photos + looks, so the page never sits on a stale grouping (which
+        // left already-moved looks lingering until the next reload).
+        refreshIds();
+        reloadPhotos();
+        loadLooks();
+      }
     }).then((fn) => {
       unlisten = fn;
     });
     return () => unlisten?.();
-  }, []);
+  }, [reloadPhotos, loadLooks]);
 
   const toggleSelect = (photoId: number) => {
     setSelected((s) => {
@@ -333,6 +345,13 @@ export default function PersonView({
     setPicking(false);
     setPickQuery("");
   };
+
+  // Flash a transient, button-less message (distinct from the Undo toast).
+  const flashNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 4500);
+  }, []);
 
   // Apply a correction to a set of photos: resolve their faces, optimistically pull
   // the cells (P2 — one update, no reflow under the user), run the backend op, and
@@ -353,11 +372,27 @@ export default function PersonView({
         undoTimer.current = window.setTimeout(() => setUndo(null), 6000);
         // Moving faces out changes the look grouping (and clears a repair flag).
         loadLooks();
-      } catch {
+      } catch (e) {
+        // The move was refused — almost always a stale generation: a background
+        // re-cluster renumbered cluster ids since this page loaded, so the backend
+        // rejects binding faces to a now-wrong id (see ensure_generation). Failing
+        // silently made a refused "Move to X" look like a no-op (the look stayed).
+        // Restore the cells, refresh ids + looks so the *next* attempt binds against
+        // current ids, and say so.
         setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
+        getClusterGeneration().then((g) => { genRef.current = g; }).catch(() => {});
+        getClusters().then(setPeople).catch(() => {});
+        reloadPhotos();
+        loadLooks();
+        const msg = String(e ?? "");
+        flashNotice(
+          /stale|reorganiz/i.test(msg)
+            ? "People were just reorganized — try that again."
+            : "Couldn't apply that — try again.",
+        );
       }
     },
-    [cluster.cluster_id, loadLooks],
+    [cluster.cluster_id, loadLooks, reloadPhotos, flashNotice],
   );
 
   const doUndo = () => {
@@ -830,6 +865,12 @@ export default function PersonView({
           <button className="undo-btn" onClick={doUndo}>
             Undo
           </button>
+        </div>
+      )}
+
+      {notice && !undo && (
+        <div className="undo-toast">
+          <span>{notice}</span>
         </div>
       )}
 
