@@ -445,6 +445,7 @@ export interface FaceState {
   cluster_id: number | null;
   identity_id: number | null;
   ignored: boolean;
+  confirmed: boolean;
 }
 
 /** What a correction returns so it can be undone exactly. */

@@ -854,13 +854,19 @@ pub fn faces_in_photo(conn: &Connection, photo_id: i64) -> Result<Vec<PhotoFace>
 }
 
 /// A face's grouping before a correction, captured so the action can be undone
-/// exactly — including whether it was ignored.
+/// exactly — including whether it was ignored and whether the *user* had vouched
+/// for it. `confirmed` must round-trip: corrections set it, so an undo that left
+/// it behind would promote a machine guess to a user-confirmed must-link (and
+/// anchor exemplar) under the restored identity — vouching forged by an action
+/// the user took back.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FaceState {
     pub face_id: i64,
     pub cluster_id: Option<i64>,
     pub identity_id: Option<i64>,
     pub ignored: bool,
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 /// Build a SQL placeholder list (`?,?,…`) for an `IN (…)` clause.
@@ -874,7 +880,7 @@ pub fn capture_face_states(conn: &Connection, face_ids: &[i64]) -> Result<Vec<Fa
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT id, cluster_id, identity_id, ignored FROM faces WHERE id IN ({})",
+        "SELECT id, cluster_id, identity_id, ignored, confirmed FROM faces WHERE id IN ({})",
         placeholders(face_ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -884,6 +890,7 @@ pub fn capture_face_states(conn: &Connection, face_ids: &[i64]) -> Result<Vec<Fa
             cluster_id: r.get(1)?,
             identity_id: r.get(2)?,
             ignored: r.get::<_, i64>(3)? != 0,
+            confirmed: r.get::<_, i64>(4)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -894,10 +901,16 @@ pub fn restore_face_states(conn: &mut Connection, states: &[FaceState]) -> Resul
     let tx = conn.transaction()?;
     {
         let mut up = tx.prepare(
-            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = ?3 WHERE id = ?4",
+            "UPDATE faces SET cluster_id = ?1, identity_id = ?2, ignored = ?3, confirmed = ?4 WHERE id = ?5",
         )?;
         for s in states {
-            up.execute(rusqlite::params![s.cluster_id, s.identity_id, s.ignored as i64, s.face_id])?;
+            up.execute(rusqlite::params![
+                s.cluster_id,
+                s.identity_id,
+                s.ignored as i64,
+                s.confirmed as i64,
+                s.face_id
+            ])?;
         }
     }
     tx.commit()?;
@@ -1432,6 +1445,40 @@ mod tests {
         assert!(!cluster_has_foreign_confirmed(&conn, 10, Some(2)).unwrap());
         // Cluster 30 has no confirmed faces at all.
         assert!(!cluster_has_foreign_confirmed(&conn, 30, Some(1)).unwrap());
+    }
+
+    /// Undo must restore `confirmed` exactly. An auto-folded face (confirmed = 0)
+    /// moved by the user (which confirms it) and then un-done must return to
+    /// UNCONFIRMED under its old identity — leaving confirmed = 1 behind would
+    /// mint a bogus user-vouched exemplar for the old identity out of an action
+    /// the user reverted (and the reverse: undoing a detach must re-vouch).
+    #[test]
+    fn undo_restores_confirmed_flag() {
+        let mut conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar'), (2, 'Kevin');")
+            .unwrap();
+        // Face 1: tentatively auto-folded to Omar. Face 2: user-confirmed Omar.
+        insert_face(&conn, 1, 10, Some(1), false);
+        insert_face(&conn, 2, 10, Some(1), true);
+        let prior = capture_face_states(&conn, &[1, 2]).unwrap();
+
+        // Move both to Kevin (a user label — sets confirmed = 1 on both), then
+        // detach face 2 style-check: set_faces_person is the confirming path.
+        set_faces_person(&mut conn, &[1, 2], 20, 2).unwrap();
+        let confirmed_of = |conn: &Connection, id: i64| -> bool {
+            conn.query_row("SELECT confirmed FROM faces WHERE id = ?1", [id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                != 0
+        };
+        assert!(confirmed_of(&conn, 1) && confirmed_of(&conn, 2));
+
+        restore_face_states(&mut conn, &prior).unwrap();
+        assert_eq!(identity_of_face(&conn, 1), Some(1));
+        assert_eq!(identity_of_face(&conn, 2), Some(1));
+        assert!(!confirmed_of(&conn, 1), "tentative face must return to unconfirmed");
+        assert!(confirmed_of(&conn, 2), "user-vouched face must stay confirmed");
     }
 
     /// The same-photo exception round-trip: the pairs the rule blocks are exactly
