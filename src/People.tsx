@@ -29,6 +29,7 @@ import {
   type IdentityGrowth,
   type ReviewQueue,
 } from "./api";
+import { usePickerNav } from "./pickerNav";
 
 // While the library is still being scanned, the incremental assign path spawns a
 // swarm of 1–3-photo fragments that mostly vanish after consolidation — pure noise
@@ -231,6 +232,20 @@ export default function People({
     );
   };
 
+  // The tile being renamed and its live suggestions — lifted out of renderTile so
+  // the keyboard-nav hook has a single home (only one tile edits at a time).
+  const editingCluster =
+    editing != null ? clusters.find((c) => c.cluster_id === editing) ?? null : null;
+  const editMatches = editingCluster ? nameMatches(editingCluster) : [];
+  // Enter commits the typed name; ↑/↓ opt into the merge suggestions first.
+  const editNav = usePickerNav(
+    editMatches.length,
+    (i) => {
+      if (editingCluster) mergeInto(editingCluster, editMatches[i]);
+    },
+    { startUnselected: true },
+  );
+
   // Fold this group into an existing person (chosen from the suggestions, or typed
   // as an exact name match). The named person survives; the growth card then offers
   // to pull in any remaining look-alikes (Direction B's batch fold).
@@ -279,16 +294,26 @@ export default function People({
     return m;
   }, [growth]);
 
+  // The whole tile opens the person (what a new user tries first); renaming lives
+  // behind a hover pencil (named) or a hover "+ Add name" (unnamed) that stop the
+  // click from navigating. The name field itself swallows clicks the same way.
   const renderTile = (c: Cluster) => {
     const review = reviewByCluster.get(c.cluster_id);
     return (
-    <div className="ptile" key={c.cluster_id}>
-      <div className="pavatar-wrap" onClick={() => setSelected(c)}>
+    <div
+      className="ptile"
+      key={c.cluster_id}
+      role="button"
+      title={c.name ? `See ${c.name}` : "See this person"}
+      onClick={() => {
+        if (editing !== c.cluster_id) setSelected(c);
+      }}
+    >
+      <div className="pavatar-wrap">
         <img
           className="pavatar"
           src={faceCropUrl(c.cover_face_id)}
           alt={c.name ?? "Unnamed person"}
-          title={c.name ? `See ${c.name}` : "See this person"}
           draggable={false}
         />
         {review && (
@@ -298,48 +323,68 @@ export default function People({
         )}
       </div>
       {editing === c.cluster_id ? (
-        <div className="pname-combo">
+        <div className="pname-combo" onClick={(e) => e.stopPropagation()}>
           <input
             className="pname-input"
             autoFocus
             value={draft}
             placeholder="Name"
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              editNav.resetHighlight();
+            }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") commitEdit(c);
-              else if (e.key === "Escape") setEditing(null);
+              if (e.key === "Escape") setEditing(null);
+              else if (editNav.onNavKey(e)) return;
+              else if (e.key === "Enter") commitEdit(c);
             }}
             onBlur={() => commitEdit(c)}
           />
-          {(() => {
-            const matches = nameMatches(c);
-            if (matches.length === 0) return null;
+          {editMatches.length > 0 && (
             // preventDefault keeps the input from blurring (and commit-naming the
             // group) before a suggestion click runs its merge.
-            return (
-              <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
-                <li className="name-suggest-head">Add to an existing person</li>
-                {matches.map((m) => (
-                  <li
-                    key={m.cluster_id}
-                    className="name-suggest-item"
-                    onClick={() => mergeInto(c, m)}
-                  >
-                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                    <span className="ns-name">{m.name}</span>
-                    <span className="ns-count">{m.count.toLocaleString()}</span>
-                  </li>
-                ))}
-              </ul>
-            );
-          })()}
+            <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
+              <li className="name-suggest-head">Add to an existing person</li>
+              {editMatches.map((m, i) => (
+                <li
+                  key={m.cluster_id}
+                  className={`name-suggest-item${editNav.highlight === i ? " hi" : ""}`}
+                  onMouseEnter={() => editNav.setHighlight(i)}
+                  onClick={() => mergeInto(c, m)}
+                >
+                  <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                  <span className="ns-name">{m.name}</span>
+                  <span className="ns-count">{m.count.toLocaleString()}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       ) : c.name ? (
-        <button className="pname" onClick={() => startEdit(c)}>
-          {c.name}
-        </button>
+        <span className="pname-row">
+          <span className="pname">{c.name}</span>
+          <button
+            className="pname-edit"
+            aria-label={`Rename ${c.name}`}
+            title="Rename"
+            onClick={(e) => {
+              e.stopPropagation();
+              startEdit(c);
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+            </svg>
+          </button>
+        </span>
       ) : (
-        <button className="paddname" onClick={() => startEdit(c)}>
+        <button
+          className="paddname"
+          onClick={(e) => {
+            e.stopPropagation();
+            startEdit(c);
+          }}
+        >
           + Add name
         </button>
       )}

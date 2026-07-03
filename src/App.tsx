@@ -47,6 +47,12 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   // Two-click guard on the destructive "start people over" reset.
   const [confirmReset, setConfirmReset] = useState(false);
+  // Two-click guard on removing a folder (the ✕ sits right next to each path —
+  // one stray click shouldn't drop thousands of photos from the index).
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  // Where the pre-reset database backup landed — shown once so the safety net is
+  // felt, not just logged to a console nobody has open.
+  const [resetNote, setResetNote] = useState<string | null>(null);
   // The "new friend" nudge: the freshly-qualified person to celebrate, plus the
   // cluster People should open the name field for when you act on it.
   const [newPerson, setNewPerson] = useState<Cluster | null>(null);
@@ -171,6 +177,7 @@ function App() {
   }, []);
 
   const handleRemove = useCallback((path: string) => {
+    setConfirmRemove(null);
     removeFolder(path).catch(() => {});
     // The new total + refresh arrive via the scan-progress "done" event.
   }, []);
@@ -182,9 +189,16 @@ function App() {
     setConfirmReset(false);
     setShowSettings(false);
     resetFaceDecisions()
-      .then((backup) => console.info(`People reset. Backup: ${backup}`))
+      .then((backup) => setResetNote(backup))
       .catch(() => {});
   }, []);
+
+  // The backup-path note lingers, then fades (dismissable meanwhile).
+  useEffect(() => {
+    if (!resetNote) return;
+    const t = setTimeout(() => setResetNote(null), 15_000);
+    return () => clearTimeout(t);
+  }, [resetNote]);
 
   // Jump to the new person and open their name field straight away.
   const nameNewPerson = useCallback(() => {
@@ -253,6 +267,7 @@ function App() {
               onClick={() => {
                 setShowSettings((s) => !s);
                 setConfirmReset(false);
+                setConfirmRemove(null);
               }}
             >
               <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -267,6 +282,7 @@ function App() {
                   onClick={() => {
                     setShowSettings(false);
                     setConfirmReset(false);
+                    setConfirmRemove(null);
                   }}
                 />
                 <div className="settings-menu">
@@ -299,20 +315,40 @@ function App() {
                     <>
                       <div className="menu-sep" />
                       <div className="menu-head">Folders</div>
-                      {roots.map((r) => (
-                        <div className="roots-item" key={r}>
-                          <span className="roots-path" title={r}>
-                            {r}
-                          </span>
-                          <button
-                            className="roots-remove"
-                            aria-label={`Remove ${r}`}
-                            onClick={() => handleRemove(r)}
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      ))}
+                      {roots.map((r) =>
+                        confirmRemove === r ? (
+                          <div className="menu-confirm" key={r}>
+                            <span className="menu-confirm-q">
+                              Remove this folder from the library? The photos on disk are
+                              untouched, but their index (and any face work in them) is dropped.
+                            </span>
+                            <div className="menu-confirm-row">
+                              <button className="menu-danger-btn" onClick={() => handleRemove(r)}>
+                                Remove
+                              </button>
+                              <button
+                                className="menu-cancel-btn"
+                                onClick={() => setConfirmRemove(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="roots-item" key={r}>
+                            <span className="roots-path" title={r}>
+                              {r}
+                            </span>
+                            <button
+                              className="roots-remove"
+                              aria-label={`Remove ${r}`}
+                              onClick={() => setConfirmRemove(r)}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ),
+                      )}
                     </>
                   )}
                   <div className="menu-sep" />
@@ -382,6 +418,20 @@ function App() {
           </p>
           <button className="pick-btn empty-add" onClick={handleAdd} disabled={busy}>
             {scanning ? "Scanning…" : "Add folder"}
+          </button>
+        </div>
+      )}
+
+      {resetNote && (
+        <div className={`toast${newPerson ? " second" : ""}`} role="status">
+          <div className="toast-body">
+            <div className="toast-title">People reset</div>
+            <div className="toast-sub toast-path" title={resetNote}>
+              Backup saved: {resetNote}
+            </div>
+          </div>
+          <button className="toast-x" aria-label="Dismiss" onClick={() => setResetNote(null)}>
+            ✕
           </button>
         </div>
       )}

@@ -120,6 +120,9 @@ export default function PhotoGrid({
 
   // --- Timeline scrubber ---
   const [scrubbing, setScrubbing] = useState(false);
+  // Mirrors draggingRef for render: while actually dragging the scrubber its own
+  // label shows; during ordinary scrolling the floating month chip does instead.
+  const [dragging, setDragging] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const hideTimer = useRef<number | undefined>(undefined);
@@ -146,11 +149,13 @@ export default function PhotoGrid({
   const onScrubPointerDown = useCallback(
     (e: React.PointerEvent) => {
       draggingRef.current = true;
+      setDragging(true);
       setScrubbing(true);
       scrubTo(e.clientY);
       const move = (ev: PointerEvent) => draggingRef.current && scrubTo(ev.clientY);
       const up = () => {
         draggingRef.current = false;
+        setDragging(false);
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         bumpHide();
@@ -335,6 +340,12 @@ export default function PhotoGrid({
         })}
       </div>
     </div>
+    {/* Date wayfinding while scrolling: a floating month chip fades in at the
+        top-left (no layout change, nothing reflows) and out when you stop. While
+        dragging the scrubber, its own label next to the thumb takes over. */}
+    {byDate && scrubbing && !dragging && topTs ? (
+      <div className="month-chip">{monthYear(topTs)}</div>
+    ) : null}
     {showScrubber && (
       <div
         className={`scrubber${scrubbing ? " active" : ""}`}
@@ -342,7 +353,7 @@ export default function PhotoGrid({
         onPointerDown={onScrubPointerDown}
       >
         <div className="scrubber-thumb" style={{ height: thumbH, transform: `translateY(${thumbTop}px)` }} />
-        {scrubbing && topTs ? (
+        {dragging && topTs ? (
           <div className="scrubber-label" style={{ top: thumbTop + thumbH / 2 }}>
             {monthYear(topTs)}
           </div>
@@ -378,13 +389,31 @@ export default function PhotoGrid({
       );
     }
     if (downloadingRef.current.has(id) || photo.status === STATUS_DOWNLOADING) {
-      return <div className="cell-overlay" aria-label="downloading"><span className="spinner" /></div>;
+      return (
+        <div className="cell-overlay" aria-label="downloading" title="Downloading…">
+          <span className="spinner" />
+        </div>
+      );
     }
     if (photo.status === STATUS_CLOUD) {
-      return <div className="cell-overlay" aria-label="in the cloud"><CloudGlyph /></div>;
+      return (
+        <div
+          className="cell-overlay"
+          aria-label="in the cloud"
+          title="In the cloud — downloads when you view it"
+        >
+          <CloudGlyph />
+        </div>
+      );
     }
     if (photo.status === STATUS_FAILED) {
-      return <div className="cell-overlay failed" aria-label="couldn't read" />;
+      return (
+        <div
+          className="cell-overlay failed"
+          aria-label="couldn't read"
+          title="Couldn't read this photo"
+        />
+      );
     }
     return null; // local pending — gray box
   }

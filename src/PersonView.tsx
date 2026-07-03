@@ -45,6 +45,7 @@ import {
   type PersonLook,
   type PhotoRow,
 } from "./api";
+import { usePickerNav } from "./pickerNav";
 
 const GAP = 4; // px between cells (matches the timeline grid)
 const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill width
@@ -350,10 +351,32 @@ export default function PersonView({
       return next;
     });
   };
+  // Shift-click selects the whole range from the last-toggled cell — selecting a
+  // 60-photo chunk one click at a time doesn't survive a 4,000-photo person (P6).
+  const anchorIndexRef = useRef<number | null>(null);
+  const handleCellSelect = (index: number, shiftRange: boolean) => {
+    if (shiftRange && anchorIndexRef.current != null) {
+      const lo = Math.min(anchorIndexRef.current, index);
+      const hi = Math.max(anchorIndexRef.current, index);
+      setSelected((s) => {
+        const next = new Set(s);
+        for (let i = lo; i <= hi; i++) {
+          const r = rowsRef.current[i];
+          if (r) next.add(r.id);
+        }
+        return next;
+      });
+    } else {
+      const r = rowsRef.current[index];
+      if (r) toggleSelect(r.id);
+    }
+    anchorIndexRef.current = index;
+  };
   const clearSelection = () => {
     setSelected(new Set());
     setPicking(false);
     setPickQuery("");
+    anchorIndexRef.current = null;
   };
 
   // Flash a transient, button-less message (distinct from the Undo toast).
@@ -500,6 +523,45 @@ export default function PersonView({
   const pickMatches = useMemo(() => filterPeople(pickQuery), [people, pickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
   const lookPickMatches = useMemo(() => filterPeople(lookPickQuery), [people, lookPickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ↑/↓ + Enter in the pickers: Enter takes the highlighted row — the top match by
+  // default, so a half-typed name never silently mints a duplicate person. The
+  // "+ New person" row is the explicit last row.
+  const pickNav = usePickerNav(pickMatches.length + 1, (i) => {
+    if (i < pickMatches.length) moveToPerson(pickMatches[i]);
+    else moveToNewPerson(pickQuery.trim() || undefined);
+  });
+  const lookNav = usePickerNav(lookPickMatches.length + 1, (i) => {
+    if (i < lookPickMatches.length) moveLookToPerson(lookPickMatches[i]);
+    else moveLookToNewPerson(lookPickQuery.trim() || undefined);
+  });
+  // The rename combobox starts un-highlighted: Enter commits the typed name;
+  // arrows opt into the merge suggestions.
+  const renameMatches = editing ? nameMatches(draft) : [];
+  const renameNav = usePickerNav(renameMatches.length, (i) => mergeThisInto(renameMatches[i]), {
+    startUnselected: true,
+  });
+
+  // Esc walks back the transient layers: picker → selection → look. Ignored while
+  // the Lightbox is open (it owns Esc) or while typing in a field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || viewerIndex !== null) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      if (picking) setPicking(false);
+      else if (selected.size > 0) clearSelection();
+      else if (lookPicking) setLookPicking(false);
+      else if (selectedLook != null) {
+        setSelectedLook(null);
+        setLookPicking(false);
+        setLookPickQuery("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewerIndex, picking, selected, lookPicking, selectedLook]);
+
   const header = (
     <div className="person-header">
       <button className="ghost-btn person-back" onClick={onBack}>
@@ -514,35 +576,36 @@ export default function PersonView({
               autoFocus
               value={draft}
               placeholder="Name"
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                renameNav.resetHighlight();
+              }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") commitName();
-                else if (e.key === "Escape") setEditing(false);
+                if (e.key === "Escape") setEditing(false);
+                else if (renameNav.onNavKey(e)) return;
+                else if (e.key === "Enter") commitName();
               }}
               onBlur={commitName}
             />
-            {(() => {
-              const matches = nameMatches(draft);
-              if (matches.length === 0) return null;
+            {renameMatches.length > 0 && (
               // preventDefault keeps the input from blurring (and rename-committing)
               // before a suggestion click runs its merge.
-              return (
-                <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
-                  <li className="name-suggest-head">Merge into an existing person</li>
-                  {matches.map((m) => (
-                    <li
-                      key={m.cluster_id}
-                      className="name-suggest-item"
-                      onClick={() => mergeThisInto(m)}
-                    >
-                      <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                      <span className="ns-name">{m.name}</span>
-                      <span className="ns-count">{m.count.toLocaleString()}</span>
-                    </li>
-                  ))}
-                </ul>
-              );
-            })()}
+              <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
+                <li className="name-suggest-head">Add to an existing person</li>
+                {renameMatches.map((m, i) => (
+                  <li
+                    key={m.cluster_id}
+                    className={`name-suggest-item${renameNav.highlight === i ? " hi" : ""}`}
+                    onMouseEnter={() => renameNav.setHighlight(i)}
+                    onClick={() => mergeThisInto(m)}
+                  >
+                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
+                    <span className="ns-name">{m.name}</span>
+                    <span className="ns-count">{m.count.toLocaleString()}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         ) : name ? (
           <button
@@ -587,7 +650,12 @@ export default function PersonView({
       {header}
 
       {looks.length > 0 && (
-        <div className="person-looks">
+        <div className="person-looks-wrap">
+          <div className="looks-head">
+            Looks
+            <span className="looks-hint"> — tap one to filter their photos, or to move a batch</span>
+          </div>
+          <div className="person-looks">
           <button
             className={`look look-all${selectedLook == null ? " sel" : ""}`}
             onClick={() => setSelectedLook(null)}
@@ -623,6 +691,7 @@ export default function PersonView({
               </button>
             );
           })}
+          </div>
         </div>
       )}
 
@@ -638,23 +707,31 @@ export default function PersonView({
                 autoFocus
                 value={lookPickQuery}
                 placeholder="Move to which person?"
-                onChange={(e) => setLookPickQuery(e.target.value)}
+                onChange={(e) => {
+                  setLookPickQuery(e.target.value);
+                  lookNav.resetHighlight();
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setLookPicking(false);
-                  else if (e.key === "Enter" && lookPickQuery.trim())
-                    moveLookToNewPerson(lookPickQuery.trim());
+                  else lookNav.onNavKey(e);
                 }}
               />
               <ul className="sb-matches">
-                {lookPickMatches.map((m) => (
-                  <li key={m.cluster_id} className="sb-match" onClick={() => moveLookToPerson(m)}>
+                {lookPickMatches.map((m, i) => (
+                  <li
+                    key={m.cluster_id}
+                    className={`sb-match${lookNav.highlight === i ? " hi" : ""}`}
+                    onMouseEnter={() => lookNav.setHighlight(i)}
+                    onClick={() => moveLookToPerson(m)}
+                  >
                     <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
                     <span className="ns-name">{m.name}</span>
                     <span className="ns-count">{m.count.toLocaleString()}</span>
                   </li>
                 ))}
                 <li
-                  className="sb-match sb-new"
+                  className={`sb-match sb-new${lookNav.highlight === lookPickMatches.length ? " hi" : ""}`}
+                  onMouseEnter={() => lookNav.setHighlight(lookPickMatches.length)}
                   onClick={() => moveLookToNewPerson(lookPickQuery.trim() || undefined)}
                 >
                   + New person{lookPickQuery.trim() ? ` “${lookPickQuery.trim()}”` : ""}
@@ -771,9 +848,12 @@ export default function PersonView({
                       className={`cell person-cell${isSelected ? " selected" : ""}`}
                       role="button"
                       tabIndex={-1}
-                      // Once a selection is underway, taps add/remove from it; otherwise
-                      // a tap opens the photo. The checkbox always toggles selection.
-                      onClick={() => (selecting ? toggleSelect(photo.id) : setViewerIndex(index))}
+                      // Once a selection is underway, taps add/remove from it (shift
+                      // extends the range); otherwise a tap opens the photo. The
+                      // checkbox always toggles selection.
+                      onClick={(e) =>
+                        selecting ? handleCellSelect(index, e.shiftKey) : setViewerIndex(index)
+                      }
                       style={{
                         width: cellSize,
                         height: cellSize,
@@ -789,7 +869,7 @@ export default function PersonView({
                         aria-pressed={isSelected}
                         onClick={(e) => {
                           e.stopPropagation();
-                          toggleSelect(photo.id);
+                          handleCellSelect(index, e.shiftKey);
                         }}
                       >
                         {isSelected ? "✓" : ""}
@@ -829,21 +909,33 @@ export default function PersonView({
                 autoFocus
                 value={pickQuery}
                 placeholder="Move to which person?"
-                onChange={(e) => setPickQuery(e.target.value)}
+                onChange={(e) => {
+                  setPickQuery(e.target.value);
+                  pickNav.resetHighlight();
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setPicking(false);
-                  else if (e.key === "Enter" && pickQuery.trim()) moveToNewPerson(pickQuery.trim());
+                  else pickNav.onNavKey(e);
                 }}
               />
               <ul className="sb-matches">
-                {pickMatches.map((m) => (
-                  <li key={m.cluster_id} className="sb-match" onClick={() => moveToPerson(m)}>
+                {pickMatches.map((m, i) => (
+                  <li
+                    key={m.cluster_id}
+                    className={`sb-match${pickNav.highlight === i ? " hi" : ""}`}
+                    onMouseEnter={() => pickNav.setHighlight(i)}
+                    onClick={() => moveToPerson(m)}
+                  >
                     <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
                     <span className="ns-name">{m.name}</span>
                     <span className="ns-count">{m.count.toLocaleString()}</span>
                   </li>
                 ))}
-                <li className="sb-match sb-new" onClick={() => moveToNewPerson(pickQuery.trim() || undefined)}>
+                <li
+                  className={`sb-match sb-new${pickNav.highlight === pickMatches.length ? " hi" : ""}`}
+                  onMouseEnter={() => pickNav.setHighlight(pickMatches.length)}
+                  onClick={() => moveToNewPerson(pickQuery.trim() || undefined)}
+                >
                   + New person{pickQuery.trim() ? ` “${pickQuery.trim()}”` : ""}
                 </li>
               </ul>
@@ -903,13 +995,29 @@ export default function PersonView({
       return <img src={thumbUrl(photo.id)} className="thumb" loading="eager" decoding="async" draggable={false} />;
     }
     if (photo.status === STATUS_DOWNLOADING) {
-      return <div className="cell-overlay" aria-label="downloading"><span className="spinner" /></div>;
+      return (
+        <div className="cell-overlay" aria-label="downloading" title="Downloading…">
+          <span className="spinner" />
+        </div>
+      );
     }
     if (photo.status === STATUS_CLOUD) {
-      return <div className="cell-overlay" aria-label="in the cloud" />;
+      return (
+        <div
+          className="cell-overlay"
+          aria-label="in the cloud"
+          title="In the cloud — downloads when you view it"
+        />
+      );
     }
     if (photo.status === STATUS_FAILED) {
-      return <div className="cell-overlay failed" aria-label="couldn't read" />;
+      return (
+        <div
+          className="cell-overlay failed"
+          aria-label="couldn't read"
+          title="Couldn't read this photo"
+        />
+      );
     }
     return null; // pending — gray box
   }

@@ -9,8 +9,19 @@
 // the next answer is refused server-side and the session refetches a fresh queue
 // and CONTINUES, instead of dead-ending. Answers already given were saved.
 //
+// Evidence grammar, shared across card kinds: the group IN QUESTION is labeled and
+// amber-ringed; the reference person's confirmed faces sit in their own labeled
+// panel. One glance says which faces you're judging and which you're judging
+// against — the old cards interleaved them and "Is this X?" was ambiguous.
+//
+// Every answer is undoable: cluster-level actions return a CorrectionUndo token
+// (prior face states + any links added), and the last answer stays revertable via
+// an inline line until the next one replaces it. "No" writes a durable
+// cannot-link, so a misclick needs a way back.
+//
 // Keyboard-first: Y (yes / merge all), N (no / not the same), S (someone else…),
-// → (skip), Esc (close). Each answer advances; the tally makes progress felt.
+// M (it's a mix…), → (skip), Esc (close). Each answer advances; the tally makes
+// progress felt.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -28,10 +39,38 @@ import {
   rejectMerge,
   resolveSamePhoto,
   setReviewActive,
+  undoCorrection,
   type Cluster,
+  type CorrectionUndo,
   type ReviewItem,
   type ReviewQueue,
 } from "./api";
+import { usePickerNav } from "./pickerNav";
+
+/** Reverses one answer on the backend. */
+type Revert = () => Promise<unknown>;
+
+/** The last answer given, kept revertable until the next one replaces it: the
+ *  backend revert plus the UI snapshot that re-shows the undone card. */
+interface LastAnswer {
+  label: string;
+  revert: Revert;
+  idx: number;
+  chipDone: Set<number>;
+  answered: number;
+  settled: number;
+}
+
+/** Chain several undo tokens into one revert (applied in reverse order). */
+function revertAll(toks: CorrectionUndo[]): Revert {
+  return async () => {
+    for (const tok of [...toks].reverse()) await undoCorrection(tok);
+  };
+}
+
+function photosLabel(n: number): string {
+  return `${n.toLocaleString()} ${n === 1 ? "photo" : "photos"}`;
+}
 
 export default function ReviewFocus({
   queue,
@@ -52,18 +91,22 @@ export default function ReviewFocus({
   const [picking, setPicking] = useState(false);
   const [pickQuery, setPickQuery] = useState("");
   const [people, setPeople] = useState<Cluster[]>([]);
-  // "Some are each" split state (who_is_this only): the contested cluster's full face
-  // set, and each tagged face's candidate slot (0 = first candidate, 1 = second).
-  // Tag slots: 0 = first candidate, 1 = second candidate, 2 = "someone else"
-  // (neither of the two — detach and let each face re-home by appearance).
+  // "It's a mix…" split state (maybe + who_is_this): the contested cluster's full
+  // face set, and each tagged face's slot — 0/1 = a candidate person, 2 = "someone
+  // else" (detach and let each face re-home by appearance).
   const [splitting, setSplitting] = useState(false);
   const [splitFaces, setSplitFaces] = useState<number[]>([]);
   const [splitLoading, setSplitLoading] = useState(false);
   const [tags, setTags] = useState<Map<number, 0 | 1 | 2>>(new Map());
+  // Sample faces of the group under review on a "maybe" card — judging a whole
+  // group from its single cover face was guesswork.
+  const [groupSamples, setGroupSamples] = useState<number[]>([]);
   // True while we're waiting out a re-cluster and refetching the queue.
   const [refreshing, setRefreshing] = useState(false);
   // Transient "we refreshed under you" note after a mid-session reorganization.
   const [note, setNote] = useState<string | null>(null);
+  // The last answer, revertable inline until the next answer replaces it.
+  const [lastAnswer, setLastAnswer] = useState<LastAnswer | null>(null);
   const refreshTries = useRef(0);
 
   const item = !refreshing && idx < items.length ? items[idx] : null;
@@ -82,6 +125,25 @@ export default function ReviewFocus({
     };
   }, []);
 
+  // The maybe card's group samples: best faces of the group under review (the
+  // single cover face is the instant fallback while they load).
+  useEffect(() => {
+    if (item?.kind !== "maybe") {
+      setGroupSamples([]);
+      return;
+    }
+    let alive = true;
+    setGroupSamples(item.group.face_id != null ? [item.group.face_id] : []);
+    getClusterFaces(item.group.cluster_id)
+      .then((f) => {
+        if (alive && f.length > 0) setGroupSamples(f.slice(0, 4));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [item]);
+
   const advance = useCallback(() => {
     setChipDone(new Set());
     setPicking(false);
@@ -95,8 +157,10 @@ export default function ReviewFocus({
   // Clustering moved on mid-session (an answer was refused, or a pass completed):
   // refetch the queue and continue with fresh items. While a pass is still
   // running the queue reads empty — poll until it lands rather than giving up.
+  // The last answer's UI snapshot is meaningless against fresh items, so it drops.
   const refresh = useCallback(() => {
     setRefreshing(true);
+    setLastAnswer(null);
     const attempt = () => {
       getReviewQueue()
         .then((q) => {
@@ -146,19 +210,48 @@ export default function ReviewFocus({
     [refresh, flashNote],
   );
 
-  // Run one answer: count it, advance on success, refresh-and-continue on refusal.
+  // The pre-answer UI snapshot `act`/`chipAct` store for undo, read through a ref
+  // so their callbacks don't re-create (and re-bind the key listener) per answer.
+  const snapRef = useRef({ idx, chipDone, answered, settled });
+  snapRef.current = { idx, chipDone, answered, settled };
+
+  // Run one answer: count it, remember how to take it back, advance on success,
+  // refresh-and-continue on refusal.
   const act = useCallback(
-    (run: () => Promise<unknown>, photos: number) => {
+    (run: () => Promise<Revert>, photos: number, label: string) => {
+      const snap = { ...snapRef.current };
       run()
-        .then(() => {
+        .then((revert) => {
           setAnswered((a) => a + 1);
           setSettled((s) => s + photos);
+          setLastAnswer({ label, revert, ...snap });
           advance();
         })
         .catch((e) => handleRefusal(e, advance));
     },
     [advance, handleRefusal],
   );
+
+  // Take back the last answer: revert on the backend, then restore the UI to the
+  // moment before it — the undone card comes back, ready to answer again.
+  const doUndo = useCallback(() => {
+    const la = lastAnswer;
+    if (!la) return;
+    setLastAnswer(null);
+    la.revert()
+      .then(() => {
+        setIdx(la.idx);
+        setChipDone(new Set(la.chipDone));
+        setAnswered(la.answered);
+        setSettled(la.settled);
+        setPicking(false);
+        setPickQuery("");
+        setSplitting(false);
+        setSplitFaces([]);
+        setTags(new Map());
+      })
+      .catch(() => flashNote("Couldn't undo that."));
+  }, [lastAnswer, flashNote]);
 
   // The named people the "someone else…" picker offers (excluding the proposed one).
   const pickMatches = useMemo(() => {
@@ -178,21 +271,55 @@ export default function ReviewFocus({
 
   const pickPerson = (target: Cluster) => {
     if (pickTargetCluster == null) return;
-    act(() => absorbClusters(target.cluster_id, [pickTargetCluster], generation), pickPhotos);
+    act(
+      async () => {
+        const tok = await absorbClusters(target.cluster_id, [pickTargetCluster], generation);
+        return () => undoCorrection(tok);
+      },
+      pickPhotos,
+      `Moved ${photosLabel(pickPhotos)} to ${target.name}`,
+    );
   };
   const pickNewPerson = (name: string) => {
     if (pickTargetCluster == null || !name.trim()) return;
-    // Naming the cluster mints the person directly (and schedules the re-cluster).
-    act(() => nameCluster(pickTargetCluster, name.trim(), generation), pickPhotos);
+    const nm = name.trim();
+    // Naming the cluster mints the person directly (and schedules the re-cluster);
+    // undo renames the (now canonical) group back to unnamed.
+    act(
+      async () => {
+        const g = await nameCluster(pickTargetCluster, nm, generation);
+        return () => nameCluster(g, "");
+      },
+      pickPhotos,
+      `Named ${nm}`,
+    );
   };
 
-  // "Some are each": the contested cluster genuinely holds both candidates. Load its
-  // full face set so the user can tag each face as one person or the other, instead of
-  // being forced to a single whole-cluster verdict (and otherwise skipping forever).
+  // ↑/↓ + Enter in the "someone else…" picker: Enter takes the highlighted row —
+  // the TOP MATCH by default, so typing "Cami" ⏎ picks Camila instead of minting
+  // a new person named "Cami". The "+ New person" row is the last row.
+  const pickRowCount = pickMatches.length + (pickQuery.trim() ? 1 : 0);
+  const pickNav = usePickerNav(pickRowCount, (i) => {
+    if (i < pickMatches.length) pickPerson(pickMatches[i]);
+    else pickNewPerson(pickQuery.trim());
+  });
+
+  // "It's a mix…": the group genuinely holds more than one person. Load its full
+  // face set so the user can tag each face — a candidate person, or "someone else"
+  // — instead of being forced to a single whole-group verdict (or skipping forever).
+  // The candidates: who_is_this offers its two, maybe offers its one proposed person.
+  const splitCandidates: { name: string; into: number }[] =
+    item?.kind === "who_is_this"
+      ? item.candidates.slice(0, 2).map((c) => ({ name: c.name, into: c.into }))
+      : item?.kind === "maybe"
+        ? [{ name: item.name, into: item.into }]
+        : [];
+  const splitClusterId =
+    item?.kind === "who_is_this" ? item.cluster_id : item?.kind === "maybe" ? item.group.cluster_id : null;
   const beginSplit = () => {
-    if (!item || item.kind !== "who_is_this") return;
+    if (splitClusterId == null) return;
     setSplitLoading(true);
-    getClusterFaces(item.cluster_id)
+    getClusterFaces(splitClusterId)
       .then((f) => {
         setSplitFaces(f);
         setTags(new Map());
@@ -205,14 +332,14 @@ export default function ReviewFocus({
     setSplitting(false);
     setTags(new Map());
   };
-  // Tap a face to cycle its tag: untagged → A → B → someone-else → untagged.
+  // Tap a face to cycle its tag through the candidates, "someone else", then clear.
   const cycleTag = (faceId: number) =>
     setTags((prev) => {
       const next = new Map(prev);
       const cur = next.get(faceId);
       if (cur === undefined) next.set(faceId, 0);
-      else if (cur === 0) next.set(faceId, 1);
-      else if (cur === 1) next.set(faceId, 2);
+      else if (cur === 0 && splitCandidates.length > 1) next.set(faceId, 1);
+      else if (cur !== 2) next.set(faceId, 2);
       else next.delete(faceId);
       return next;
     });
@@ -221,67 +348,127 @@ export default function ReviewFocus({
   // force them together). Untagged faces stay put (partial splits are fine — the card
   // returns for whatever's left). One `act` so it counts as one answer and advances.
   const applySplit = () => {
-    if (!item || item.kind !== "who_is_this") return;
-    const a = item.candidates[0];
-    const b = item.candidates[1];
-    const bucketA: number[] = [];
-    const bucketB: number[] = [];
-    const bucketElse: number[] = [];
-    for (const [fid, t] of tags) (t === 0 ? bucketA : t === 1 ? bucketB : bucketElse).push(fid);
-    if (bucketA.length === 0 && bucketB.length === 0 && bucketElse.length === 0) return;
-    act(async () => {
-      if (bucketA.length) await confirmFacesIntoCluster(bucketA, a.into, generation);
-      if (bucketB.length) await confirmFacesIntoCluster(bucketB, b.into, generation);
-      if (bucketElse.length) await detachFaces(bucketElse);
-    }, bucketA.length + bucketB.length + bucketElse.length);
+    if (!item || splitCandidates.length === 0) return;
+    const buckets: number[][] = [[], [], []];
+    for (const [fid, t] of tags) buckets[t].push(fid);
+    const total = buckets[0].length + buckets[1].length + buckets[2].length;
+    if (total === 0) return;
+    act(
+      async () => {
+        const toks: CorrectionUndo[] = [];
+        for (let i = 0; i < splitCandidates.length; i++) {
+          if (buckets[i].length)
+            toks.push(await confirmFacesIntoCluster(buckets[i], splitCandidates[i].into, generation));
+        }
+        if (buckets[2].length) toks.push(await detachFaces(buckets[2]));
+        return revertAll(toks);
+      },
+      total,
+      `Split ${total.toLocaleString()} ${total === 1 ? "face" : "faces"}`,
+    );
   };
 
-  // Keyboard shortcuts — disabled while the picker's text field is active.
+  // Keyboard shortcuts — disabled while the picker's text field or split grid is up.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (picking) setPicking(false);
+        else if (splitting) endSplit();
         else onClose();
         return;
       }
-      if (picking || !item) return;
+      if (picking || splitting || !item) return;
       const k = e.key.toLowerCase();
       if (k === "arrowright") advance();
       if (item.kind === "maybe") {
-        if (k === "y") act(() => absorbClusters(item.into, [item.group.cluster_id], generation), item.photos);
-        else if (k === "n") act(() => notThisPerson(item.into, item.group.cluster_id, generation), item.photos);
+        if (k === "y")
+          act(
+            async () => {
+              const tok = await absorbClusters(item.into, [item.group.cluster_id], generation);
+              return () => undoCorrection(tok);
+            },
+            item.photos,
+            `Added ${photosLabel(item.photos)} to ${item.name}`,
+          );
+        else if (k === "n")
+          act(
+            async () => {
+              const tok = await notThisPerson(item.into, item.group.cluster_id, generation);
+              return () => undoCorrection(tok);
+            },
+            item.photos,
+            `Marked not ${item.name}`,
+          );
         else if (k === "s") setPicking(true);
+        else if (k === "m") beginSplit();
       } else if (item.kind === "pairwise") {
-        if (k === "y") act(() => mergeClusters(item.into, item.from, generation), item.photos);
-        else if (k === "n") act(() => rejectMerge(item.into, item.from, generation), item.photos);
+        if (k === "y")
+          act(
+            async () => {
+              const tok = await mergeClusters(item.into, item.from, generation);
+              return () => undoCorrection(tok);
+            },
+            item.photos,
+            item.into_name ? `Merged into ${item.into_name}` : "Merged — same person",
+          );
+        else if (k === "n")
+          act(
+            async () => {
+              const tok = await rejectMerge(item.into, item.from, generation);
+              return () => undoCorrection(tok);
+            },
+            item.photos,
+            "Kept apart — not the same",
+          );
       } else if (item.kind === "same_photo_twin") {
         const rest = item.pairs.filter((p) => !chipDone.has(p.from));
         if (k === "y" || k === "n") {
-          act(async () => {
-            for (const p of rest) await resolveSamePhoto(p.into, p.from, k === "y", generation);
-          }, rest.reduce((n, p) => n + p.photos, 0));
+          act(
+            async () => {
+              const toks: CorrectionUndo[] = [];
+              for (const p of rest)
+                toks.push(await resolveSamePhoto(p.into, p.from, k === "y", generation));
+              return revertAll(toks);
+            },
+            rest.reduce((n, p) => n + p.photos, 0),
+            k === "y" ? "Same person (collage/mirror)" : "Kept apart — two people",
+          );
         }
       } else if (item.kind === "strong_batch") {
         if (k === "y") {
           const rest = item.groups.filter((g) => !chipDone.has(g.cluster_id));
           act(
-            () => absorbClusters(item.into, rest.map((g) => g.cluster_id), generation),
+            async () => {
+              const tok = await absorbClusters(item.into, rest.map((g) => g.cluster_id), generation);
+              return () => undoCorrection(tok);
+            },
             rest.reduce((n, g) => n + g.photos, 0),
+            `Merged ${rest.length.toLocaleString()} ${rest.length === 1 ? "group" : "groups"} into ${item.name}`,
           );
         }
       } else if (item.kind === "who_is_this") {
         if (k === "s") setPicking(true);
+        else if (k === "m") beginSplit();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [item, picking, chipDone, generation, act, advance, onClose]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item, picking, splitting, chipDone, generation, act, advance, onClose]);
 
-  // One strong-batch / twin-pair chip answered: run it, tally it, and advance when
-  // the card empties. Chip actions don't use `act` — the card stays for the rest.
-  // A non-stale refusal hides the chip WITHOUT counting it: the backend says the
-  // question can't be answered as asked, so re-offering it forever helps no one.
-  const chipAct = (run: () => Promise<unknown>, chipId: number, photos: number, total: number) => {
+  // One strong-batch / twin-pair chip answered: run it, tally it, remember the
+  // take-back, and advance when the card empties. Chip actions don't use `act` —
+  // the card stays for the rest. A non-stale refusal hides the chip WITHOUT
+  // counting it: the backend says the question can't be answered as asked, so
+  // re-offering it forever helps no one.
+  const chipAct = (
+    run: () => Promise<Revert>,
+    chipId: number,
+    photos: number,
+    total: number,
+    label: string,
+  ) => {
+    const snap = { ...snapRef.current };
     const hideChip = () =>
       setChipDone((d) => {
         const next = new Set(d).add(chipId);
@@ -289,15 +476,88 @@ export default function ReviewFocus({
         return next;
       });
     run()
-      .then(() => {
+      .then((revert) => {
         setAnswered((a) => a + 1);
         setSettled((s) => s + photos);
+        setLastAnswer({ label, revert, ...snap });
         hideChip();
       })
       .catch((e) => handleRefusal(e, hideChip));
   };
 
   const keyHint = (k: string) => <span className="rf-key">{k}</span>;
+
+  const face = (f: number, cls = "") => (
+    <img key={f} className={`rf-face ${cls}`.trim()} src={faceCropUrl(f)} alt="" draggable={false} />
+  );
+
+  // The two-panel evidence block: the group in question (amber-ringed) on the
+  // left, the reference on the right — both labeled.
+  const panels = (
+    leftLabel: string,
+    leftFaces: number[],
+    rightLabel: string,
+    rightFaces: number[],
+    ringLeft: boolean,
+  ) => (
+    <div className="rf-panels">
+      <div className="rf-panel">
+        <span className="rf-panel-label">{leftLabel}</span>
+        <div className="rf-faces">{leftFaces.map((f) => face(f, ringLeft ? "small mystery" : "small"))}</div>
+      </div>
+      <div className="rf-panel-div" />
+      <div className="rf-panel">
+        <span className="rf-panel-label">{rightLabel}</span>
+        <div className="rf-faces">{rightFaces.map((f) => face(f, "small"))}</div>
+      </div>
+    </div>
+  );
+
+  // The "It's a mix…" tagging grid, shared by maybe (one candidate) and
+  // who_is_this (two candidates).
+  const renderSplit = () => {
+    const counts = [0, 0, 0];
+    for (const t of tags.values()) counts[t]++;
+    const total = counts[0] + counts[1] + counts[2];
+    const slotCls = ["a", "b", "c"];
+    return (
+      <>
+        <p className="rf-q">
+          {splitCandidates.length > 1
+            ? "Which is which?"
+            : `Tag the faces that are ${splitCandidates[0]?.name ?? "them"}`}
+        </p>
+        <div className="rf-split-legend">
+          {splitCandidates.map((c, i) => (
+            <span key={c.into} className={`rf-split-key ${slotCls[i]}`}>
+              {c.name} · {counts[i].toLocaleString()}
+            </span>
+          ))}
+          <span className="rf-split-key c">Someone else · {counts[2].toLocaleString()}</span>
+        </div>
+        <p className="rf-sub">
+          Tap a face to cycle its tag — untagged faces stay put for later.
+        </p>
+        <div className="rf-split-grid">
+          {splitFaces.map((f) => {
+            const t = tags.get(f);
+            const cls = t === undefined ? "" : slotCls[t];
+            return (
+              <button key={f} className={`rf-split-face ${cls}`} onClick={() => cycleTag(f)}>
+                {face(f, "small")}
+              </button>
+            );
+          })}
+        </div>
+        <div className="rf-actions">
+          <button className="sb-btn" disabled={total === 0} onClick={applySplit}>
+            Apply split ({total.toLocaleString()})
+          </button>
+          <button className="sb-btn ghost" onClick={endSplit}>Cancel</button>
+        </div>
+      </>
+    );
+  };
 
   const body = () => {
     if (refreshing) {
@@ -325,30 +585,59 @@ export default function ReviewFocus({
       );
     }
     if (item.kind === "maybe") {
+      if (splitting) return renderSplit();
       return (
         <>
-          <div className="rf-faces">
-            {item.group.face_id != null && (
-              <img className="rf-face" src={faceCropUrl(item.group.face_id)} alt="" draggable={false} />
-            )}
-          </div>
+          {panels(
+            `This group · ${photosLabel(item.photos)}`,
+            groupSamples,
+            item.name,
+            item.anchor_faces.slice(0, 3),
+            true,
+          )}
           <p className="rf-q">
-            Is this {item.name}? <span className="rf-anchor-strip">{item.anchor_faces.slice(0, 3).map((f) => (
-              <img key={f} className="rf-face tiny" src={faceCropUrl(f)} alt="" draggable={false} />
-            ))}</span>
+            {groupSamples.length > 1 ? `Are these ${item.name}?` : `Is this ${item.name}?`}
           </p>
-          <p className="rf-sub">{item.photos.toLocaleString()} {item.photos === 1 ? "photo" : "photos"}</p>
           {picking ? (
             renderPicker()
           ) : (
             <div className="rf-actions">
-              <button className="sb-btn" onClick={() => act(() => absorbClusters(item.into, [item.group.cluster_id], generation), item.photos)}>
+              <button
+                className="sb-btn"
+                onClick={() =>
+                  act(
+                    async () => {
+                      const tok = await absorbClusters(item.into, [item.group.cluster_id], generation);
+                      return () => undoCorrection(tok);
+                    },
+                    item.photos,
+                    `Added ${photosLabel(item.photos)} to ${item.name}`,
+                  )
+                }
+              >
                 Yes {keyHint("Y")}
               </button>
-              <button className="sb-btn" onClick={() => act(() => notThisPerson(item.into, item.group.cluster_id, generation), item.photos)}>
+              <button
+                className="sb-btn"
+                onClick={() =>
+                  act(
+                    async () => {
+                      const tok = await notThisPerson(item.into, item.group.cluster_id, generation);
+                      return () => undoCorrection(tok);
+                    },
+                    item.photos,
+                    `Marked not ${item.name}`,
+                  )
+                }
+              >
                 No {keyHint("N")}
               </button>
-              <button className="sb-btn" onClick={() => setPicking(true)}>Someone else… {keyHint("S")}</button>
+              <button className="sb-btn" onClick={() => setPicking(true)}>
+                Someone else… {keyHint("S")}
+              </button>
+              <button className="sb-btn" disabled={splitLoading} onClick={beginSplit}>
+                {splitLoading ? "Loading…" : <>It's a mix… {keyHint("M")}</>}
+              </button>
               <button className="sb-btn ghost" onClick={advance}>Skip {keyHint("→")}</button>
             </div>
           )}
@@ -356,69 +645,21 @@ export default function ReviewFocus({
       );
     }
     if (item.kind === "who_is_this") {
-      const a = item.candidates[0];
-      const b = item.candidates[1];
-      // Split mode: tag every contested face as one candidate or the other.
-      if (splitting) {
-        let countA = 0;
-        let countB = 0;
-        let countElse = 0;
-        for (const t of tags.values()) t === 0 ? countA++ : t === 1 ? countB++ : countElse++;
-        const total = countA + countB + countElse;
-        return (
-          <>
-            <p className="rf-q">Which is which?</p>
-            <div className="rf-split-legend">
-              <span className="rf-split-key a">{a.name} · {countA.toLocaleString()}</span>
-              <span className="rf-split-key b">{b.name} · {countB.toLocaleString()}</span>
-              <span className="rf-split-key c">Someone else · {countElse.toLocaleString()}</span>
-            </div>
-            <p className="rf-sub">
-              Tap a face to tag it — {a.name}, {b.name}, someone else, then clear.
-            </p>
-            <div className="rf-split-grid">
-              {splitFaces.map((f) => {
-                const t = tags.get(f);
-                const cls = t === 0 ? "a" : t === 1 ? "b" : t === 2 ? "c" : "";
-                return (
-                  <button key={f} className={`rf-split-face ${cls}`} onClick={() => cycleTag(f)}>
-                    <img className="rf-face small" src={faceCropUrl(f)} alt="" draggable={false} />
-                  </button>
-                );
-              })}
-            </div>
-            <div className="rf-actions">
-              <button className="sb-btn" disabled={total === 0} onClick={applySplit}>
-                Apply split ({total.toLocaleString()})
-              </button>
-              <button className="sb-btn ghost" onClick={endSplit}>Cancel</button>
-            </div>
-          </>
-        );
-      }
+      if (splitting) return renderSplit();
       return (
         <>
           <div className="rf-who">
             {item.candidates.slice(0, 2).map((c) => (
               <div className="rf-who-col" key={c.identity_id}>
                 <p className="rf-who-name">{c.name}</p>
-                <div className="rf-faces">
-                  {c.anchor_faces.map((f) => (
-                    <img key={f} className="rf-face small" src={faceCropUrl(f)} alt="" draggable={false} />
-                  ))}
-                </div>
+                <div className="rf-faces">{c.anchor_faces.map((f) => face(f, "small"))}</div>
               </div>
             ))}
           </div>
-          <div className="rf-faces">
-            {item.group_faces.map((f) => (
-              <img key={f} className="rf-face mystery" src={faceCropUrl(f)} alt="" draggable={false} />
-            ))}
-          </div>
+          <span className="rf-panel-label">This group · {photosLabel(item.photos)}</span>
+          <div className="rf-faces">{item.group_faces.map((f) => face(f, "mystery"))}</div>
           <p className="rf-q">Who is this?</p>
-          <p className="rf-sub">
-            {item.photos.toLocaleString()} {item.photos === 1 ? "photo" : "photos"} — both match; you decide
-          </p>
+          <p className="rf-sub">both match; you decide</p>
           {picking ? (
             renderPicker()
           ) : (
@@ -427,15 +668,26 @@ export default function ReviewFocus({
                 <button
                   key={c.identity_id}
                   className="sb-btn"
-                  onClick={() => act(() => absorbClusters(c.into, [item.cluster_id], generation), item.photos)}
+                  onClick={() =>
+                    act(
+                      async () => {
+                        const tok = await absorbClusters(c.into, [item.cluster_id], generation);
+                        return () => undoCorrection(tok);
+                      },
+                      item.photos,
+                      `Added ${photosLabel(item.photos)} to ${c.name}`,
+                    )
+                  }
                 >
                   {c.name}
                 </button>
               ))}
               <button className="sb-btn" disabled={splitLoading} onClick={beginSplit}>
-                {splitLoading ? "Loading…" : "Some are each…"}
+                {splitLoading ? "Loading…" : <>It's a mix… {keyHint("M")}</>}
               </button>
-              <button className="sb-btn" onClick={() => setPicking(true)}>Someone else… {keyHint("S")}</button>
+              <button className="sb-btn" onClick={() => setPicking(true)}>
+                Someone else… {keyHint("S")}
+              </button>
               <button className="sb-btn ghost" onClick={advance}>Not sure {keyHint("→")}</button>
             </div>
           )}
@@ -461,8 +713,8 @@ export default function ReviewFocus({
             {rest.map((p) => (
               <div className="pr-chip rf-twinpair" key={p.from}>
                 <div className="rf-faces">
-                  <img className="rf-face small" src={faceCropUrl(p.face_a)} alt="" draggable={false} />
-                  <img className="rf-face small" src={faceCropUrl(p.face_b)} alt="" draggable={false} />
+                  {face(p.face_a, "small")}
+                  {face(p.face_b, "small")}
                 </div>
                 {p.into_name && <div className="pr-count">{p.into_name}?</div>}
                 <div className="pr-yn">
@@ -471,10 +723,14 @@ export default function ReviewFocus({
                     title={`Same person${p.into_name ? ` — merge into ${p.into_name}` : ""} (collage/mirror)`}
                     onClick={() =>
                       chipAct(
-                        () => resolveSamePhoto(p.into, p.from, true, generation),
+                        async () => {
+                          const tok = await resolveSamePhoto(p.into, p.from, true, generation);
+                          return () => undoCorrection(tok);
+                        },
                         p.from,
                         p.photos,
                         item.pairs.length,
+                        "Same person (collage/mirror)",
                       )
                     }
                   >
@@ -485,10 +741,14 @@ export default function ReviewFocus({
                     title="Two people — keep them apart for good"
                     onClick={() =>
                       chipAct(
-                        () => resolveSamePhoto(p.into, p.from, false, generation),
+                        async () => {
+                          const tok = await resolveSamePhoto(p.into, p.from, false, generation);
+                          return () => undoCorrection(tok);
+                        },
                         p.from,
                         p.photos,
                         item.pairs.length,
+                        "Kept apart — two people",
                       )
                     }
                   >
@@ -502,9 +762,16 @@ export default function ReviewFocus({
             <button
               className="sb-btn"
               onClick={() =>
-                act(async () => {
-                  for (const p of rest) await resolveSamePhoto(p.into, p.from, true, generation);
-                }, rest.reduce((n, p) => n + p.photos, 0))
+                act(
+                  async () => {
+                    const toks: CorrectionUndo[] = [];
+                    for (const p of rest)
+                      toks.push(await resolveSamePhoto(p.into, p.from, true, generation));
+                    return revertAll(toks);
+                  },
+                  rest.reduce((n, p) => n + p.photos, 0),
+                  "Same person (collage/mirror)",
+                )
               }
             >
               {one ? "Same person" : `All same person (${rest.length.toLocaleString()})`} {keyHint("Y")}
@@ -512,9 +779,16 @@ export default function ReviewFocus({
             <button
               className="sb-btn"
               onClick={() =>
-                act(async () => {
-                  for (const p of rest) await resolveSamePhoto(p.into, p.from, false, generation);
-                }, rest.reduce((n, p) => n + p.photos, 0))
+                act(
+                  async () => {
+                    const toks: CorrectionUndo[] = [];
+                    for (const p of rest)
+                      toks.push(await resolveSamePhoto(p.into, p.from, false, generation));
+                    return revertAll(toks);
+                  },
+                  rest.reduce((n, p) => n + p.photos, 0),
+                  "Kept apart — two people",
+                )
               }
             >
               {one ? "Two people" : "All two people"} {keyHint("N")}
@@ -525,24 +799,47 @@ export default function ReviewFocus({
       );
     }
     if (item.kind === "pairwise") {
+      const named = item.into_name != null;
       return (
         <>
-          <div className="rf-faces">
-            {item.into_faces.slice(0, 3).map((f) => (
-              <img key={f} className="rf-face small" src={faceCropUrl(f)} alt="" draggable={false} />
-            ))}
-            <span className="rf-plus">+</span>
-            {item.from_faces.slice(0, 3).map((f) => (
-              <img key={f} className="rf-face small" src={faceCropUrl(f)} alt="" draggable={false} />
-            ))}
-          </div>
-          <p className="rf-q">Same person{item.into_name ? ` — ${item.into_name}` : ""}?</p>
-          <p className="rf-sub">{item.photos.toLocaleString()} {item.photos === 1 ? "photo" : "photos"} would fold in</p>
+          {panels(
+            named ? `This group · ${photosLabel(item.photos)}` : "Group A",
+            item.from_faces.slice(0, 3),
+            item.into_name ?? "Group B",
+            item.into_faces.slice(0, 3),
+            named,
+          )}
+          <p className="rf-q">Same person{named ? ` — ${item.into_name}` : ""}?</p>
+          <p className="rf-sub">{photosLabel(item.photos)} would fold in</p>
           <div className="rf-actions">
-            <button className="sb-btn" onClick={() => act(() => mergeClusters(item.into, item.from, generation), item.photos)}>
-              Merge {keyHint("Y")}
+            <button
+              className="sb-btn"
+              onClick={() =>
+                act(
+                  async () => {
+                    const tok = await mergeClusters(item.into, item.from, generation);
+                    return () => undoCorrection(tok);
+                  },
+                  item.photos,
+                  named ? `Merged into ${item.into_name}` : "Merged — same person",
+                )
+              }
+            >
+              Yes, merge {keyHint("Y")}
             </button>
-            <button className="sb-btn" onClick={() => act(() => rejectMerge(item.into, item.from, generation), item.photos)}>
+            <button
+              className="sb-btn"
+              onClick={() =>
+                act(
+                  async () => {
+                    const tok = await rejectMerge(item.into, item.from, generation);
+                    return () => undoCorrection(tok);
+                  },
+                  item.photos,
+                  "Kept apart — not the same",
+                )
+              }
+            >
               Not the same {keyHint("N")}
             </button>
             <button className="sb-btn ghost" onClick={advance}>Skip {keyHint("→")}</button>
@@ -555,14 +852,13 @@ export default function ReviewFocus({
     return (
       <>
         <p className="rf-q">
-          {remaining.length.toLocaleString()} {remaining.length === 1 ? "group" : "groups"} strongly match{" "}
-          {item.name}
-          <span className="rf-anchor-strip">
-            {item.anchor_faces.slice(0, 3).map((f) => (
-              <img key={f} className="rf-face tiny" src={faceCropUrl(f)} alt="" draggable={false} />
-            ))}
-          </span>
+          {remaining.length.toLocaleString()} {remaining.length === 1 ? "group" : "groups"} strongly
+          match {item.name}
         </p>
+        <div className="rf-refrow">
+          <span className="rf-panel-label">{item.name}</span>
+          {item.anchor_faces.slice(0, 3).map((f) => face(f, "tiny"))}
+        </div>
         <p className="rf-sub">confirm each, or merge them all</p>
         <div className="rf-chiprow">
           {remaining.map((g) => (
@@ -579,10 +875,14 @@ export default function ReviewFocus({
                   title={`Yes — this is ${item.name}`}
                   onClick={() =>
                     chipAct(
-                      () => absorbClusters(item.into, [g.cluster_id], generation),
+                      async () => {
+                        const tok = await absorbClusters(item.into, [g.cluster_id], generation);
+                        return () => undoCorrection(tok);
+                      },
                       g.cluster_id,
                       g.photos,
                       item.groups.length,
+                      `Added ${photosLabel(g.photos)} to ${item.name}`,
                     )
                   }
                 >
@@ -593,10 +893,14 @@ export default function ReviewFocus({
                   title="Not this person"
                   onClick={() =>
                     chipAct(
-                      () => notThisPerson(item.into, g.cluster_id, generation),
+                      async () => {
+                        const tok = await notThisPerson(item.into, g.cluster_id, generation);
+                        return () => undoCorrection(tok);
+                      },
                       g.cluster_id,
                       g.photos,
                       item.groups.length,
+                      `Marked not ${item.name}`,
                     )
                   }
                 >
@@ -611,8 +915,16 @@ export default function ReviewFocus({
             className="sb-btn"
             onClick={() =>
               act(
-                () => absorbClusters(item.into, remaining.map((g) => g.cluster_id), generation),
+                async () => {
+                  const tok = await absorbClusters(
+                    item.into,
+                    remaining.map((g) => g.cluster_id),
+                    generation,
+                  );
+                  return () => undoCorrection(tok);
+                },
                 remaining.reduce((n, g) => n + g.photos, 0),
+                `Merged ${remaining.length.toLocaleString()} ${remaining.length === 1 ? "group" : "groups"} into ${item.name}`,
               )
             }
           >
@@ -633,22 +945,34 @@ export default function ReviewFocus({
           autoFocus
           value={pickQuery}
           placeholder="Who is it?"
-          onChange={(e) => setPickQuery(e.target.value)}
+          onChange={(e) => {
+            setPickQuery(e.target.value);
+            pickNav.resetHighlight();
+          }}
           onKeyDown={(e) => {
             if (e.key === "Escape") setPicking(false);
-            else if (e.key === "Enter" && pickQuery.trim()) pickNewPerson(pickQuery.trim());
+            else pickNav.onNavKey(e);
           }}
         />
         <ul className="sb-matches">
-          {pickMatches.map((m) => (
-            <li key={m.cluster_id} className="sb-match" onClick={() => pickPerson(m)}>
+          {pickMatches.map((m, i) => (
+            <li
+              key={m.cluster_id}
+              className={`sb-match${pickNav.highlight === i ? " hi" : ""}`}
+              onMouseEnter={() => pickNav.setHighlight(i)}
+              onClick={() => pickPerson(m)}
+            >
               <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
               <span className="ns-name">{m.name}</span>
               <span className="ns-count">{m.count.toLocaleString()}</span>
             </li>
           ))}
           {pickQuery.trim() && (
-            <li className="sb-match sb-new" onClick={() => pickNewPerson(pickQuery.trim())}>
+            <li
+              className={`sb-match sb-new${pickNav.highlight === pickMatches.length ? " hi" : ""}`}
+              onMouseEnter={() => pickNav.setHighlight(pickMatches.length)}
+              onClick={() => pickNewPerson(pickQuery.trim())}
+            >
               + New person “{pickQuery.trim()}”
             </li>
           )}
@@ -662,10 +986,10 @@ export default function ReviewFocus({
       <div className="rf-card" onClick={(e) => e.stopPropagation()}>
         <div className="rf-progress">
           <span className="rf-count">
-            {answered > 0
-              ? `${answered.toLocaleString()} answered`
-              : items.length > idx
-                ? `${(items.length - idx).toLocaleString()} to look at`
+            {refreshing
+              ? "…"
+              : items.length > 0 && idx < items.length
+                ? `${(idx + 1).toLocaleString()} of ${items.length.toLocaleString()}`
                 : ""}
           </span>
           {(item || refreshing) && (
@@ -676,6 +1000,14 @@ export default function ReviewFocus({
         </div>
         {body()}
         {note && <p className="rf-note">{note}</p>}
+        {lastAnswer && !refreshing && (
+          <p className="rf-last">
+            <span className="rf-last-label">{lastAnswer.label}</span>
+            <button className="rf-undo" onClick={doUndo}>
+              Undo
+            </button>
+          </p>
+        )}
         {settled > 0 && item && (
           <p className="rf-tally">{settled.toLocaleString()} photos settled this session</p>
         )}

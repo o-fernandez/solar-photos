@@ -484,9 +484,9 @@ fn merge_clusters(
     into: i64,
     from: i64,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<CorrectionUndo, String> {
     ensure_generation(&state, expected_generation)?;
-    {
+    let undo = {
         let conn = state.conn.lock().unwrap();
         // If exactly one side carries a name, that side survives — folding a named
         // person INTO an unnamed pile would silently un-name them.
@@ -497,6 +497,7 @@ fn merge_clusters(
         } else {
             (into, from)
         };
+        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
         // A user merge vouches for BOTH sides as one person — everything under the
         // surviving identity is confirmed (sticky exemplars + must-links) after the
         // fold. Confirming only one side let the next pass split the other right
@@ -506,11 +507,12 @@ fn merge_clusters(
             db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
         db::merge_group_into_identity(&conn, into_identity, from).map_err(|e| e.to_string())?;
         db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
-    }
+        CorrectionUndo::faces_only(prior)
+    };
     prune_suggestion_cache(&state, &[into, from]);
     // The merge added exemplars — re-derive the folds competitively (self-heal).
     schedule_refold(app);
-    Ok(())
+    Ok(undo)
 }
 
 /// Every photo containing this person, newest first (same ordering as the
@@ -567,12 +569,46 @@ fn face_ids_for_photos(
 }
 
 /// What a correction returns so it can be undone exactly: the faces' prior state,
-/// the new person's group key when one was created, and any cannot-link we added.
+/// the new person's group key when one was created, any cannot-link we added, and
+/// any same-photo exceptions we added (cluster-level review answers use these too).
 #[derive(Clone, serde::Serialize)]
 struct CorrectionUndo {
     prior: Vec<db::FaceState>,
     new_cluster_id: Option<i64>,
     added_cannot_link: Option<(i64, i64)>,
+    added_same_photo_ok: Vec<(i64, i64)>,
+}
+
+impl CorrectionUndo {
+    fn faces_only(prior: Vec<db::FaceState>) -> Self {
+        CorrectionUndo {
+            prior,
+            new_cluster_id: None,
+            added_cannot_link: None,
+            added_same_photo_ok: Vec::new(),
+        }
+    }
+}
+
+/// Snapshot the face states of whole groups — what a cluster-level answer (merge /
+/// absorb / reject / not-this-person / same-photo) needs captured for exact undo.
+/// Chunked: a big person can hold thousands of faces, and SQLite caps the variables
+/// one `IN (…)` may carry.
+fn capture_group_states(
+    conn: &rusqlite::Connection,
+    groups: &[i64],
+) -> anyhow::Result<Vec<db::FaceState>> {
+    let mut ids: Vec<i64> = Vec::new();
+    for &g in groups {
+        ids.extend(db::cluster_face_ids(conn, g)?);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut states = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(900) {
+        states.extend(db::capture_face_states(conn, chunk)?);
+    }
+    Ok(states)
 }
 
 /// Reassign faces to an **existing** person (their cluster). Binds them to that
@@ -601,7 +637,7 @@ fn reassign_faces_to_cluster(
         db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
     db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
     let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added })
+    Ok(CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) })
 }
 
 /// Reassign faces to a **new** person (an optional name). Splits them into a fresh
@@ -629,7 +665,7 @@ fn reassign_faces_to_new_person(
                     db::ensure_identity_for_group(&conn, target).map_err(|e| e.to_string())?;
                 db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
                 let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
-                return Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: added });
+                return Ok(CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) });
             }
         }
     }
@@ -641,7 +677,11 @@ fn reassign_faces_to_new_person(
         let _ = db::name_group(&conn, -new_id, nm).map_err(|e| e.to_string())?;
     }
     let added = record_cannot_link_if_new(&conn, source_id, new_id).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo { prior, new_cluster_id: Some(-new_id), added_cannot_link: added })
+    Ok(CorrectionUndo {
+        new_cluster_id: Some(-new_id),
+        added_cannot_link: added,
+        ..CorrectionUndo::faces_only(prior)
+    })
 }
 
 /// Every face in a cluster (face ids, best first) — backs the "Who is this?" split
@@ -681,7 +721,7 @@ fn confirm_faces_into_cluster(
         db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
         drop(conn);
         schedule_refold(app);
-        Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
+        Ok(CorrectionUndo::faces_only(prior))
     }
 }
 
@@ -694,7 +734,7 @@ fn ignore_faces(
     let conn = state.conn.lock().unwrap();
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     db::ignore_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
+    Ok(CorrectionUndo::faces_only(prior))
 }
 
 /// "Not this person" without naming who they are: unbind the faces from their
@@ -712,24 +752,30 @@ fn detach_faces(
         let conn = state.conn.lock().unwrap();
         let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
         db::detach_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
-        CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None }
+        CorrectionUndo::faces_only(prior)
     };
     schedule_refold(app);
     Ok(undo)
 }
 
 /// Undo any correction: restore the faces' prior grouping and drop any cannot-link
-/// the correction added.
+/// or same-photo exceptions the correction added. Re-derives the folds afterward so
+/// the display reflects the restored state (deferred while a review session holds).
 #[tauri::command]
 fn undo_correction(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     undo: CorrectionUndoArg,
 ) -> Result<(), String> {
-    let mut conn = state.conn.lock().unwrap();
-    db::restore_face_states(&mut conn, &undo.prior).map_err(|e| e.to_string())?;
-    if let Some((a, b)) = undo.added_cannot_link {
-        db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
+    {
+        let mut conn = state.conn.lock().unwrap();
+        db::restore_face_states(&mut conn, &undo.prior).map_err(|e| e.to_string())?;
+        if let Some((a, b)) = undo.added_cannot_link {
+            db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
+        }
+        db::remove_same_photo_ok(&conn, &undo.added_same_photo_ok).map_err(|e| e.to_string())?;
     }
+    schedule_refold(app);
     Ok(())
 }
 
@@ -739,6 +785,8 @@ fn undo_correction(
 struct CorrectionUndoArg {
     prior: Vec<db::FaceState>,
     added_cannot_link: Option<(i64, i64)>,
+    #[serde(default)]
+    added_same_photo_ok: Vec<(i64, i64)>,
 }
 
 /// Record a cannot-link between two identities unless it already exists or they're
@@ -810,12 +858,13 @@ fn absorb_clusters(
     into: i64,
     clusters: Vec<i64>,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<CorrectionUndo, String> {
     ensure_generation(&state, expected_generation)?;
     let mut touched = clusters.clone();
     touched.push(into);
-    {
+    let undo = {
         let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
         let into_identity =
             db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
         for from in clusters {
@@ -838,11 +887,12 @@ fn absorb_clusters(
             db::merge_group_into_identity(&conn, into_identity, from)
                 .map_err(|e| e.to_string())?;
         }
-    }
+        CorrectionUndo::faces_only(prior)
+    };
     prune_suggestion_cache(&state, &touched);
     // Bulk-merging added exemplars — re-derive the folds competitively (self-heal).
     schedule_refold(app);
-    Ok(())
+    Ok(undo)
 }
 
 /// "Not the same" on a merge prompt: record a durable cannot-link so the pair is
@@ -858,18 +908,20 @@ fn reject_merge(
     into: i64,
     from: i64,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<CorrectionUndo, String> {
     ensure_generation(&state, expected_generation)?;
-    {
+    let undo = {
         let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
         let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
         let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
-        db::add_cannot_link_ids(&conn, ia, ib).map_err(|e| e.to_string())?;
+        let added = record_cannot_link_if_new(&conn, ia, ib).map_err(|e| e.to_string())?;
         db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
         db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
-    }
+        CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
+    };
     prune_suggestion_cache(&state, &[into, from]);
-    Ok(())
+    Ok(undo)
 }
 
 /// "Not <person>" on a review candidate: instead of a weak, per-group cannot-link, make
@@ -884,22 +936,25 @@ fn not_this_person(
     person_cluster_id: i64,
     other_cluster_id: i64,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<CorrectionUndo, String> {
     ensure_generation(&state, expected_generation)?;
-    {
+    let undo = {
         let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &[person_cluster_id, other_cluster_id])
+            .map_err(|e| e.to_string())?;
         // Mint identities for both sides + cannot-link, then confirm the rejected group
         // so it's a durable, competing exemplar (not wiped as a tentative machine label).
         let person =
             db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
         let other =
             db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
-        db::add_cannot_link_ids(&conn, person, other).map_err(|e| e.to_string())?;
+        let added = record_cannot_link_if_new(&conn, person, other).map_err(|e| e.to_string())?;
         db::confirm_identity_faces(&conn, other).map_err(|e| e.to_string())?;
-    }
+        CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
+    };
     prune_suggestion_cache(&state, &[person_cluster_id, other_cluster_id]);
     schedule_refold(app);
-    Ok(())
+    Ok(undo)
 }
 
 /// Resolve a same-photo contradiction (see [`ReviewItem::SamePhotoTwin`]).
@@ -915,10 +970,11 @@ fn resolve_same_photo(
     from: i64,
     same_person: bool,
     expected_generation: Option<i64>,
-) -> Result<(), String> {
+) -> Result<CorrectionUndo, String> {
     ensure_generation(&state, expected_generation)?;
-    {
+    let undo = {
         let conn = state.conn.lock().unwrap();
+        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
         if same_person {
             // Resolve the blocked face pairs BEFORE any identity minting shifts
             // the positive group key out from under `cooccurring_face_pairs`.
@@ -938,25 +994,28 @@ fn resolve_same_photo(
             {
                 return Err("that group already belongs to another named person".into());
             }
-            db::add_same_photo_ok(&conn, &pairs).map_err(|e| e.to_string())?;
+            let added_ok =
+                db::add_same_photo_ok_returning_new(&conn, &pairs).map_err(|e| e.to_string())?;
             db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
             db::merge_group_into_identity(&conn, into_identity, from)
                 .map_err(|e| e.to_string())?;
             // Vouch for the united person so the pairing survives self-heal.
             db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
+            CorrectionUndo { added_same_photo_ok: added_ok, ..CorrectionUndo::faces_only(prior) }
         } else {
             // Two look-alikes: durable cannot-link, both sides durable competitors
             // (same rationale as reject_merge — unconfirmed bindings evaporate).
             let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
             let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
-            db::add_cannot_link_ids(&conn, ia, ib).map_err(|e| e.to_string())?;
+            let added = record_cannot_link_if_new(&conn, ia, ib).map_err(|e| e.to_string())?;
             db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
             db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
+            CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
         }
-    }
+    };
     prune_suggestion_cache(&state, &[into, from]);
     schedule_refold(app);
-    Ok(())
+    Ok(undo)
 }
 
 /// Wipe all face data — detections, clusters, names, identities, decisions — and

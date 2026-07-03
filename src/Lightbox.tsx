@@ -29,6 +29,7 @@ import {
   type PhotoDetail,
   type PhotoFace,
 } from "./api";
+import { usePickerNav } from "./pickerNav";
 
 interface Props {
   index: number;
@@ -67,8 +68,14 @@ function contentRectOf(img: HTMLImageElement): ContentRect | null {
 export default function Lightbox({ index, total, resolveId, onClose, onCorrection }: Props) {
   const [current, setCurrent] = useState(index);
   const [id, setId] = useState<number | null>(null);
+  // The photo actually on screen. Navigation preloads the next photo off-screen
+  // and swaps `shownId` only once it's decoded — the previous photo stays up, so
+  // arrowing never flashes to black even when the neighbor isn't cached yet.
+  const [shownId, setShownId] = useState<number | null>(null);
   const [detail, setDetail] = useState<PhotoDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  // Face boxes can be hidden (F, or the button) to look at the photo clean.
+  const [showFaces, setShowFaces] = useState(true);
 
   const [faces, setFaces] = useState<PhotoFace[]>([]);
   const [rect, setRect] = useState<ContentRect | null>(null);
@@ -90,14 +97,22 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     [total],
   );
 
-  // Keyboard: ←/→ navigate, Esc closes (or just closes an open face menu first).
+  // Keyboard: ←/→ navigate, F toggles face boxes, Esc closes (or just closes an
+  // open face menu first). Ignored while typing in a face-menu field — the fields
+  // handle their own keys, and an arrow press there must not change the photo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       if (e.key === "Escape") {
         if (openFace !== null) setOpenFace(null);
         else onClose();
       } else if (e.key === "ArrowRight") go(1);
       else if (e.key === "ArrowLeft") go(-1);
+      else if (e.key.toLowerCase() === "f") {
+        setOpenFace(null);
+        setShowFaces((s) => !s);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -154,6 +169,33 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       alive = false;
     };
   }, [current, total, resolveId]);
+
+  // Swap the on-screen photo only once the new one is decoded (see `shownId`).
+  // A slow preload that lands after the user has arrowed further is dropped —
+  // only the *latest* target may swap in.
+  const idRef = useRef<number | null>(null);
+  idRef.current = id;
+  useEffect(() => {
+    if (id == null) return;
+    if (shownId == null) {
+      setShownId(id); // first photo: the <img> itself shows progress
+      return;
+    }
+    if (id === shownId) {
+      // Navigated away and straight back: the <img> src won't change, so no load
+      // event will clear the spinner — the photo on screen is already right.
+      setLoading(false);
+      return;
+    }
+    const pre = new Image();
+    const swap = () => {
+      if (idRef.current === id) setShownId(id); // onerror too: let the <img> surface it
+    };
+    pre.onload = swap;
+    pre.onerror = swap;
+    pre.src = photoUrl(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
   // Keep the face-box overlay aligned to the displayed image as it loads / resizes.
   // The boxes are children of the stage, so we express the image's content rect in
@@ -276,6 +318,25 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         ✕
       </button>
 
+      {faces.length > 0 && (
+        <button
+          className={`viewer-btn viewer-faces${showFaces ? " on" : ""}`}
+          aria-label={showFaces ? "Hide face boxes" : "Show face boxes"}
+          aria-pressed={showFaces}
+          title={showFaces ? "Hide faces (F)" : "Show faces (F)"}
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpenFace(null);
+            setShowFaces((s) => !s);
+          }}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="8" r="4" />
+            <path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" />
+          </svg>
+        </button>
+      )}
+
       {current > 0 && (
         <button
           className="viewer-btn viewer-prev"
@@ -301,13 +362,19 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         </button>
       )}
 
-      <div className="viewer-stage" ref={stageRef} onClick={(e) => e.stopPropagation()}>
+      <div
+        className="viewer-stage"
+        ref={stageRef}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (openFace !== null) setOpenFace(null); // click-away closes the menu
+        }}
+      >
         {loading && <span className="viewer-spinner" />}
-        {id != null && (
+        {shownId != null && (
           <img
-            key={id}
             ref={imgRef}
-            src={photoUrl(id)}
+            src={photoUrl(shownId)}
             className="viewer-img"
             alt={detail?.filename ?? ""}
             draggable={false}
@@ -316,12 +383,12 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
               remeasure();
             }}
             onError={() => setLoading(false)}
-            style={{ opacity: loading ? 0 : 1 }}
           />
         )}
 
-        {/* Face boxes, positioned over the displayed image content. */}
-        {!loading && rect &&
+        {/* Face boxes, positioned over the displayed image content — only for the
+            photo actually on screen, and only while the overlay is shown. */}
+        {!loading && rect && showFaces && shownId === id &&
           faces.map((f) => {
             const box = {
               left: rect.left + f.x1 * rect.width,
@@ -393,7 +460,7 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         </div>
       )}
 
-      {detail && (
+      {detail && shownId === id && (
         <div className="viewer-caption" onClick={(e) => e.stopPropagation()}>
           {when}
           <span className="viewer-filename"> · {detail.filename}</span>
@@ -456,6 +523,19 @@ function FaceMenu({
     .slice(0, 6);
   const exact = q ? people.find((c) => c.name && c.name.toLowerCase() === q) : undefined;
 
+  // ↑/↓ + Enter over the rows; the top match is Enter's default, so a half-typed
+  // name picks the person instead of minting a near-duplicate. "Ignore" stays
+  // click-only — too destructive for a stray Enter.
+  const nameRows = matches.length + (draft.trim() && !exact ? 1 : 0);
+  const nameNav = usePickerNav(nameRows, (i) => {
+    if (i < matches.length) onMergePerson(matches[i]);
+    else onNamePerson(draft.trim());
+  });
+  const moveNav = usePickerNav(matches.length + 1, (i) => {
+    if (i < matches.length) onReassignExisting(matches[i]);
+    else onReassignNew(draft.trim() || undefined);
+  });
+
   return (
     <div className="face-menu" style={placement} onClick={(e) => e.stopPropagation()}>
       {/* Unnamed: one unified "name or pick a person" combobox. */}
@@ -466,21 +546,33 @@ function FaceMenu({
             autoFocus
             value={draft}
             placeholder="Name, or pick a person"
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              nameNav.resetHighlight();
+            }}
             onKeyDown={(e) => {
               if (e.key === "Escape") onClose();
-              else if (e.key === "Enter" && q) (exact ? onMergePerson(exact) : onNamePerson(draft.trim()));
+              else nameNav.onNavKey(e);
             }}
           />
           <ul className="fm-matches">
-            {matches.map((m) => (
-              <li key={m.cluster_id} className="fm-match" onClick={() => onMergePerson(m)}>
+            {matches.map((m, i) => (
+              <li
+                key={m.cluster_id}
+                className={`fm-match${nameNav.highlight === i ? " hi" : ""}`}
+                onMouseEnter={() => nameNav.setHighlight(i)}
+                onClick={() => onMergePerson(m)}
+              >
                 <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
                 <span className="ns-name">{m.name}</span>
               </li>
             ))}
             {draft.trim() && !exact && (
-              <li className="fm-match fm-new" onClick={() => onNamePerson(draft.trim())}>
+              <li
+                className={`fm-match fm-new${nameNav.highlight === matches.length ? " hi" : ""}`}
+                onMouseEnter={() => nameNav.setHighlight(matches.length)}
+                onClick={() => onNamePerson(draft.trim())}
+              >
                 + Name “{draft.trim()}”
               </li>
             )}
@@ -529,20 +621,32 @@ function FaceMenu({
             autoFocus
             value={draft}
             placeholder="Move to which person?"
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              moveNav.resetHighlight();
+            }}
             onKeyDown={(e) => {
               if (e.key === "Escape") setMode("root");
-              else if (e.key === "Enter" && draft.trim()) onReassignNew(draft.trim());
+              else moveNav.onNavKey(e);
             }}
           />
           <ul className="fm-matches">
-            {matches.map((m) => (
-              <li key={m.cluster_id} className="fm-match" onClick={() => onReassignExisting(m)}>
+            {matches.map((m, i) => (
+              <li
+                key={m.cluster_id}
+                className={`fm-match${moveNav.highlight === i ? " hi" : ""}`}
+                onMouseEnter={() => moveNav.setHighlight(i)}
+                onClick={() => onReassignExisting(m)}
+              >
                 <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
                 <span className="ns-name">{m.name}</span>
               </li>
             ))}
-            <li className="fm-match fm-new" onClick={() => onReassignNew(draft.trim() || undefined)}>
+            <li
+              className={`fm-match fm-new${moveNav.highlight === matches.length ? " hi" : ""}`}
+              onMouseEnter={() => moveNav.setHighlight(matches.length)}
+              onClick={() => onReassignNew(draft.trim() || undefined)}
+            >
               + New person{draft.trim() ? ` “${draft.trim()}”` : ""}
             </li>
           </ul>

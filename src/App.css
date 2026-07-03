@@ -352,6 +352,15 @@ body,
     transform: translateY(0);
   }
 }
+.toast.second {
+  bottom: 92px;
+}
+.toast-path {
+  max-width: 250px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .toast {
   position: fixed;
   right: 18px;
@@ -536,6 +545,10 @@ body,
   flex-direction: column;
   align-items: center;
   gap: 6px;
+  cursor: pointer;
+}
+.ptile:hover .pavatar {
+  box-shadow: 0 0 0 3px #cdddf5;
 }
 .pavatar {
   width: 88px;
@@ -550,8 +563,33 @@ body,
   font-size: 14px;
   font-weight: 500;
   color: #1a1a1a;
-  cursor: pointer;
   padding: 0;
+}
+/* Name + hover pencil: the whole tile opens the person, so renaming moved behind
+   an explicit affordance instead of a look-alike click target. */
+.pname-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.pname-edit {
+  border: none;
+  background: none;
+  color: #8a8a8a;
+  cursor: pointer;
+  padding: 2px 3px;
+  border-radius: 4px;
+  line-height: 0;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.ptile:hover .pname-edit,
+.pname-edit:focus-visible {
+  opacity: 1;
+}
+.pname-edit:hover {
+  color: #1a1a1a;
+  background: #ececec;
 }
 .paddname {
   border: none;
@@ -560,6 +598,14 @@ body,
   color: #185fa5;
   cursor: pointer;
   padding: 0;
+  /* Hover-only: a settled grid repeats this on dozens of tiles — as permanent
+     chrome it's a wall of identical calls to action. */
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.ptile:hover .paddname,
+.paddname:focus-visible {
+  opacity: 1;
 }
 .pname-input {
   width: 110px;
@@ -602,7 +648,8 @@ body,
   border-radius: 6px;
   cursor: pointer;
 }
-.name-suggest-item:hover {
+.name-suggest-item:hover,
+.name-suggest-item.hi {
   background: #eef4fc;
 }
 .ns-face {
@@ -669,13 +716,26 @@ body,
   border-bottom: 1px solid #ececec;
 }
 /* The "looks" strip: a person's own appearance sub-clusters. Click one to filter the
-   grid to that era; a look flagged as someone else offers a one-click batch move. */
+   grid to that era; a look flagged as someone else offers a one-click batch move.
+   Titled — a bare row of face circles right under the header read as "more people". */
+.person-looks-wrap {
+  border-bottom: 1px solid #ececec;
+}
+.looks-head {
+  padding: 10px 16px 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: #6a6a6a;
+}
+.looks-hint {
+  font-weight: 400;
+  color: #9e9e9e;
+}
 .person-looks {
   display: flex;
   gap: 10px;
-  padding: 12px 16px;
+  padding: 10px 16px 12px;
   overflow-x: auto;
-  border-bottom: 1px solid #ececec;
 }
 .look {
   display: flex;
@@ -957,8 +1017,12 @@ body,
   cursor: pointer;
   transition: background 0.12s;
 }
-.sb-btn:hover {
+.sb-btn:hover:not(:disabled) {
   background: #4a4a4a;
+}
+.sb-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .sb-btn.ghost {
   background: transparent;
@@ -1000,7 +1064,8 @@ body,
   cursor: pointer;
   color: #1a1a1a;
 }
-.sb-match:hover {
+.sb-match:hover,
+.sb-match.hi {
   background: #eef4fc;
 }
 .sb-new {
@@ -1171,6 +1236,23 @@ body,
 }
 .scrubber:hover .scrubber-thumb {
   background: #a9a9a9;
+}
+/* Date wayfinding while scrolling: fades in at the grid's top-left, out on stop. */
+.month-chip {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  z-index: 6;
+  background: #ffffff;
+  border: 1px solid #d8d8d8;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1a1a1a;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
 }
 .scrubber-label {
   position: absolute;
@@ -1356,7 +1438,8 @@ body,
   border-radius: 6px;
   cursor: pointer;
 }
-.fm-match:hover {
+.fm-match:hover,
+.fm-match.hi {
   background: #eef4fc;
 }
 .fm-new {
@@ -1421,6 +1504,18 @@ body,
   top: 16px;
   right: 20px;
   font-size: 22px;
+}
+/* Face-overlay toggle (F): amber while the boxes are shown, dim while hidden. */
+.viewer-faces {
+  top: 16px;
+  right: 62px;
+  padding: 2px 6px;
+}
+.viewer-faces.on {
+  color: #f5a623;
+}
+.viewer-faces.on:hover {
+  color: #f7b84a;
 }
 .viewer-prev,
 .viewer-next {
@@ -1653,6 +1748,110 @@ body,
   .person-name {
     color: #ededed;
   }
+  .ptile:hover .pavatar {
+    box-shadow: 0 0 0 3px #2f4a6e;
+  }
+  .pname-edit {
+    color: #999;
+  }
+  .pname-edit:hover {
+    color: #ededed;
+    background: #333;
+  }
+  .name-suggest-item.hi {
+    background: #2f3a49;
+  }
+  /* The person page's banners and bands — these stayed light-mode slabs. */
+  .reorg-banner {
+    background: #26303a;
+    color: #85b7eb;
+  }
+  .pb-sub {
+    color: #7da7d6;
+  }
+  .banner-x {
+    color: #7da7d6;
+  }
+  .banner-x:hover {
+    color: #b5d4f4;
+  }
+  .person-looks-wrap {
+    border-bottom-color: #333;
+  }
+  .looks-head {
+    color: #aaa;
+  }
+  .looks-hint {
+    color: #777;
+  }
+  .look {
+    background: #2c2c2c;
+    border-color: #3a3a3a;
+  }
+  .look-lbl {
+    color: #ededed;
+  }
+  .look-sub {
+    color: #9a9a9a;
+  }
+  .look.sel {
+    background: #20342a;
+    border-color: #2f7a4d;
+  }
+  .look.flag {
+    background: #3a2f1c;
+    border-color: #8a6220;
+  }
+  .look-flagtag {
+    color: #e3b878;
+  }
+  .look-face {
+    background: #2a2a2a;
+  }
+  .look-bar {
+    background: #1f2b23;
+    border-bottom-color: #2c3f33;
+  }
+  .lb-count {
+    color: #8fc7a4;
+  }
+  /* Scoped to the person page's review band — the same .pr-* chips also live on
+     the review card, which is deliberately always-white. */
+  .person-review {
+    background: #20342a;
+    border-bottom-color: #2c3f33;
+  }
+  .person-review .pr-title {
+    color: #6fce97;
+  }
+  .person-review .pr-count {
+    color: #8fc7a4;
+  }
+  .person-review .pr-face {
+    border-color: #20342a;
+    background: #2a2a2a;
+  }
+  .person-review .pr-yn button {
+    background: #2c2c2c;
+    border-color: #444;
+  }
+  .person-review .pr-y {
+    border-color: #2f5a41 !important;
+  }
+  .person-review .pr-y:hover {
+    background: #1f2b23;
+  }
+  .person-review .pr-n {
+    border-color: #5a2f2f !important;
+  }
+  .person-review .pr-n:hover {
+    background: #3a2424;
+  }
+  .month-chip {
+    background: #2c2c2c;
+    border-color: #444;
+    color: #ededed;
+  }
 }
 
 /* --- Focus review (the training session as an inbox: one decision per screen). */
@@ -1748,11 +1947,75 @@ body,
   font-weight: 500;
   margin: 0 0 2px;
 }
-/* The proposed person's own reference faces, inline next to the question. */
-.rf-anchor-strip {
-  margin-left: 8px;
-  display: inline-flex;
-  gap: 3px;
+/* Two labeled evidence panels: the group IN QUESTION (amber-ringed) beside the
+   reference person's confirmed faces. Both named, so "Is this X?" stops being
+   ambiguous about which faces "this" means. */
+.rf-panels {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  gap: 14px;
+  margin: 4px 0 12px;
+}
+.rf-panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.rf-panel .rf-faces {
+  margin: 0;
+  flex-wrap: wrap;
+}
+.rf-panel-div {
+  width: 1px;
+  background: #ececec;
+  flex: 0 0 auto;
+}
+.rf-panel-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  color: #8a8a8a;
+  text-align: center;
+}
+/* The reference person's faces as a labeled row (strong-batch card). */
+.rf-refrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 6px 0 2px;
+}
+/* The last answer, revertable until the next one replaces it — "No" writes a
+   durable cannot-link, so a misclick needs a way back. */
+.rf-last {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 12px;
+  color: #5a5a5a;
+  margin: 14px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid #f0f0f0;
+}
+.rf-last-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rf-undo {
+  border: none;
+  background: none;
+  color: #1a6fd0;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  flex: 0 0 auto;
 }
 .rf-sub {
   text-align: center;

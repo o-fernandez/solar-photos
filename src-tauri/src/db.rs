@@ -311,13 +311,31 @@ pub fn same_photo_ok_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Record same-photo exceptions for a set of face pairs (normalized, idempotent).
-pub fn add_same_photo_ok(conn: &Connection, pairs: &[(i64, i64)]) -> Result<()> {
+/// Record same-photo exceptions, returning only the pairs that were actually new —
+/// what an undo of the answer must remove (pre-existing pairs belong to earlier,
+/// separate decisions and must survive it).
+pub fn add_same_photo_ok_returning_new(
+    conn: &Connection,
+    pairs: &[(i64, i64)],
+) -> Result<Vec<(i64, i64)>> {
     let mut ins = conn
         .prepare("INSERT OR IGNORE INTO same_photo_ok (a, b) VALUES (?1, ?2)")?;
+    let mut added = Vec::new();
     for &(x, y) in pairs {
         let (a, b) = if x < y { (x, y) } else { (y, x) };
-        ins.execute(rusqlite::params![a, b])?;
+        if ins.execute(rusqlite::params![a, b])? > 0 {
+            added.push((a, b));
+        }
+    }
+    Ok(added)
+}
+
+/// Drop same-photo exceptions (undo of a "same person — collage" answer).
+pub fn remove_same_photo_ok(conn: &Connection, pairs: &[(i64, i64)]) -> Result<()> {
+    let mut del = conn.prepare("DELETE FROM same_photo_ok WHERE a = ?1 AND b = ?2")?;
+    for &(x, y) in pairs {
+        let (a, b) = if x < y { (x, y) } else { (y, x) };
+        del.execute(rusqlite::params![a, b])?;
     }
     Ok(())
 }
@@ -1555,9 +1573,16 @@ mod tests {
         .unwrap();
         let pairs = cooccurring_face_pairs(&conn, 10, 20).unwrap();
         assert_eq!(pairs, vec![(9, 1, 2)], "only the shared-photo pair is blocked");
-        add_same_photo_ok(&conn, &pairs.iter().map(|&(_, a, b)| (a, b)).collect::<Vec<_>>())
-            .unwrap();
-        add_same_photo_ok(&conn, &[(2, 1)]).unwrap(); // reversed + duplicate: idempotent
+        let added = add_same_photo_ok_returning_new(
+            &conn,
+            &pairs.iter().map(|&(_, a, b)| (a, b)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(added, vec![(1, 2)], "new pairs are reported for undo");
+        // Reversed + duplicate: idempotent, and NOT re-reported as new.
+        assert_eq!(add_same_photo_ok_returning_new(&conn, &[(2, 1)]).unwrap(), vec![]);
         assert_eq!(same_photo_ok_pairs(&conn).unwrap(), vec![(1, 2)]);
+        remove_same_photo_ok(&conn, &added).unwrap();
+        assert_eq!(same_photo_ok_pairs(&conn).unwrap(), vec![], "undo removes the pair");
     }
 }

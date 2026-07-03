@@ -179,12 +179,12 @@ export function nameCluster(
  *  `expectedGeneration` (from a suggestion payload) lets the backend refuse the
  *  merge if clustering has been renumbered since the card was computed — acting on
  *  a stale card would merge whatever cluster now holds that id. Omit for paths fed
- *  by fresh data (the name typeahead). */
+ *  by fresh data (the name typeahead). Resolves to an undo token. */
 export function mergeClusters(
   into: number,
   from: number,
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<CorrectionUndo> {
   return invoke("merge_clusters", { into, from, expectedGeneration: expectedGeneration ?? null });
 }
 
@@ -333,13 +333,14 @@ export function setReviewActive(active: boolean): Promise<void> {
 
 /** Resolve a same-photo contradiction: `samePerson` = it's a collage/mirror
  *  (record durable per-pair exceptions + merge); otherwise they're two
- *  look-alikes — durable cannot-link so they never re-merge. */
+ *  look-alikes — durable cannot-link so they never re-merge. Resolves to an
+ *  undo token. */
 export function resolveSamePhoto(
   into: number,
   from: number,
   samePerson: boolean,
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<CorrectionUndo> {
   return invoke("resolve_same_photo", {
     into,
     from,
@@ -348,12 +349,13 @@ export function resolveSamePhoto(
   });
 }
 
-/** Fold a batch of look-alike clusters into a confirmed person (durable). */
+/** Fold a batch of look-alike clusters into a confirmed person (durable).
+ *  Resolves to an undo token. */
 export function absorbClusters(
   into: number,
   clusters: number[],
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<CorrectionUndo> {
   return invoke("absorb_clusters", {
     into,
     clusters,
@@ -361,12 +363,13 @@ export function absorbClusters(
   });
 }
 
-/** "Not the same": record a durable cannot-link so the pair is never re-suggested. */
+/** "Not the same": record a durable cannot-link so the pair is never re-suggested.
+ *  Resolves to an undo token. */
 export function rejectMerge(
   into: number,
   from: number,
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<CorrectionUndo> {
   return invoke("reject_merge", { into, from, expectedGeneration: expectedGeneration ?? null });
 }
 
@@ -377,7 +380,7 @@ export function notThisPerson(
   personClusterId: number,
   otherClusterId: number,
   expectedGeneration?: number,
-): Promise<void> {
+): Promise<CorrectionUndo> {
   return invoke("not_this_person", {
     personClusterId,
     otherClusterId,
@@ -470,6 +473,8 @@ export interface CorrectionUndo {
   /** Set when the correction created a new person (so the UI can focus it). */
   new_cluster_id: number | null;
   added_cannot_link: [number, number] | null;
+  /** Same-photo exceptions added by a "same person — collage" answer. */
+  added_same_photo_ok: [number, number][];
 }
 
 /** Faces detected in one photo (for the in-photo overlay), highest score first. */
@@ -554,6 +559,10 @@ export function detachFaces(faceIds: number[]): Promise<CorrectionUndo> {
 /** Undo any correction with the token it returned. */
 export function undoCorrection(undo: CorrectionUndo): Promise<void> {
   return invoke("undo_correction", {
-    undo: { prior: undo.prior, added_cannot_link: undo.added_cannot_link },
+    undo: {
+      prior: undo.prior,
+      added_cannot_link: undo.added_cannot_link,
+      added_same_photo_ok: undo.added_same_photo_ok ?? [],
+    },
   });
 }
