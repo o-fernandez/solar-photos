@@ -504,6 +504,28 @@ export function ignoreFaces(faceIds: number[]): Promise<CorrectionUndo> {
   return invoke("ignore_faces", { faceIds });
 }
 
+/** Every face in a cluster (face ids, best first) — the full set behind a "Who is
+ *  this?" card, so the split grid can show every contested face. */
+export function getClusterFaces(clusterId: number): Promise<number[]> {
+  return invoke("get_cluster_faces", { clusterId });
+}
+
+/** Confirm a subset of faces into an existing person, leaving the rest of the source
+ *  cluster untouched. Backs the "Who is this?" split — the user tags some faces as A
+ *  and some as B, and each batch is confirmed into that person. No cannot-link against
+ *  the (ephemeral, contested) source, so untagged faces aren't stranded. */
+export function confirmFacesIntoCluster(
+  faceIds: number[],
+  targetClusterId: number,
+  expectedGeneration?: number,
+): Promise<CorrectionUndo> {
+  return invoke("confirm_faces_into_cluster", {
+    faceIds,
+    targetClusterId,
+    expectedGeneration: expectedGeneration ?? null,
+  });
+}
+
 /** "Not this person" without naming who they are: detach the faces and let the
  *  re-cluster re-home each by appearance (they may land in several people, or none).
  *  Unlike a new-person split they aren't forced together; unlike ignore they aren't

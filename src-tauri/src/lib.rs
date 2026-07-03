@@ -849,6 +849,48 @@ fn reassign_faces_to_new_person(
     Ok(CorrectionUndo { prior, new_cluster_id: Some(new_cluster), added_cannot_link: added })
 }
 
+/// Every face in a cluster (face ids, best first) — backs the "Who is this?" split
+/// grid, where the user tags each contested face as one candidate or the other and so
+/// needs the whole cluster on screen, not the 3-face sample the card ships with.
+#[tauri::command]
+fn get_cluster_faces(
+    state: tauri::State<'_, AppState>,
+    cluster_id: i64,
+) -> Result<Vec<i64>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::cluster_face_ids(&conn, cluster_id).map_err(|e| e.to_string())
+}
+
+/// Confirm a subset of faces into an existing person, leaving the rest of their
+/// current cluster untouched. Backs the "Who is this?" split: a contested cluster
+/// holds two people, so the user tags some faces as A and some as B and each batch is
+/// confirmed into that person. Unlike [`reassign_faces_to_cluster`] this records **no**
+/// cannot-link against the source — the source is an ephemeral contested cluster, and
+/// cannot-linking its untagged remainder from both people would strand faces that are
+/// in fact one of them, just not tagged this round. Kicks a (review-deferred)
+/// re-cluster so the remainder re-folds. Returns prior state for exact undo.
+#[tauri::command]
+fn confirm_faces_into_cluster(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+    target_cluster_id: i64,
+    expected_generation: Option<i64>,
+) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
+    {
+        let mut conn = state.conn.lock().unwrap();
+        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+        let target_id =
+            db::ensure_identity_for_cluster(&conn, target_cluster_id).map_err(|e| e.to_string())?;
+        db::set_faces_person(&mut conn, &face_ids, target_cluster_id, target_id)
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        schedule_recluster(app);
+        Ok(CorrectionUndo { prior, new_cluster_id: None, added_cannot_link: None })
+    }
+}
+
 /// Ignore faces (drop from People for good). Returns prior state for undo.
 #[tauri::command]
 fn ignore_faces(
@@ -1674,6 +1716,9 @@ const RECLUSTER_FLAG: &str = "reclustered_v1";
 /// Set once faces have been re-detected with the fixed alignment (see the
 /// migration in `setup`). Bumping this string forces a one-time face re-sweep.
 const FACES_ALIGNED_FLAG: &str = "faces_aligned_v2";
+/// Set once HEIC faces have been re-detected from the correctly-oriented decode.
+/// Bumping this string re-runs the orientation repair (see the migration in `setup`).
+const HEIC_ORIENT_FLAG: &str = "heic_orient_v1";
 
 /// Progress of a background re-cluster. `running` flips false when it finishes, so
 /// the People view can reload exactly once (and never mid-rebuild → no reflow).
@@ -2122,9 +2167,29 @@ fn run_recluster(app: AppHandle) {
             // are left free to re-cluster by appearance, so a wrongly-folded look-alike
             // isn't welded on — it re-homes once a better-matching person exists.
             let (photo_of, same_photo_ok) = photo_constraints(&conn)?;
+            // Two identities the user gave *different* names are, by definition,
+            // different people — they must never agglomerate into one cluster (which
+            // would bury the smaller under the larger's name, e.g. "Mía" vanishing
+            // into "Arnaldo"). Naming is the user's decision, so treat every distinct-
+            // name pair as an implicit cannot-link, on top of the explicit "not the
+            // same" ones. Same-name identities (one person split across two clusters)
+            // are left mergeable, so this also helps re-fuse an over-split person.
+            let mut cannot_link: std::collections::HashSet<(i64, i64)> =
+                db::cannot_link_pairs(&conn)?.into_iter().collect();
+            {
+                let named = db::named_identities(&conn)?;
+                for (i, (ida, na)) in named.iter().enumerate() {
+                    for (idb, nb) in named.iter().skip(i + 1) {
+                        if na != nb {
+                            let key = if ida < idb { (*ida, *idb) } else { (*idb, *ida) };
+                            cannot_link.insert(key);
+                        }
+                    }
+                }
+            }
             let constraints = cluster::LinkConstraints {
                 face_identity: db::confirmed_face_identities(&conn)?.into_iter().collect(),
-                cannot_link: db::cannot_link_pairs(&conn)?.into_iter().collect(),
+                cannot_link,
                 photo_of,
                 same_photo_ok,
             };
@@ -2573,6 +2638,28 @@ pub fn run() {
                 db::set_meta(&conn, FACES_ALIGNED_FLAG, "1")?;
             }
 
+            // One-time migration for the HEIC orientation fix: iPhone HEICs store
+            // rotation in the container's `irot` box (not an EXIF tag), and earlier
+            // builds detected faces before that transform was applied (orientation
+            // handling changed across 1c955bf → dc5df8f → 6b811c9). Those faces' boxes
+            // — and the crops they were embedded from — sit in the un-rotated space,
+            // so boxes land off-target and the embeddings are poor. Re-detect every
+            // HEIC from the current, correctly-oriented decode, dropping the stale
+            // preview + crop caches (and re-queuing thumbnails) so nothing re-detects
+            // on the old pixels. Skipped cleanly once done (or when there are no HEICs).
+            if db::get_meta(&conn, HEIC_ORIENT_FLAG).ok().flatten().is_none() {
+                let ids = db::heic_photo_ids(&conn).unwrap_or_default();
+                let face_ids = db::face_ids_of_photos(&conn, &ids).unwrap_or_default();
+                db::rearm_photos_for_redetect(&conn, &ids)?;
+                for fid in &face_ids {
+                    let _ = std::fs::remove_file(faces::face_crop_path(&faces_dir, *fid));
+                }
+                for id in &ids {
+                    let _ = std::fs::remove_file(thumbs::preview_path(&preview_dir, *id));
+                }
+                db::set_meta(&conn, HEIC_ORIENT_FLAG, "1")?;
+            }
+
             // Has the one-time migration off the old greedy clustering run yet?
             // (Checked now, before `conn` moves into the shared state.)
             let needs_recluster = db::get_meta(&conn, RECLUSTER_FLAG)
@@ -2755,6 +2842,8 @@ pub fn run() {
             get_person_looks,
             get_faces_in_photo,
             face_ids_for_photos,
+            get_cluster_faces,
+            confirm_faces_into_cluster,
             reassign_faces_to_cluster,
             reassign_faces_to_new_person,
             ignore_faces,

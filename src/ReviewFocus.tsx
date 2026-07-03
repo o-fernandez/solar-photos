@@ -15,7 +15,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   absorbClusters,
+  confirmFacesIntoCluster,
+  detachFaces,
   faceCropUrl,
+  getClusterFaces,
   getClusters,
   getReviewQueue,
   mergeClusters,
@@ -49,6 +52,14 @@ export default function ReviewFocus({
   const [picking, setPicking] = useState(false);
   const [pickQuery, setPickQuery] = useState("");
   const [people, setPeople] = useState<Cluster[]>([]);
+  // "Some are each" split state (who_is_this only): the contested cluster's full face
+  // set, and each tagged face's candidate slot (0 = first candidate, 1 = second).
+  // Tag slots: 0 = first candidate, 1 = second candidate, 2 = "someone else"
+  // (neither of the two — detach and let each face re-home by appearance).
+  const [splitting, setSplitting] = useState(false);
+  const [splitFaces, setSplitFaces] = useState<number[]>([]);
+  const [splitLoading, setSplitLoading] = useState(false);
+  const [tags, setTags] = useState<Map<number, 0 | 1 | 2>>(new Map());
   // True while we're waiting out a re-cluster and refetching the queue.
   const [refreshing, setRefreshing] = useState(false);
   // Transient "we refreshed under you" note after a mid-session reorganization.
@@ -75,6 +86,9 @@ export default function ReviewFocus({
     setChipDone(new Set());
     setPicking(false);
     setPickQuery("");
+    setSplitting(false);
+    setSplitFaces([]);
+    setTags(new Map());
     setIdx((i) => i + 1);
   }, []);
 
@@ -98,6 +112,9 @@ export default function ReviewFocus({
           setChipDone(new Set());
           setPicking(false);
           setPickQuery("");
+          setSplitting(false);
+          setSplitFaces([]);
+          setTags(new Map());
           setRefreshing(false);
           setNote("People were reorganized — continuing with fresh suggestions.");
           window.setTimeout(() => setNote(null), 4000);
@@ -145,6 +162,56 @@ export default function ReviewFocus({
     if (pickTargetCluster == null || !name.trim()) return;
     // Naming the cluster mints the person directly (and schedules the re-cluster).
     act(() => nameCluster(pickTargetCluster, name.trim()), pickPhotos);
+  };
+
+  // "Some are each": the contested cluster genuinely holds both candidates. Load its
+  // full face set so the user can tag each face as one person or the other, instead of
+  // being forced to a single whole-cluster verdict (and otherwise skipping forever).
+  const beginSplit = () => {
+    if (!item || item.kind !== "who_is_this") return;
+    setSplitLoading(true);
+    getClusterFaces(item.cluster_id)
+      .then((f) => {
+        setSplitFaces(f);
+        setTags(new Map());
+        setSplitting(true);
+      })
+      .catch(() => {})
+      .finally(() => setSplitLoading(false));
+  };
+  const endSplit = () => {
+    setSplitting(false);
+    setTags(new Map());
+  };
+  // Tap a face to cycle its tag: untagged → A → B → someone-else → untagged.
+  const cycleTag = (faceId: number) =>
+    setTags((prev) => {
+      const next = new Map(prev);
+      const cur = next.get(faceId);
+      if (cur === undefined) next.set(faceId, 0);
+      else if (cur === 0) next.set(faceId, 1);
+      else if (cur === 1) next.set(faceId, 2);
+      else next.delete(faceId);
+      return next;
+    });
+  // Confirm each candidate batch into its person; "someone else" faces detach and
+  // re-home by appearance (they may be one new person, several, or none — so we don't
+  // force them together). Untagged faces stay put (partial splits are fine — the card
+  // returns for whatever's left). One `act` so it counts as one answer and advances.
+  const applySplit = () => {
+    if (!item || item.kind !== "who_is_this") return;
+    const a = item.candidates[0];
+    const b = item.candidates[1];
+    const bucketA: number[] = [];
+    const bucketB: number[] = [];
+    const bucketElse: number[] = [];
+    for (const [fid, t] of tags) (t === 0 ? bucketA : t === 1 ? bucketB : bucketElse).push(fid);
+    if (bucketA.length === 0 && bucketB.length === 0 && bucketElse.length === 0) return;
+    act(async () => {
+      if (bucketA.length) await confirmFacesIntoCluster(bucketA, a.into, generation);
+      if (bucketB.length) await confirmFacesIntoCluster(bucketB, b.into, generation);
+      if (bucketElse.length) await detachFaces(bucketElse);
+    }, bucketA.length + bucketB.length + bucketElse.length);
   };
 
   // Keyboard shortcuts — disabled while the picker's text field is active.
@@ -263,6 +330,46 @@ export default function ReviewFocus({
       );
     }
     if (item.kind === "who_is_this") {
+      const a = item.candidates[0];
+      const b = item.candidates[1];
+      // Split mode: tag every contested face as one candidate or the other.
+      if (splitting) {
+        let countA = 0;
+        let countB = 0;
+        let countElse = 0;
+        for (const t of tags.values()) t === 0 ? countA++ : t === 1 ? countB++ : countElse++;
+        const total = countA + countB + countElse;
+        return (
+          <>
+            <p className="rf-q">Which is which?</p>
+            <div className="rf-split-legend">
+              <span className="rf-split-key a">{a.name} · {countA.toLocaleString()}</span>
+              <span className="rf-split-key b">{b.name} · {countB.toLocaleString()}</span>
+              <span className="rf-split-key c">Someone else · {countElse.toLocaleString()}</span>
+            </div>
+            <p className="rf-sub">
+              Tap a face to tag it — {a.name}, {b.name}, someone else, then clear.
+            </p>
+            <div className="rf-split-grid">
+              {splitFaces.map((f) => {
+                const t = tags.get(f);
+                const cls = t === 0 ? "a" : t === 1 ? "b" : t === 2 ? "c" : "";
+                return (
+                  <button key={f} className={`rf-split-face ${cls}`} onClick={() => cycleTag(f)}>
+                    <img className="rf-face small" src={faceCropUrl(f)} alt="" draggable={false} />
+                  </button>
+                );
+              })}
+            </div>
+            <div className="rf-actions">
+              <button className="sb-btn" disabled={total === 0} onClick={applySplit}>
+                Apply split ({total.toLocaleString()})
+              </button>
+              <button className="sb-btn ghost" onClick={endSplit}>Cancel</button>
+            </div>
+          </>
+        );
+      }
       return (
         <>
           <div className="rf-who">
@@ -299,6 +406,9 @@ export default function ReviewFocus({
                   {c.name}
                 </button>
               ))}
+              <button className="sb-btn" disabled={splitLoading} onClick={beginSplit}>
+                {splitLoading ? "Loading…" : "Some are each…"}
+              </button>
               <button className="sb-btn" onClick={() => setPicking(true)}>Someone else… {keyHint("S")}</button>
               <button className="sb-btn ghost" onClick={advance}>Not sure {keyHint("→")}</button>
             </div>

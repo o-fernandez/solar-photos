@@ -387,6 +387,17 @@ pub fn top_face_ids(conn: &Connection, cluster_id: i64, limit: i64) -> Result<Ve
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Every face id in a cluster, best (highest score) first. Backs the "Who is this?"
+/// split grid, where the user tags each contested face as one candidate or the other,
+/// so — unlike [`top_face_ids`] — it must return the whole cluster, not a sample.
+pub fn cluster_face_ids(conn: &Connection, cluster_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM faces WHERE cluster_id = ?1 ORDER BY score DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cluster_id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Discard all detected faces and re-arm the sweep. Used as a one-time migration
 /// when the embedding pipeline itself changes (e.g. the alignment fix): every
 /// stored embedding is now invalid, and landmarks aren't persisted, so faces must
@@ -1029,6 +1040,55 @@ pub fn delete_faces_for_photos(conn: &Connection, photo_ids: &[i64]) -> Result<(
     let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
     let sql = format!("DELETE FROM faces WHERE photo_id IN ({placeholders})");
     conn.execute(&sql, rusqlite::params_from_iter(photo_ids.iter()))?;
+    Ok(())
+}
+
+/// Photo ids whose original is a genuine HEIC/HEIF (by extension). Drives the
+/// one-time orientation-repair migration.
+pub fn heic_photo_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM photos WHERE lower(path) LIKE '%.heic' OR lower(path) LIKE '%.heif'",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Face ids belonging to the given photos — used to clean their cached crops (keyed
+/// by face id) before the rows are deleted.
+pub fn face_ids_of_photos(conn: &Connection, photo_ids: &[i64]) -> Result<Vec<i64>> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id FROM faces WHERE photo_id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(photo_ids.iter()), |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Re-arm the given photos for a fresh face sweep and thumbnail regeneration: drop
+/// their detected faces, clear `faces_scanned`, and knock any cached (stale-
+/// orientation) thumbnail back to PENDING so the worker regenerates it upright.
+/// Callers drop the stale preview/crop files on the filesystem side.
+pub fn rearm_photos_for_redetect(conn: &Connection, photo_ids: &[i64]) -> Result<()> {
+    if photo_ids.is_empty() {
+        return Ok(());
+    }
+    delete_faces_for_photos(conn, photo_ids)?;
+    let placeholders = std::iter::repeat("?").take(photo_ids.len()).collect::<Vec<_>>().join(",");
+    conn.execute(
+        &format!("UPDATE photos SET faces_scanned = 0 WHERE id IN ({placeholders})"),
+        rusqlite::params_from_iter(photo_ids.iter()),
+    )?;
+    // Only re-queue photos that already have a local thumbnail; leave cloud-only
+    // ones (never downloaded) untouched so this doesn't trigger a mass download.
+    conn.execute(
+        &format!(
+            "UPDATE photos SET thumb_status = {STATUS_PENDING} \
+             WHERE thumb_status = {STATUS_READY} AND id IN ({placeholders})"
+        ),
+        rusqlite::params_from_iter(photo_ids.iter()),
+    )?;
     Ok(())
 }
 
