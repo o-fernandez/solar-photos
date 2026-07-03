@@ -567,7 +567,7 @@ fn face_ids_for_photos(
 }
 
 /// What a correction returns so it can be undone exactly: the faces' prior state,
-/// the new cluster id when a new person was created, and any cannot-link we added.
+/// the new person's group key when one was created, and any cannot-link we added.
 #[derive(Clone, serde::Serialize)]
 struct CorrectionUndo {
     prior: Vec<db::FaceState>,
@@ -1153,6 +1153,7 @@ fn run_auto_fold(app: AppHandle) {
     }
     let db_path = state.db_path.clone();
     let reclustering = state.reclustering.clone();
+    let recluster_pending = state.recluster_pending.clone();
     let fold_pending = state.fold_pending.clone();
     drop(state);
 
@@ -1173,8 +1174,12 @@ fn run_auto_fold(app: AppHandle) {
         }
         let _ = app.emit("cluster-progress", ClusterProgress { running: false, fraction: 1.0 });
         reclustering.store(false, Ordering::SeqCst);
-        // A fold was requested while we ran — honor it so its corrections land.
-        if fold_pending.swap(false, Ordering::SeqCst) {
+        // Anything queued while we ran — a full re-cluster outranks a fold (it
+        // ends with one), and folds are frequent now, so dropping a queued
+        // consolidation here would starve the sweep's cleanup.
+        if recluster_pending.swap(false, Ordering::SeqCst) {
+            run_recluster(app_for_rerun);
+        } else if fold_pending.swap(false, Ordering::SeqCst) {
             run_auto_fold(app_for_rerun);
         }
     });
@@ -1495,8 +1500,16 @@ fn spawn_face_workers(
                             && !app.state::<AppState>().reclustering.load(Ordering::SeqCst)
                         {
                             run_recluster(app.clone());
-                            let guard = app.state::<AppState>().reclustering.clone();
-                            while guard.load(Ordering::SeqCst) {
+                            // Wait for the pass — including one that got QUEUED
+                            // because a fold snuck in between the check above and
+                            // the call (recluster_pending) — before reloading the
+                            // in-memory index; reloading early would resurrect
+                            // pre-consolidation cluster ids for new faces.
+                            let st = app.state::<AppState>();
+                            let guard = st.reclustering.clone();
+                            let queued = st.recluster_pending.clone();
+                            drop(st);
+                            while guard.load(Ordering::SeqCst) || queued.load(Ordering::SeqCst) {
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                             }
                             index = cluster::ClusterIndex::load(

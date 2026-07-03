@@ -485,7 +485,9 @@ export default function PersonView({
   const keepLook = () => {
     if (!activeLook || activeLook.likely_other_cluster == null) return;
     endLook();
-    rejectMerge(groupId, activeLook.likely_other_cluster).then(loadLooks).catch(() => {});
+    rejectMerge(groupId, activeLook.likely_other_cluster)
+      .then(loadLooks)
+      .catch(() => flashNotice("People were just reorganized — try that again."));
   };
 
   // Named people other than the one we're viewing, filtered by a typeahead — shared by

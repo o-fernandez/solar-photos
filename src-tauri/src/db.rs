@@ -723,9 +723,23 @@ pub fn identity_of_group(conn: &Connection, group: i64) -> Result<Option<i64>> {
 /// one; a positive (appearance) key mints a fresh identity and binds the group's
 /// faces to it — from then on the tile lives under the stable negative key, so
 /// callers must not reuse the old positive key afterwards.
+///
+/// An EMPTY positive group is refused: fold passes don't bump the generation (they
+/// move no ids), so a held positive key can outlive its faces — a fold may have
+/// claimed them all since the UI loaded it. Minting an identity for it would bind
+/// nothing, and the caller's follow-up writes (a name, a merge target) would land
+/// on an invisible ghost. The error text matches the frontend's stale handling.
 pub fn ensure_identity_for_group(conn: &Connection, group: i64) -> Result<i64> {
     if group < 0 {
         return Ok(-group);
+    }
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM faces WHERE cluster_id = ?1 AND identity_id IS NULL AND ignored = 0",
+        [group],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        anyhow::bail!("stale group: people were reorganized since it was shown");
     }
     let id = new_identity(conn)?;
     conn.execute(
@@ -1443,6 +1457,23 @@ mod tests {
         assert_eq!(identity_of_face(&conn, 2), Some(minted));
         assert_eq!(group_of_face(&conn, 2), Some(-minted), "tile moves to the stable key");
         assert_eq!(identity_of_face(&conn, 1), Some(1), "Omar's face untouched");
+    }
+
+    /// A positive group whose faces a fold claimed since the UI loaded it must be
+    /// refused, not minted as a ghost: naming/merging an emptied tile should fail
+    /// loudly (the frontends read this as "people were reorganized — retry").
+    #[test]
+    fn ensure_refuses_an_emptied_group() {
+        let conn = test_conn();
+        conn.execute_batch("INSERT INTO identities (id, name) VALUES (1, 'Omar');").unwrap();
+        insert_face(&conn, 1, 10, Some(1), false); // the fold claimed cluster 10's face
+        let err = ensure_identity_for_group(&conn, 10).unwrap_err().to_string();
+        assert!(err.contains("reorganized"), "got: {err}");
+        // No ghost identity was minted.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// group_is_other_named_person: only a named identity with confirmed evidence
