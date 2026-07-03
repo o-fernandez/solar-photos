@@ -3,7 +3,7 @@
 How Solar turns 30k photos into named people, and — more importantly — how it
 handles the cases the face model *can't* cleanly separate (babies, siblings,
 look-alikes). This is the hard-won design rationale; read it before changing
-anything in `src-tauri/src/{cluster,db,lib}.rs` or `src/{People,PersonView}.tsx`.
+anything in `src-tauri/src/{cluster,recognition,db,lib}.rs` or `src/{People,PersonView}.tsx`.
 
 ## The problem, honestly
 
@@ -161,7 +161,7 @@ competitor); `not_this_person` is the shortcut that mints an unnamed competitor 
 - `reset_face_recognition` — the nuke: deletes faces and re-runs the full detection
   sweep. Not wired to the UI.
 
-## Tuning knobs (all in `lib.rs` unless noted)
+## Tuning knobs (all in `recognition.rs` unless noted)
 
 | Const | Val | Meaning |
 |---|---|---|
