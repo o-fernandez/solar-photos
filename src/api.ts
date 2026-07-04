@@ -457,6 +457,20 @@ export function faceCropUrl(faceId: number): string {
   return `thumb://localhost/face/${faceId}`;
 }
 
+/** The photo a face was cropped from, plus its normalized box within it —
+ *  for peeking at the full picture from a review chip or card. */
+export interface FacePhoto {
+  photo_id: number;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export function getFacePhoto(faceId: number): Promise<FacePhoto | null> {
+  return invoke("get_face_photo", { faceId });
+}
+
 /** Every photo containing this person, newest first (a filtered timeline). */
 export function getPersonPhotos(clusterId: number): Promise<PhotoRow[]> {
   return invoke("get_person_photos", { clusterId });

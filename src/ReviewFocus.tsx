@@ -47,6 +47,7 @@ import {
   type ReviewQueue,
 } from "./api";
 import { usePickerNav } from "./pickerNav";
+import FacePeek from "./FacePeek";
 
 /** Reverses one answer on the backend. */
 type Revert = () => Promise<unknown>;
@@ -108,6 +109,8 @@ export default function ReviewFocus({
   const [note, setNote] = useState<string | null>(null);
   // The last answer, revertable inline until the next answer replaces it.
   const [lastAnswer, setLastAnswer] = useState<LastAnswer | null>(null);
+  // A face being peeked at full-photo size (crops alone often aren't enough).
+  const [peekFace, setPeekFace] = useState<number | null>(null);
   const refreshTries = useRef(0);
 
   const item = !refreshing && idx < items.length ? items[idx] : null;
@@ -407,7 +410,7 @@ export default function ReviewFocus({
         else onClose();
         return;
       }
-      if (picking || splitting || !item) return;
+      if (picking || splitting || peekFace != null || !item) return;
       const k = e.key.toLowerCase();
       if (k === "arrowright") advance();
       if (item.kind === "maybe") {
@@ -484,7 +487,7 @@ export default function ReviewFocus({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item, picking, splitting, chipDone, generation, act, advance, onClose]);
+  }, [item, picking, splitting, peekFace, chipDone, generation, act, advance, onClose]);
 
   // One strong-batch / twin-pair chip answered: run it, tally it, remember the
   // take-back, and advance when the card empties. Chip actions don't use `act` —
@@ -517,8 +520,26 @@ export default function ReviewFocus({
 
   const keyHint = (k: string) => <span className="rf-key">{k}</span>;
 
-  const face = (f: number, cls = "") => (
-    <img key={f} className={`rf-face ${cls}`.trim()} src={faceCropUrl(f)} alt="" draggable={false} />
+  // Every card face peeks at its full photo on click — the context is often the
+  // identifying signal a crop lacks. Opted OUT in the split grid, where a tap
+  // means "tag this face".
+  const face = (f: number, cls = "", peekable = true) => (
+    <img
+      key={f}
+      className={`rf-face ${cls}${peekable ? " peekable" : ""}`.trim()}
+      src={faceCropUrl(f)}
+      alt=""
+      draggable={false}
+      title={peekable ? "See the full photo" : undefined}
+      onClick={
+        peekable
+          ? (e) => {
+              e.stopPropagation();
+              setPeekFace(f);
+            }
+          : undefined
+      }
+    />
   );
 
   // The two-panel evidence block: the group in question (amber-ringed) on the
@@ -574,7 +595,7 @@ export default function ReviewFocus({
             const cls = t === undefined ? "" : slotCls[t];
             return (
               <button key={f} className={`rf-split-face ${cls}`} onClick={() => cycleTag(f)}>
-                {face(f, "small")}
+                {face(f, "small", false)}
               </button>
             );
           })}
@@ -894,7 +915,14 @@ export default function ReviewFocus({
           {remaining.map((g) => (
             <div className="pr-chip" key={g.cluster_id}>
               {g.face_id != null ? (
-                <img className="pr-face" src={faceCropUrl(g.face_id)} alt="" draggable={false} />
+                <img
+                  className="pr-face peekable"
+                  src={faceCropUrl(g.face_id)}
+                  alt=""
+                  draggable={false}
+                  title="See the full photo"
+                  onClick={() => setPeekFace(g.face_id!)}
+                />
               ) : (
                 <div className="pr-face pr-face-blank" />
               )}
@@ -1054,6 +1082,7 @@ export default function ReviewFocus({
           <p className="rf-tally">{settled.toLocaleString()} photos settled this session</p>
         )}
       </div>
+      {peekFace != null && <FacePeek faceId={peekFace} onClose={() => setPeekFace(null)} />}
     </div>
   );
 }

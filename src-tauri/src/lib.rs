@@ -1007,6 +1007,30 @@ fn not_these_people(
     Ok(undo)
 }
 
+/// The photo behind a face crop, plus the face's normalized box — backs the
+/// "peek at the full picture" affordance on review chips and cards, where a
+/// tight crop alone often isn't enough to tell who someone is (the context —
+/// who else is in the frame, where — is the identifying signal).
+#[derive(serde::Serialize)]
+struct FacePhoto {
+    photo_id: i64,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+#[tauri::command]
+fn get_face_photo(
+    state: tauri::State<'_, AppState>,
+    face_id: i64,
+) -> Result<Option<FacePhoto>, String> {
+    let conn = state.conn.lock().unwrap();
+    Ok(db::face_box(&conn, face_id)
+        .map_err(|e| e.to_string())?
+        .map(|(photo_id, x1, y1, x2, y2)| FacePhoto { photo_id, x1, y1, x2, y2 }))
+}
+
 /// Name (or assign to an existing person, matched by exact name) a handful of
 /// faces — WITHOUT touching the rest of their cluster and WITHOUT a cannot-link.
 /// The lightbox's "just this face" scope: on a junk cluster (pose-blended
@@ -2058,6 +2082,7 @@ pub fn run() {
             not_these_people,
             not_this_person_many,
             name_faces,
+            get_face_photo,
             reset_face_recognition,
             reset_face_decisions,
             recluster,

@@ -2288,6 +2288,40 @@ body,
   object-fit: contain;
   background: #f2f2f2;
 }
+/* "See the full picture" peek: any review face crop opens its photo with the
+   face outlined — the context a tight crop lacks. Click anywhere / Esc closes. */
+.peekable {
+  cursor: zoom-in;
+}
+.peek-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  background: rgba(12, 14, 12, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.peek-stage {
+  position: relative;
+  line-height: 0;
+}
+.peek-img {
+  max-width: 86vw;
+  max-height: 82vh;
+  border-radius: 10px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  transition: opacity 0.12s ease;
+}
+.peek-facebox {
+  position: absolute;
+  border: 2.5px solid #f5a623;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
 /* Transient "queue refreshed under you" note in focus review. */
 .rf-note {
   font-size: 12px;

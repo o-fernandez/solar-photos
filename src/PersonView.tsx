@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
+import FacePeek from "./FacePeek";
 import {
   absorbClusters,
   detachFaces,
@@ -285,6 +286,10 @@ export default function PersonView({
       })
       .catch(() => flashNotice("People were just reorganized — try that again."));
   };
+
+  // A review-band face being peeked at full-photo size (a crop alone often isn't
+  // enough to say who someone is).
+  const [peekFace, setPeekFace] = useState<number | null>(null);
 
   // Review-tail decisions (the "N more might also be this person" band). "Yes" folds
   // the group in and pulls its photos into this page; "no" writes a durable cannot-link
@@ -852,7 +857,14 @@ export default function PersonView({
             {reviewLeft.map((c) => (
               <div className="pr-chip" key={c.cluster_id}>
                 {c.face_id != null ? (
-                  <img className="pr-face" src={faceCropUrl(c.face_id)} alt="" draggable={false} />
+                  <img
+                    className="pr-face peekable"
+                    src={faceCropUrl(c.face_id)}
+                    alt=""
+                    draggable={false}
+                    title="See the full photo"
+                    onClick={() => setPeekFace(c.face_id!)}
+                  />
                 ) : (
                   <div className="pr-face pr-face-blank" />
                 )}
@@ -1046,6 +1058,8 @@ export default function PersonView({
           onCorrection={reloadPhotos}
         />
       )}
+
+      {peekFace != null && <FacePeek faceId={peekFace} onClose={() => setPeekFace(null)} />}
     </div>
   );
 
