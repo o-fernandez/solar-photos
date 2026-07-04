@@ -1007,6 +1007,47 @@ fn not_these_people(
     Ok(undo)
 }
 
+/// Name (or assign to an existing person, matched by exact name) a handful of
+/// faces — WITHOUT touching the rest of their cluster and WITHOUT a cannot-link.
+/// The lightbox's "just this face" scope: on a junk cluster (pose-blended
+/// profiles), naming one face must not vouch for hundreds of strangers along
+/// with it. The rest of the cluster re-homes competitively on later passes; the
+/// named face becomes one confirmed exemplar (no magnet authority until
+/// MIN_ANCHOR confirmed faces accumulate — see recognition::MIN_ANCHOR).
+#[tauri::command]
+fn name_faces(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    face_ids: Vec<i64>,
+    name: String,
+    expected_generation: Option<i64>,
+) -> Result<CorrectionUndo, String> {
+    ensure_generation(&state, expected_generation)?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("a name is required".into());
+    }
+    let undo = {
+        let mut conn = state.conn.lock().unwrap();
+        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
+        // An existing person with this exact name adopts the faces; otherwise a
+        // fresh identity is minted and named.
+        let identity = if let Some(group) =
+            db::group_for_name(&conn, trimmed).map_err(|e| e.to_string())?
+        {
+            db::ensure_identity_for_group(&conn, group).map_err(|e| e.to_string())?
+        } else {
+            let id = db::new_identity(&conn).map_err(|e| e.to_string())?;
+            let _ = db::name_group(&conn, -id, trimmed).map_err(|e| e.to_string())?;
+            id
+        };
+        db::set_faces_person(&mut conn, &face_ids, identity).map_err(|e| e.to_string())?;
+        CorrectionUndo { new_cluster_id: Some(-identity), ..CorrectionUndo::faces_only(prior) }
+    };
+    schedule_refold(app);
+    Ok(undo)
+}
+
 /// "Not this person" for a whole batch of candidate groups at once — the person
 /// page's review band offers "none of these are <name>". Same semantics as
 /// [`not_this_person`] per group (cannot-link + durable competitor), but captured
@@ -2016,6 +2057,7 @@ pub fn run() {
             not_this_person,
             not_these_people,
             not_this_person_many,
+            name_faces,
             reset_face_recognition,
             reset_face_decisions,
             recluster,

@@ -483,7 +483,7 @@ function People({
             <b>{queue!.items.length.toLocaleString()}</b>{" "}
             {queue!.items.length === 1 ? "question" : "questions"} to review (
             {queuePhotos.toLocaleString()} {queuePhotos === 1 ? "photo" : "photos"}) — biggest
-            first, one at a time.
+            first, one at a time. Smaller one-photo questions wait on each person's page.
           </div>
           <button
             className="pick-btn"

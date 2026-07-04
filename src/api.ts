@@ -571,6 +571,21 @@ export function getClusterFaces(clusterId: number): Promise<number[]> {
   return invoke("get_cluster_faces", { clusterId });
 }
 
+/** Name (or fold into the person with this exact name) specific faces only —
+ *  never their whole cluster, and no cannot-link. The lightbox's "just this
+ *  face" scope, for when the surrounding cluster can't be vouched for. */
+export function nameFaces(
+  faceIds: number[],
+  name: string,
+  expectedGeneration?: number,
+): Promise<CorrectionUndo> {
+  return invoke("name_faces", {
+    faceIds,
+    name,
+    expectedGeneration: expectedGeneration ?? null,
+  });
+}
+
 /** Confirm a subset of faces into an existing person, leaving the rest of the source
  *  cluster untouched. Backs the "Who is this?" split — the user tags some faces as A
  *  and some as B, and each batch is confirmed into that person. No cannot-link against

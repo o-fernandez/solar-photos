@@ -772,6 +772,15 @@ pub fn compute_identity_growth(
 /// the focus flow walks: strong batches and uncertain growth per person, contested
 /// who-is-this clusters, and pairwise same-person evidence — biggest photos first,
 /// capped so a session has a visible end.
+/// Focus review is for HIGH-LEVERAGE decisions: a card must move at least this
+/// many photos to earn a spot in the session. Every answer costs the same
+/// attention, so sixty 1-photo "who is this?" cards read as manual labor for no
+/// visible payoff. Small questions aren't lost — they stay reachable in context
+/// (the person page's review band with its bulk answers, the unnamed tiles in
+/// People) and many resolve themselves in later self-heal passes as confirmed
+/// evidence accumulates.
+pub const REVIEW_MIN_PHOTOS: i64 = 4;
+
 pub fn build_review_queue(
     merges: &[MergeSuggestion],
     growth: &[IdentityGrowth],
@@ -816,6 +825,7 @@ pub fn build_review_queue(
         | ReviewItem::Pairwise { photos, .. }
         | ReviewItem::SamePhotoTwin { photos, .. } => *photos,
     };
+    items.retain(|i| photos_of(i) >= REVIEW_MIN_PHOTOS);
     items.sort_by(|a, b| photos_of(b).cmp(&photos_of(a)));
     items.truncate(MAX_QUEUE);
     items
@@ -1262,6 +1272,39 @@ mod tests {
             })
             .collect();
         assert_eq!(photos, vec![50, 20, 5], "biggest payoff first");
+    }
+
+    /// Cards below the payoff floor stay out of the focus session — a 1-photo
+    /// question is a chore there; it lives on the person page / People instead.
+    #[test]
+    fn review_queue_drops_low_payoff_cards() {
+        let merges = vec![
+            MergeSuggestion {
+                into: 1,
+                from: 2,
+                into_faces: vec![],
+                from_faces: vec![],
+                into_name: None,
+                similarity: 0.8,
+                photos: REVIEW_MIN_PHOTOS, // exactly at the floor: stays
+                generation: 0,
+            },
+            MergeSuggestion {
+                into: 3,
+                from: 4,
+                into_faces: vec![],
+                from_faces: vec![],
+                into_name: None,
+                similarity: 0.9,
+                photos: 1, // a singleton: filtered
+                generation: 0,
+            },
+        ];
+        let queue = build_review_queue(&merges, &[], Vec::new());
+        assert_eq!(queue.len(), 1, "only the at-floor card survives");
+        assert!(
+            matches!(&queue[0], ReviewItem::Pairwise { photos, .. } if *photos == REVIEW_MIN_PHOTOS)
+        );
     }
 
     /// The anchor core drops a minority outlier (a wrong fold / off-angle shot) so

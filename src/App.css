@@ -1502,6 +1502,14 @@ body,
   text-align: left;
   margin: 4px;
 }
+/* Naming from the viewer applies to the face you can see, never a group you
+   can't — this line says so, and that the group follows as evidence builds. */
+.fm-hint {
+  font-size: 11px;
+  color: #999;
+  margin: 0 6px 2px;
+  line-height: 1.35;
+}
 .fm-matches {
   list-style: none;
   margin: 4px 0 0;

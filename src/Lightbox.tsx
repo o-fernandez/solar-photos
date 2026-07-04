@@ -11,14 +11,15 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
+  confirmFacesIntoCluster,
   faceCropUrl,
   getClusterGeneration,
   getClusters,
   getFacesInPhoto,
   getPhotoDetail,
   ignoreFaces,
-  mergeClusters,
   nameCluster,
+  nameFaces,
   onClusterProgress,
   photoUrl,
   reassignFacesToCluster,
@@ -371,8 +372,8 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     [flashUndo, afterChange, flashRefused],
   );
 
-  // Cluster-level: name this person, or merge their group into an existing person —
-  // the unified "identify this unnamed face" flow (mirrors the People grid).
+  // Renaming a NAMED person from their face — still cluster-scoped on purpose:
+  // renaming changes the person's label, not any face's grouping.
   const nameThisPerson = useCallback(
     async (face: PhotoFace, name: string) => {
       setOpenFace(null);
@@ -385,20 +386,6 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
         flashUndo(`Named ${name}`, () =>
           nameCluster(g, prev, genRef.current).then(afterChange).catch(() => {}),
         );
-        afterChange();
-      } catch {
-        flashRefused();
-      }
-    },
-    [flashUndo, afterChange, flashRefused],
-  );
-  const mergeThisPerson = useCallback(
-    async (face: PhotoFace, target: Cluster) => {
-      setOpenFace(null);
-      if (face.cluster_id == null) return;
-      try {
-        await mergeClusters(target.cluster_id, face.cluster_id, genRef.current);
-        flashUndo(`Merged into ${target.name}`, null); // a merge isn't cleanly reversible
         afterChange();
       } catch {
         flashRefused();
@@ -532,7 +519,19 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
                     people={people}
                     placement={menuPlacement(box, stageSize)}
                     onNamePerson={(name) => nameThisPerson(f, name)}
-                    onMergePerson={(target) => mergeThisPerson(f, target)}
+                    onNameFaceOnly={(name) =>
+                      applyToFace(
+                        () => nameFaces([f.face_id], name, genRef.current),
+                        `Named this face ${name}`,
+                      )
+                    }
+                    onConfirmFaceInto={(target) =>
+                      applyToFace(
+                        () =>
+                          confirmFacesIntoCluster([f.face_id], target.cluster_id, genRef.current),
+                        `Moved this face to ${target.name}`,
+                      )
+                    }
                     onReassignExisting={(target) =>
                       applyToFace(
                         () =>
@@ -601,7 +600,7 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
 // flipped above when there isn't room, and clamped horizontally to the stage.
 type Placement = { left: number; top: number } | { left: number; bottom: number };
 const MENU_W = 232;
-const MENU_H = 300; // generous estimate incl. the matches list
+const MENU_H = 330; // generous estimate incl. the scope row + matches list
 function menuPlacement(box: ContentRect, stage: { width: number; height: number }): Placement {
   const left = Math.max(8, Math.min(box.left, stage.width - MENU_W - 8));
   const below = stage.height - (box.top + box.height);
@@ -612,16 +611,19 @@ function menuPlacement(box: ContentRect, stage: { width: number; height: number 
 }
 
 // The popover for one face. For an UNNAMED person it's a single combobox — type a
-// new name (names this person), or pick an existing person (merges into them) — so
-// the user never has to remember whether they've named someone before. For a NAMED
-// person the scopes differ (rename the person vs. move just this face), so those
-// stay as distinct actions.
+// new name, or pick an existing person — and it applies to THIS FACE ONLY: you
+// can't see the rest of the group from here, so the menu never asks you to vouch
+// for it blind (naming one face once confirmed a 262-photo pose blob). The refold
+// pulls the rest of the group in later, exactly when the confirmed evidence
+// supports it. For a NAMED person the scopes differ (rename the person vs. move
+// just this face), so those stay as distinct actions.
 function FaceMenu({
   face,
   people,
   placement,
   onNamePerson,
-  onMergePerson,
+  onNameFaceOnly,
+  onConfirmFaceInto,
   onReassignExisting,
   onReassignNew,
   onIgnore,
@@ -630,8 +632,10 @@ function FaceMenu({
   face: PhotoFace;
   people: Cluster[];
   placement: Placement;
+  /** Rename a named person (cluster-scoped — a label change, not a face move). */
   onNamePerson: (name: string) => void;
-  onMergePerson: (target: Cluster) => void;
+  onNameFaceOnly: (name: string) => void;
+  onConfirmFaceInto: (target: Cluster) => void;
   onReassignExisting: (target: Cluster) => void;
   onReassignNew: (name?: string) => void;
   onIgnore: () => void;
@@ -642,6 +646,8 @@ function FaceMenu({
   // at the action menu and drop into "rename" or "move just this face" on demand.
   const [mode, setMode] = useState<"root" | "name" | "move">(unnamed ? "name" : "root");
   const [draft, setDraft] = useState("");
+  const pickTarget = (m: Cluster) => onConfirmFaceInto(m);
+  const nameNew = (nm: string) => onNameFaceOnly(nm);
 
   const q = draft.trim().toLowerCase();
   const matches = people
@@ -655,8 +661,8 @@ function FaceMenu({
   // click-only — too destructive for a stray Enter.
   const nameRows = matches.length + (draft.trim() && !exact ? 1 : 0);
   const nameNav = usePickerNav(nameRows, (i) => {
-    if (i < matches.length) onMergePerson(matches[i]);
-    else onNamePerson(draft.trim());
+    if (i < matches.length) pickTarget(matches[i]);
+    else nameNew(draft.trim());
   });
   const moveNav = usePickerNav(matches.length + 1, (i) => {
     if (i < matches.length) onReassignExisting(matches[i]);
@@ -682,13 +688,16 @@ function FaceMenu({
               else nameNav.onNavKey(e);
             }}
           />
+          <div className="fm-hint">
+            Applies to this face — look-alikes group up as Solar learns
+          </div>
           <ul className="fm-matches">
             {matches.map((m, i) => (
               <li
                 key={m.cluster_id}
                 className={`fm-match${nameNav.highlight === i ? " hi" : ""}`}
                 onMouseEnter={() => nameNav.setHighlight(i)}
-                onClick={() => onMergePerson(m)}
+                onClick={() => pickTarget(m)}
               >
                 <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
                 <span className="ns-name">{m.name}</span>
@@ -698,7 +707,7 @@ function FaceMenu({
               <li
                 className={`fm-match fm-new${nameNav.highlight === matches.length ? " hi" : ""}`}
                 onMouseEnter={() => nameNav.setHighlight(matches.length)}
-                onClick={() => onNamePerson(draft.trim())}
+                onClick={() => nameNew(draft.trim())}
               >
                 + Name “{draft.trim()}”
               </li>
