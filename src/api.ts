@@ -457,6 +457,39 @@ export function faceCropUrl(faceId: number): string {
   return `thumb://localhost/face/${faceId}`;
 }
 
+/** One located photo on the Places map. */
+export interface GeoPoint {
+  id: number;
+  lat: number;
+  lon: number;
+  ts: number;
+}
+
+/** Every photo with a GPS fix — the Places map's whole dataset in one read. */
+export function getGeoPoints(): Promise<GeoPoint[]> {
+  return invoke("get_geo_points");
+}
+
+/** Size of the bundled offline basemap (0 = not bundled — see
+ *  scripts/fetch-basemap.sh). */
+export function basemapSize(): Promise<number> {
+  return invoke("basemap_size");
+}
+
+/** One raw byte range of the bundled basemap — the PMTiles reader's transport.
+ *  The backend returns raw bytes (`tauri::ipc::Response`); coerce whatever shape
+ *  the IPC hands back (ArrayBuffer, typed array, or a JSON byte array) into the
+ *  ArrayBuffer the PMTiles reader requires. */
+export async function readBasemapRange(offset: number, length: number): Promise<ArrayBuffer> {
+  const r = await invoke<unknown>("read_basemap_range", { offset, length });
+  if (r instanceof ArrayBuffer) return r;
+  if (r instanceof Uint8Array) {
+    return r.buffer.slice(r.byteOffset, r.byteOffset + r.byteLength) as ArrayBuffer;
+  }
+  if (Array.isArray(r)) return new Uint8Array(r).buffer;
+  throw new Error(`unexpected basemap response type: ${Object.prototype.toString.call(r)}`);
+}
+
 /** The photo a face was cropped from, plus its normalized box within it —
  *  for peeking at the full picture from a review chip or card. */
 export interface FacePhoto {

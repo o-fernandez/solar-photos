@@ -66,6 +66,15 @@ pub fn init(conn: &Connection) -> Result<()> {
         "ALTER TABLE photos ADD COLUMN faces_scanned INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // GPS position (decimal degrees) + whether EXIF GPS was ever looked for.
+    // Tri-state matters: lat NULL + geo_scanned=0 means "not checked yet"
+    // (backfill candidate); lat NULL + geo_scanned=1 means "checked, no fix".
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN lat REAL", []);
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN lon REAL", []);
+    let _ = conn.execute(
+        "ALTER TABLE photos ADD COLUMN geo_scanned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // The timeline orders on COALESCE(taken_ts, mtime); index it for fast paging.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));
@@ -1282,6 +1291,46 @@ pub fn set_taken_ts_if_empty(conn: &Connection, id: i64, ts: i64) -> Result<()> 
         rusqlite::params![ts, id],
     )?;
     Ok(())
+}
+
+/// Record the result of a GPS look-up: the coordinates when a fix was present,
+/// and always the "we checked" flag so a photo is never re-read for GPS.
+pub fn set_geo_scanned(conn: &Connection, id: i64, gps: Option<(f64, f64)>) -> Result<()> {
+    match gps {
+        Some((lat, lon)) => conn.execute(
+            "UPDATE photos SET lat = ?1, lon = ?2, geo_scanned = 1 WHERE id = ?3",
+            rusqlite::params![lat, lon, id],
+        )?,
+        None => conn.execute("UPDATE photos SET geo_scanned = 1 WHERE id = ?1", [id])?,
+    };
+    Ok(())
+}
+
+/// Local photos whose EXIF was never checked for GPS — the backfill worklist.
+/// Cloud-only files are excluded (reading their EXIF would force a download);
+/// they get their GPS after an on-demand download like their capture date does.
+pub fn geo_backfill_batch(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM photos
+         WHERE geo_scanned = 0 AND thumb_status NOT IN (?1, ?2)
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![STATUS_CLOUD, STATUS_DOWNLOADING, limit],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every photo with a GPS fix: (id, lat, lon, sort timestamp) — the Places map's
+/// entire dataset in one compact read (fine at 100k; it's four numbers a row).
+pub fn geo_points(conn: &Connection) -> Result<Vec<(i64, f64, f64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, lat, lon, COALESCE(taken_ts, mtime) FROM photos WHERE lat IS NOT NULL",
+    )?;
+    let rows =
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Look up status + path for a set of ids. Used by on-demand cloud handling to

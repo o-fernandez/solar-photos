@@ -1,20 +1,34 @@
-//! Reading the capture date — the spine of the timeline.
+//! Reading EXIF metadata — the capture date (the spine of the timeline) and the
+//! GPS position (the spine of the Places map).
 //!
-//! We pull EXIF DateTimeOriginal (when the shutter fired). This is only ever
-//! read for files we already have locally: at scan time for local originals, and
-//! after download for cloud originals. We never read EXIF from a cloud-only file
-//! up front, because reading it would force a download (see the on-demand policy).
+//! Only ever read for files we already have locally: at scan time for local
+//! originals, and after download for cloud originals. We never read EXIF from a
+//! cloud-only file up front, because reading it would force a download (see the
+//! on-demand policy).
 
 use std::path::Path;
 
-/// EXIF capture date for a photo, as a Unix timestamp (seconds), or `None` if
-/// the file has no usable date tag.
-pub fn read_taken_ts(path: &Path) -> Option<i64> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut buf = std::io::BufReader::new(file);
-    let reader = exif::Reader::new();
-    let exif = reader.read_from_container(&mut buf).ok()?;
+/// Everything we pull from a file's EXIF in one pass (one open, one parse).
+#[derive(Default)]
+pub struct ExifMeta {
+    /// Capture date as a Unix timestamp (seconds), if the file has a usable tag.
+    pub taken_ts: Option<i64>,
+    /// GPS position as decimal degrees (lat, lon), if a plausible fix is present.
+    pub gps: Option<(f64, f64)>,
+}
 
+/// Read capture date + GPS from a local file. Never fails — a missing or
+/// unreadable EXIF block just yields empty fields.
+pub fn read_exif_meta(path: &Path) -> ExifMeta {
+    let Ok(file) = std::fs::File::open(path) else { return ExifMeta::default() };
+    let mut buf = std::io::BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut buf) else {
+        return ExifMeta::default();
+    };
+    ExifMeta { taken_ts: taken_ts_of(&exif), gps: gps_of(&exif) }
+}
+
+fn taken_ts_of(exif: &exif::Exif) -> Option<i64> {
     let field = exif
         .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))?;
@@ -26,6 +40,41 @@ pub fn read_taken_ts(path: &Path) -> Option<i64> {
         return parse_exif_datetime(s);
     }
     None
+}
+
+/// GPS position in decimal degrees. Rejects out-of-range values and the exact
+/// (0, 0) "null island" a lost fix writes — a real photo there is vanishingly
+/// rarer than a bugged GPS chip.
+fn gps_of(exif: &exif::Exif) -> Option<(f64, f64)> {
+    let lat = gps_coord(exif, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef, b'S')?;
+    let lon = gps_coord(exif, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef, b'W')?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    if lat == 0.0 && lon == 0.0 {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+/// One GPS coordinate: degrees/minutes/seconds rationals → decimal degrees,
+/// negated when the hemisphere ref matches `neg` (S or W).
+fn gps_coord(exif: &exif::Exif, tag: exif::Tag, ref_tag: exif::Tag, neg: u8) -> Option<f64> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    let dms = match &field.value {
+        exif::Value::Rational(v) if !v.is_empty() => v,
+        _ => return None,
+    };
+    let part = |i: usize| dms.get(i).map(|r| r.to_f64()).unwrap_or(0.0);
+    let mut v = part(0) + part(1) / 60.0 + part(2) / 3600.0;
+    if let Some(rf) = exif.get_field(ref_tag, exif::In::PRIMARY) {
+        if let exif::Value::Ascii(ref vals) = rf.value {
+            if vals.first().and_then(|b| b.first()).map(|c| c.to_ascii_uppercase()) == Some(neg) {
+                v = -v;
+            }
+        }
+    }
+    v.is_finite().then_some(v)
 }
 
 /// Parse "YYYY:MM:DD HH:MM:SS" (also tolerates '-' separators). Treated as UTC —

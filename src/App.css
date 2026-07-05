@@ -1394,6 +1394,129 @@ body,
   }
 }
 
+/* --- Places: the offline globe --- */
+.places {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.places-map {
+  position: absolute;
+  inset: 0;
+}
+/* Centered note over the map (loading / no basemap / no located photos). */
+.places-note {
+  position: absolute;
+  left: 50%;
+  top: 42%;
+  transform: translate(-50%, -50%);
+  z-index: 4;
+  background: #ffffff;
+  border: 1px solid #e3e3e3;
+  border-radius: 12px;
+  padding: 16px 22px;
+  max-width: 420px;
+  text-align: center;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14);
+}
+.places-note p {
+  margin: 0 0 4px;
+}
+.places-note code {
+  font-size: 12px;
+  background: #f2f2f2;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.places-error {
+  top: auto;
+  bottom: 120px;
+  transform: translateX(-50%);
+  border-color: #e6bcbc;
+  z-index: 6;
+}
+/* Photo-thumbnail cluster marker: a round cover with a count badge. */
+.geo-marker {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  cursor: pointer;
+}
+.geo-marker img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2.5px solid #ffffff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  background: #ececec;
+}
+.geo-marker.geo-noimg img {
+  visibility: hidden;
+}
+.geo-marker:hover img {
+  border-color: #f5a623;
+}
+.geo-count {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  background: #f5a623;
+  color: #1a1a1a;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 1px 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+/* Floating filmstrip: the photos in the current view, newest first. */
+.geo-strip-wrap {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  z-index: 5;
+  pointer-events: none;
+}
+.geo-strip-count {
+  display: inline-block;
+  pointer-events: auto;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1a1a1a;
+  padding: 3px 10px;
+  margin: 0 0 6px 2px;
+}
+.geo-strip {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  pointer-events: auto;
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+  scrollbar-width: thin;
+}
+.geo-strip-thumb {
+  width: 72px;
+  height: 72px;
+  flex: 0 0 auto;
+  object-fit: cover;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #ececec;
+}
+.geo-strip-thumb:hover {
+  outline: 2px solid #f5a623;
+  outline-offset: -2px;
+}
+
 /* The immersive viewer. Always dark, in both light and dark app themes. */
 .viewer {
   position: fixed;
@@ -1975,6 +2098,28 @@ body,
     background: #2c2c2c;
     border-color: #444;
     color: #ededed;
+  }
+  .places-note {
+    background: #2a2a2a;
+    border-color: #444;
+  }
+  .places-note code {
+    background: #3a3a3a;
+  }
+  .geo-strip-count {
+    background: rgba(38, 38, 38, 0.92);
+    border-color: #444;
+    color: #ededed;
+  }
+  .geo-strip {
+    background: rgba(30, 30, 30, 0.85);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+  .geo-strip-thumb {
+    background: #2a2a2a;
+  }
+  .geo-marker img {
+    border-color: #2c2c2c;
   }
 }
 

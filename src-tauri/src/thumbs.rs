@@ -194,12 +194,15 @@ pub fn spawn_workers<F>(
                     }
                 };
                 let _ = db::set_status(&conn, job.id, status);
-                // For cloud files (now downloaded), read the capture date the scan
-                // couldn't reach without forcing a download. Applied on next sort.
+                // For cloud files (now downloaded), read the capture date + GPS
+                // the scan couldn't reach without forcing a download. The date is
+                // applied on next sort; the fix feeds the Places map.
                 if extract_date && status == STATUS_READY {
-                    if let Some(ts) = crate::meta::read_taken_ts(Path::new(&job.path)) {
+                    let m = crate::meta::read_exif_meta(Path::new(&job.path));
+                    if let Some(ts) = m.taken_ts {
                         let _ = db::set_taken_ts_if_empty(&conn, job.id, ts);
                     }
+                    let _ = db::set_geo_scanned(&conn, job.id, m.gps);
                 }
                 queue.complete(job.id);
                 // Notify either way so the cell stops waiting, but say whether a

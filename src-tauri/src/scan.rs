@@ -160,14 +160,15 @@ where
             let mut select =
                 tx.prepare("SELECT id, cache_key, thumb_status FROM photos WHERE path = ?1")?;
             let mut insert = tx.prepare(
-                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status, taken_ts, seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO photos (path, mtime, size, cache_key, thumb_status, taken_ts, seen, lat, lon, geo_scanned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
-            // COALESCE keeps a known capture date when this pass has none to offer:
-            // a cloud file whose metadata a sync tool touched re-registers with
-            // taken = None (its EXIF is unreachable without a download), and writing
-            // that NULL used to wipe the date extracted after an earlier download.
+            // COALESCE keeps a known capture date (and GPS fix) when this pass has
+            // none to offer: a cloud file whose metadata a sync tool touched
+            // re-registers with taken = None (its EXIF is unreachable without a
+            // download), and writing that NULL used to wipe the values extracted
+            // after an earlier download. MAX keeps geo_scanned sticky the same way.
             let mut update = tx.prepare(
-                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4, taken_ts = COALESCE(?5, taken_ts), seen = ?6 WHERE id = ?7",
+                "UPDATE photos SET mtime = ?1, size = ?2, cache_key = ?3, thumb_status = ?4, taken_ts = COALESCE(?5, taken_ts), seen = ?6, lat = COALESCE(?7, lat), lon = COALESCE(?8, lon), geo_scanned = MAX(geo_scanned, ?9) WHERE id = ?10",
             )?;
             // Bump only the seen-generation for files that are unchanged, so the
             // post-rescan prune knows they still exist.
@@ -177,20 +178,26 @@ where
                 let key = cache_key(&item.path, item.mtime, item.size);
                 // Cloud-only files become placeholders; local files are queued.
                 let fresh_status = if item.cloud { STATUS_CLOUD } else { STATUS_PENDING };
-                // Capture date: EXIF for local files (reading a cloud original's
-                // EXIF would force a download), else the date parsed from the
-                // filename — free, and the main signal for cloud photos.
-                let taken: Option<i64> = if item.cloud {
-                    None
+                // Capture date + GPS: one EXIF pass for local files (reading a
+                // cloud original's EXIF would force a download); the filename
+                // date is the free fallback either way. geo_scanned records that
+                // GPS was looked for, so the backfill never re-reads this file.
+                let exif = if item.cloud {
+                    meta::ExifMeta::default()
                 } else {
-                    meta::read_taken_ts(Path::new(&item.path))
-                }
-                .or_else(|| {
+                    meta::read_exif_meta(Path::new(&item.path))
+                };
+                let geo_scanned: i64 = if item.cloud { 0 } else { 1 };
+                let taken: Option<i64> = exif.taken_ts.or_else(|| {
                     Path::new(&item.path)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .and_then(meta::parse_filename_date)
                 });
+                let (lat, lon) = match exif.gps {
+                    Some((la, lo)) => (Some(la), Some(lo)),
+                    None => (None, None),
+                };
 
                 let existing = select
                     .query_row([&item.path], |r| {
@@ -214,6 +221,9 @@ where
                             fresh_status,
                             taken,
                             gen,
+                            lat,
+                            lon,
+                            geo_scanned,
                             id
                         ])?;
                         if !item.cloud {
@@ -228,7 +238,10 @@ where
                             key,
                             fresh_status,
                             taken,
-                            gen
+                            gen,
+                            lat,
+                            lon,
+                            geo_scanned
                         ])?;
                         let id = tx.last_insert_rowid();
                         total += 1;

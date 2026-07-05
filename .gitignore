@@ -26,3 +26,8 @@ dist-ssr
 # Face models (fetched via scripts/fetch-models.sh; not committed)
 src-tauri/models/*.onnx
 specs/
+
+# Offline basemap + label assets (fetched via scripts/fetch-basemap.sh; not committed)
+src-tauri/basemap/
+public/basemap-assets/
+scripts/.tools/

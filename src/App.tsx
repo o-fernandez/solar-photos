@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
 import People from "./People";
+import Places from "./Places";
 import {
   addFolder,
   faceCropUrl,
@@ -42,7 +43,7 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [faceScanned, setFaceScanned] = useState(0);
   const [faceEligible, setFaceEligible] = useState(0);
-  const [view, setView] = useState<"timeline" | "people">("timeline");
+  const [view, setView] = useState<"timeline" | "people" | "places">("timeline");
   // Settings menu (Add folder / Rescan / folders), tucked behind the gear.
   const [showSettings, setShowSettings] = useState(false);
   // Two-click guard on the destructive "start people over" reset.
@@ -306,6 +307,12 @@ function App() {
             >
               People
             </button>
+            <button
+              className={view === "places" ? "on" : ""}
+              onClick={() => setView("places")}
+            >
+              Places
+            </button>
           </nav>
         )}
 
@@ -450,6 +457,8 @@ function App() {
       {total > 0 ? (
         view === "people" ? (
           <People focusClusterId={focusClusterId} onFocusConsumed={handleFocusConsumed} />
+        ) : view === "places" ? (
+          <Places />
         ) : (
           // Discovery order while a scan runs (append-only, no reflow); snap to
           // the newest-first timeline otherwise. refreshKey forces a refetch
