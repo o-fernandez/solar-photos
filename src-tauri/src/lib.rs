@@ -287,6 +287,14 @@ fn get_photos_range(
     db::photos_range(&conn, offset, limit, by_date, f).map_err(|e| e.to_string())
 }
 
+/// "On this day" — photos taken on today's month-and-day in past years, for the
+/// Home shelf. Empty when nothing was captured on this date.
+#[tauri::command]
+fn get_on_this_day(state: tauri::State<'_, AppState>) -> Result<Vec<db::PhotoRow>, String> {
+    let conn = state.conn.lock().unwrap();
+    db::on_this_day(&conn).map_err(|e| e.to_string())
+}
+
 /// Toggle a photo's favorite star.
 #[tauri::command]
 fn set_photo_favorite(state: tauri::State<'_, AppState>, id: i64, favorite: bool) -> Result<(), String> {
@@ -2264,6 +2272,7 @@ pub fn run() {
             set_photo_hidden,
             export_curation,
             import_curation,
+            get_on_this_day,
             reset_face_recognition,
             reset_face_decisions,
             recluster,

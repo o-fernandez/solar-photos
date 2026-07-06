@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import PhotoGrid from "./PhotoGrid";
 import People from "./People";
 import Places from "./Places";
+import Home from "./Home";
 import {
   addFolder,
   exportCuration,
@@ -49,9 +50,11 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [faceScanned, setFaceScanned] = useState(0);
   const [faceEligible, setFaceEligible] = useState(0);
-  const [view, setView] = useState<"timeline" | "favorites" | "people" | "places" | "hidden">(
-    "timeline",
-  );
+  const [view, setView] = useState<
+    "home" | "timeline" | "favorites" | "people" | "places" | "hidden"
+  >("home");
+  // A person to open straight to their page (from a Home "Your people" tile).
+  const [openPerson, setOpenPerson] = useState<Cluster | null>(null);
   // A transient result line for an import/export action.
   const [curationNote, setCurationNote] = useState<string | null>(null);
   // Settings menu (Add folder / Rescan / folders), tucked behind the gear.
@@ -248,6 +251,17 @@ function App() {
   // Stable prop for the memoized People — an inline lambda would defeat the memo.
   const handleFocusConsumed = useCallback(() => setFocusClusterId(null), []);
 
+  // From a Home "Your people" tile: go to People and open that person's page.
+  const handleOpenPerson = useCallback((c: Cluster) => {
+    setOpenPerson(c);
+    setView("people");
+  }, []);
+  const handleOpenConsumed = useCallback(() => setOpenPerson(null), []);
+  const handleNavigate = useCallback(
+    (v: "home" | "timeline" | "favorites" | "people" | "places" | "hidden") => setView(v),
+    [],
+  );
+
   // A star/hide toggle changed a curation count — refresh the badges.
   const handleCurationChanged = useCallback(() => refreshStats(), [refreshStats]);
 
@@ -336,6 +350,12 @@ function App() {
 
         {total > 0 && (
           <nav className="view-nav tb-tabs">
+            <button
+              className={view === "home" ? "on" : ""}
+              onClick={() => setView("home")}
+            >
+              Home
+            </button>
             <button
               className={view === "timeline" || view === "hidden" ? "on" : ""}
               onClick={() => setView("timeline")}
@@ -530,8 +550,15 @@ function App() {
       </div>
 
       {total > 0 ? (
-        view === "people" ? (
-          <People focusClusterId={focusClusterId} onFocusConsumed={handleFocusConsumed} />
+        view === "home" ? (
+          <Home onNavigate={handleNavigate} onOpenPerson={handleOpenPerson} />
+        ) : view === "people" ? (
+          <People
+            focusClusterId={focusClusterId}
+            onFocusConsumed={handleFocusConsumed}
+            openCluster={openPerson}
+            onOpenConsumed={handleOpenConsumed}
+          />
         ) : view === "places" ? (
           <Places />
         ) : view === "favorites" ? (

@@ -1364,6 +1364,30 @@ pub fn apply_curation(conn: &mut Connection, rows: &[(String, bool, bool)]) -> R
     Ok(applied)
 }
 
+/// "On this day": photos whose capture date falls on today's month-and-day, in
+/// any past year — the Home screen's nostalgia shelf. Real capture dates only
+/// (`taken_ts NOT NULL`): matching the mtime fallback would surface files that
+/// merely happen to carry today's file date. Hidden photos stay out. Newest
+/// first, so the frontend can group by year and pick a year to feature.
+pub fn on_this_day(conn: &Connection) -> Result<Vec<PhotoRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, thumb_status, taken_ts AS ts, favorite FROM photos
+         WHERE taken_ts IS NOT NULL AND hidden = 0
+           AND strftime('%m-%d', datetime(taken_ts, 'unixepoch'))
+             = strftime('%m-%d', 'now', 'localtime')
+         ORDER BY ts DESC LIMIT 300",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PhotoRow {
+            id: r.get(0)?,
+            status: r.get(1)?,
+            ts: r.get(2)?,
+            favorite: r.get::<_, i64>(3)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Photos missing a capture date (id, path) — used to backfill filename dates
 /// into a library that was indexed before that fallback existed.
 pub fn null_date_photos(conn: &Connection) -> Result<Vec<(i64, String)>> {

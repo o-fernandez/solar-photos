@@ -15,36 +15,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { PMTiles, Protocol, type RangeResponse, type Source } from "pmtiles";
-import { layers, namedFlavor } from "@protomaps/basemaps";
 import Supercluster from "supercluster";
 import Lightbox from "./Lightbox";
-import { basemapSize, getGeoPoints, readBasemapRange, thumbUrl, type GeoPoint } from "./api";
+import { basemapSize, getGeoPoints, thumbUrl, type GeoPoint } from "./api";
+import { basemapFlavor, basemapStyle, ensureBasemapProtocol } from "./basemap";
 
 // How many markers we render per view (clusters keep it low anyway) and how
 // many thumbs the filmstrip mounts (each is an <img> request — P6).
 const MAX_MARKERS = 150;
 const MAX_STRIP = 200;
-
-/** PMTiles source over the bundled archive: byte ranges via Tauri IPC. */
-class BundledBasemap implements Source {
-  getKey() {
-    return "bundled-world";
-  }
-  async getBytes(offset: number, length: number): Promise<RangeResponse> {
-    return { data: await readBasemapRange(offset, length) };
-  }
-}
-
-// Register the pmtiles:// protocol once per app run.
-let protocolRegistered = false;
-function ensureProtocol() {
-  if (protocolRegistered) return;
-  const protocol = new Protocol();
-  protocol.add(new PMTiles(new BundledBasemap()));
-  maplibregl.addProtocol("pmtiles", protocol.tile);
-  protocolRegistered = true;
-}
 
 type Status = "loading" | "nomap" | "ready";
 
@@ -156,17 +135,6 @@ export default function Places() {
         return;
       }
 
-      // Self-check the IPC byte-range transport before the map depends on it:
-      // the first 16KB must start with the PMTiles magic ("PM").
-      try {
-        const head = new DataView(await readBasemapRange(0, 16384));
-        if (head.getUint16(0, true) !== 0x4d50) {
-          setMapError(`basemap transport corrupt (magic ${head.getUint16(0, true)})`);
-        }
-      } catch (e) {
-        setMapError(`basemap transport failed: ${e}`);
-      }
-
       if (points.length > 0) {
         const index = new Supercluster<ClusterProps>({ radius: 64, maxZoom: 17, minPoints: 2 });
         index.load(
@@ -179,25 +147,10 @@ export default function Places() {
         indexRef.current = index;
       }
 
-      ensureProtocol();
-      const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      const flavor = dark ? "dark" : "light";
+      ensureBasemapProtocol();
       map = new maplibregl.Map({
         container: containerRef.current,
-        style: {
-          version: 8,
-          projection: { type: "globe" },
-          glyphs: `${location.origin}/basemap-assets/fonts/{fontstack}/{range}.pbf`,
-          sprite: `${location.origin}/basemap-assets/sprites/v4/${flavor}`,
-          sources: {
-            protomaps: {
-              type: "vector",
-              url: "pmtiles://bundled-world",
-              attribution: "© OpenStreetMap",
-            },
-          },
-          layers: layers("protomaps", namedFlavor(flavor), { lang: "en" }),
-        },
+        style: basemapStyle(basemapFlavor()),
         center: [0, 20],
         zoom: 1.4,
         attributionControl: false,

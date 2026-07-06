@@ -52,6 +52,12 @@ export function getPhotosRange(
   return invoke("get_photos_range", { offset, limit, byDate, filter });
 }
 
+/** Photos taken on today's month-and-day in past years — the Home shelf.
+ *  Newest first; empty when nothing was captured on this date. */
+export function getOnThisDay(): Promise<PhotoRow[]> {
+  return invoke("get_on_this_day");
+}
+
 /** Toggle a photo's favorite star. */
 export function setPhotoFavorite(id: number, favorite: boolean): Promise<void> {
   return invoke("set_photo_favorite", { id, favorite });

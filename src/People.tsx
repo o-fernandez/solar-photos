@@ -69,11 +69,17 @@ function queueFaces(q: ReviewQueue): number[] {
 function People({
   focusClusterId = null,
   onFocusConsumed,
+  openCluster = null,
+  onOpenConsumed,
 }: {
   // When set (e.g. from the new-person toast), jump to this person and open their
   // name field. Consumed once, then cleared via onFocusConsumed.
   focusClusterId?: number | null;
   onFocusConsumed?: () => void;
+  // When set (e.g. from a Home "Your people" tile), open straight to this
+  // person's page. Consumed once, then cleared via onOpenConsumed.
+  openCluster?: Cluster | null;
+  onOpenConsumed?: () => void;
 } = {}) {
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [growth, setGrowth] = useState<IdentityGrowth[]>([]);
@@ -217,6 +223,13 @@ function People({
     setDraft("");
     onFocusConsumed?.();
   }, [focusClusterId, onFocusConsumed]);
+
+  // Arriving from a Home "Your people" tile: open straight to this person's page.
+  useEffect(() => {
+    if (openCluster == null) return;
+    setSelected(openCluster);
+    onOpenConsumed?.();
+  }, [openCluster, onOpenConsumed]);
 
   const startEdit = (c: Cluster) => {
     setEditing(c.cluster_id);
