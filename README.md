@@ -19,13 +19,19 @@ It's named for **güey** (*gway*), the Taíno word for the sun. A photograph is
 captured light; Solar is where your light lives — on your machine, in your
 hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
 
-> **Status:** v1 — well past the "daily use" floor. Add your folders, fly through
-> a newest-first timeline of 100,000+ photos, open any one full-screen, **find
-> and name the people in them**, **see them laid out on a globe** — and trust
-> that a relaunch shows the truth.
+> **Status:** v1 — well past the "daily use" floor. Add your folders, open on a
+> **Home** that greets you with this day in years past, your people, and your
+> places; fly through a newest-first timeline of 100,000+ photos; **find and name
+> the people in them**; **see them on a globe** — and trust that a relaunch shows
+> the truth.
 
 ## What it does
 
+- **A Home that greets you with everything.** Open the app and land on a
+  discovery feed, not a wall: **on this day** in years past (one cover per year),
+  the **people** you photograph most, a live map of your **places**, your
+  **favorites**, and what's newest — each a doorway into the full view. It's your
+  library saying hello, assembled entirely on your machine.
 - **Add your folders** (multiple); JPEG, HEIC, PNG and WebP are found
   **recursively** and remembered as library roots.
 - **A timeline of your whole life in photos** — newest-first by EXIF capture
@@ -41,6 +47,11 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
   the name *and* the grouping survive every re-scan. A "merge all" nudge reunites
   the rest of someone's photos in a click, and the more you confirm, the more it
   pulls together. New people slide in with a gentle hello as they're found.
+- **Favorite and hide — a curation layer that never touches your files.** Heart
+  your best; hide the clutter (screenshots, receipts) so it drops out of the
+  timeline, People, and Places without ever being deleted. Both are flags in the
+  app, not edits to your originals — and you can export them to a JSON file you
+  keep, so your curation outlives any cache.
 - **Your photos on a globe — that never phones home.** The **Places** tab plots
   every located photo on an interactive world map (a spinning globe that flattens
   as you zoom), clustered into thumbnail pins you can dive into. The map itself is
@@ -173,6 +184,8 @@ built it or downloaded it. After that:
 | Face detection + embeddings | `src-tauri/src/faces.rs` | On-device YuNet detect + SFace embed on aligned crops. Nothing leaves the machine. |
 | People clustering + identities | `src-tauri/src/cluster.rs` | Purity-first clustering; durable identities that survive re-scans (must/cannot-link). |
 | UI shell | `src/App.tsx` | Minimal top bar, hairline progress, settings menu, new-person nudges, cold-start render. |
+| Home (discovery feed) | `src/Home.tsx` | On this day, people, a live places mini-map, favorites, recent — shelves into the full views. |
+| Offline basemap setup | `src/basemap.ts` | Shared PMTiles-over-IPC protocol + MapLibre style, used by Home and Places. |
 | Virtualized grid + scrubber | `src/PhotoGrid.tsx` | `@tanstack/react-virtual`; fixed cells = no reflow; timeline scrubber. |
 | People | `src/People.tsx` | Person tiles, inline naming, merge suggestions, the "merge all" magnet. |
 | Viewer | `src/Lightbox.tsx` | Full-screen preview, keyboard nav + zoom, neighbor prefetch, on-photo face labels. |
