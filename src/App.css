@@ -1351,6 +1351,97 @@ body,
   border-radius: 3px;
   overflow: hidden;
   flex: 0 0 auto;
+  position: relative;
+}
+/* Per-cell curation actions (star + hide), revealed on hover — absolutely
+   positioned so they never affect layout (Principle 2). */
+.cell-actions {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  right: 5px;
+  display: flex;
+  justify-content: space-between;
+  opacity: 0;
+  transition: opacity 0.12s;
+  pointer-events: none;
+}
+.cell:hover .cell-actions,
+.cell.is-fav .cell-actions {
+  opacity: 1;
+}
+.cell-fav,
+.cell-hide {
+  pointer-events: auto;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.4);
+  color: #fff;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, color 0.12s, transform 0.1s;
+}
+.cell-fav:hover,
+.cell-hide:hover {
+  background: rgba(0, 0, 0, 0.62);
+}
+.cell-fav:active {
+  transform: scale(1.18);
+}
+.cell-fav.on {
+  color: #f24d6b;
+}
+/* A favorited cell keeps its heart visible even unhovered (a quiet red mark). */
+.cell.is-fav .cell-hide {
+  opacity: 0;
+}
+.cell.is-fav:hover .cell-hide {
+  opacity: 1;
+}
+.viewer-fav.on {
+  color: #f24d6b;
+}
+.viewer-fav.on:hover {
+  color: #f56c85;
+}
+.viewer-fav {
+  top: 16px;
+  right: 104px;
+  padding: 2px 6px;
+}
+.viewer-hide {
+  top: 16px;
+  right: 146px;
+  padding: 2px 6px;
+}
+
+/* Hidden-photos management view: a slim header over the reused grid. */
+.curated-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.curated-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #ececec;
+  flex-wrap: wrap;
+}
+.curated-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.curated-hint {
+  font-size: 12px;
+  color: #999;
 }
 
 .thumb {
@@ -2105,6 +2196,12 @@ body,
   }
   .places-note code {
     background: #3a3a3a;
+  }
+  .curated-head {
+    border-bottom-color: #333;
+  }
+  .curated-hint {
+    color: #888;
   }
   .geo-strip-count {
     background: rgba(38, 38, 38, 0.92);

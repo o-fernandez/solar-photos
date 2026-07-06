@@ -4,7 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 /** Thumbnail status, mirrored from the Rust side. */
@@ -21,12 +21,19 @@ export interface PhotoRow {
   status: number;
   /** Capture date if known, else file mtime — Unix seconds. Sorts + labels. */
   ts: number;
+  /** The favorite star (defaults false for queries that don't select it). */
+  favorite?: boolean;
 }
 
 export interface LibraryStats {
   total: number;
   ready: number;
+  favorites: number;
+  hidden: number;
 }
+
+/** Which curation slice of the library a grid shows. */
+export type PhotoFilter = "visible" | "favorites" | "hidden";
 
 /** Counts for the whole library — used to render the grid skeleton at once. */
 export function getLibraryStats(): Promise<LibraryStats> {
@@ -34,13 +41,49 @@ export function getLibraryStats(): Promise<LibraryStats> {
 }
 
 /** Fetch a contiguous window of photo rows. `byDate` = newest-first timeline
- *  order; otherwise discovery order (used while a scan is still running). */
+ *  order; otherwise discovery order (used while a scan is still running).
+ *  `filter` selects the curation slice (default the visible timeline). */
 export function getPhotosRange(
   offset: number,
   limit: number,
   byDate: boolean,
+  filter: PhotoFilter = "visible",
 ): Promise<PhotoRow[]> {
-  return invoke("get_photos_range", { offset, limit, byDate });
+  return invoke("get_photos_range", { offset, limit, byDate, filter });
+}
+
+/** Toggle a photo's favorite star. */
+export function setPhotoFavorite(id: number, favorite: boolean): Promise<void> {
+  return invoke("set_photo_favorite", { id, favorite });
+}
+
+/** Soft-archive (or restore) a photo — a flag only; the file is untouched. */
+export function setPhotoHidden(id: number, hidden: boolean): Promise<void> {
+  return invoke("set_photo_hidden", { id, hidden });
+}
+
+/** Write favorites + hidden to a JSON file the user picks (curation backup that
+ *  outlives the cache dir). Returns how many flagged photos were written. */
+export async function exportCuration(): Promise<number | null> {
+  const path = await save({
+    title: "Export favorites & hidden",
+    defaultPath: "solar-curation.json",
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!path) return null;
+  return invoke("export_curation", { path });
+}
+
+/** Read a curation file and merge its flags back in by path (OR-merge — never
+ *  clears a star). Returns how many entries matched a photo here. */
+export async function importCuration(): Promise<number | null> {
+  const selected = await open({
+    title: "Import favorites & hidden",
+    multiple: false,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (typeof selected !== "string") return null;
+  return invoke("import_curation", { path: selected });
 }
 
 /** Add a folder to the library (remembered as a root) and scan it. Returns
@@ -117,6 +160,8 @@ export interface PhotoDetail {
   /** Full path on disk — backs the viewer's "Show in Finder". */
   path: string;
   timestamp: number;
+  favorite: boolean;
+  hidden: boolean;
 }
 
 /** Filename + path + timestamp for the viewer chrome. */

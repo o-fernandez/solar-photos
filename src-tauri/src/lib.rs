@@ -247,7 +247,7 @@ fn rescan_all(app: AppHandle) {
                 let _ = db::delete_faces_for_photos(&conn, &removed);
                 delete_cache_files(&cache_dir, &preview_dir, &removed);
             }
-            let total = db::stats(&conn).map(|(t, _)| t).unwrap_or(0);
+            let total = db::stats(&conn).map(|s| s.0).unwrap_or(0);
             let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
         }
         rescanning.store(false, Ordering::SeqCst);
@@ -260,16 +260,19 @@ fn rescan_all(app: AppHandle) {
 struct LibraryStats {
     total: i64,
     ready: i64,
+    favorites: i64,
+    hidden: i64,
 }
 
 #[tauri::command]
 fn get_library_stats(state: tauri::State<'_, AppState>) -> Result<LibraryStats, String> {
     let conn = state.conn.lock().unwrap();
-    let (total, ready) = db::stats(&conn).map_err(|e| e.to_string())?;
-    Ok(LibraryStats { total, ready })
+    let (total, ready, favorites, hidden) = db::stats(&conn).map_err(|e| e.to_string())?;
+    Ok(LibraryStats { total, ready, favorites, hidden })
 }
 
-/// Fetch a contiguous window of photo rows (id + thumbnail status), in discovery
+/// Fetch a contiguous window of photo rows (id + thumbnail status) under a
+/// curation filter ("visible" | "favorites" | "hidden"), in discovery or date
 /// order. The virtualized grid asks for only the ranges it is about to display.
 #[tauri::command]
 fn get_photos_range(
@@ -277,9 +280,79 @@ fn get_photos_range(
     offset: i64,
     limit: i64,
     by_date: bool,
+    filter: Option<String>,
 ) -> Result<Vec<db::PhotoRow>, String> {
+    let f = db::PhotoFilter::parse(filter.as_deref().unwrap_or("visible"));
     let conn = state.conn.lock().unwrap();
-    db::photos_range(&conn, offset, limit, by_date).map_err(|e| e.to_string())
+    db::photos_range(&conn, offset, limit, by_date, f).map_err(|e| e.to_string())
+}
+
+/// Toggle a photo's favorite star.
+#[tauri::command]
+fn set_photo_favorite(state: tauri::State<'_, AppState>, id: i64, favorite: bool) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::set_favorite(&conn, id, favorite).map_err(|e| e.to_string())
+}
+
+/// Soft-archive (or restore) a photo — a flag only; the file is never touched.
+#[tauri::command]
+fn set_photo_hidden(state: tauri::State<'_, AppState>, id: i64, hidden: bool) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::set_hidden(&conn, id, hidden).map_err(|e| e.to_string())
+}
+
+/// One JSON line per flagged photo — the curation snapshot the user owns.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CurationEntry {
+    path: String,
+    favorite: bool,
+    hidden: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CurationFile {
+    /// Bumped if the shape ever changes; readers tolerate what they understand.
+    version: u32,
+    entries: Vec<CurationEntry>,
+}
+
+/// Write the favorites + hidden flags to a JSON file the user chooses, so their
+/// curation outlives the app's cache directory (it's the one thing here that
+/// isn't re-derivable from the photos). Keyed by path.
+#[tauri::command]
+fn export_curation(state: tauri::State<'_, AppState>, path: String) -> Result<usize, String> {
+    let rows = {
+        let conn = state.conn.lock().unwrap();
+        db::curation_rows(&conn).map_err(|e| e.to_string())?
+    };
+    let file = CurationFile {
+        version: 1,
+        entries: rows
+            .into_iter()
+            .map(|(path, favorite, hidden)| CurationEntry { path, favorite, hidden })
+            .collect(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    let n = file.entries.len();
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+/// Read a previously exported curation file and merge it into the library by path
+/// (flags are OR-merged — an import never clears a star). Returns how many entries
+/// matched a photo present in this library.
+#[tauri::command]
+fn import_curation(state: tauri::State<'_, AppState>, path: String) -> Result<usize, String> {
+    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let file: CurationFile = serde_json::from_str(&json)
+        .map_err(|_| "that isn't a Solar curation file".to_string())?;
+    let rows: Vec<(String, bool, bool)> = file
+        .entries
+        .into_iter()
+        .map(|e| (e.path, e.favorite, e.hidden))
+        .collect();
+    let mut conn = state.conn.lock().unwrap();
+    db::apply_curation(&mut conn, &rows).map_err(|e| e.to_string())
 }
 
 /// Progress payload for the streaming scan: how many photos are registered so
@@ -354,7 +427,7 @@ fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path:
     delete_cache_files(&state.cache_dir, &state.preview_dir, &removed);
     let total = {
         let conn = state.conn.lock().unwrap();
-        db::stats(&conn).map(|(t, _)| t).unwrap_or(0)
+        db::stats(&conn).map(|s| s.0).unwrap_or(0)
     };
     let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
 }
@@ -367,6 +440,8 @@ struct PhotoDetail {
     /// Full path on disk — backs the viewer's "Show in Finder".
     path: String,
     timestamp: i64,
+    favorite: bool,
+    hidden: bool,
 }
 
 #[tauri::command]
@@ -376,12 +451,12 @@ fn get_photo_detail(
 ) -> Result<Option<PhotoDetail>, String> {
     let conn = state.conn.lock().unwrap();
     let detail = db::detail(&conn, id).map_err(|e| e.to_string())?;
-    Ok(detail.map(|(path, timestamp)| {
+    Ok(detail.map(|(path, timestamp, favorite, hidden)| {
         let filename = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
-        PhotoDetail { filename, path, timestamp }
+        PhotoDetail { filename, path, timestamp, favorite, hidden }
     }))
 }
 
@@ -2101,7 +2176,7 @@ pub fn run() {
                             .collect();
                         if !pairs.is_empty() {
                             let _ = db::set_taken_ts_batch(&mut c, &pairs);
-                            let total = db::stats(&c).map(|(t, _)| t).unwrap_or(0);
+                            let total = db::stats(&c).map(|s| s.0).unwrap_or(0);
                             let _ = app2.emit("scan-progress", ScanProgress { found: total, done: true });
                         }
                     }
@@ -2185,6 +2260,10 @@ pub fn run() {
             get_geo_points,
             basemap_size,
             read_basemap_range,
+            set_photo_favorite,
+            set_photo_hidden,
+            export_curation,
+            import_curation,
             reset_face_recognition,
             reset_face_decisions,
             recluster,

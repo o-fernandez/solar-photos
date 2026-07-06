@@ -4,10 +4,12 @@ import People from "./People";
 import Places from "./Places";
 import {
   addFolder,
+  exportCuration,
   faceCropUrl,
   getClusters,
   getFaceProgress,
   getLibraryStats,
+  importCuration,
   listRoots,
   onFaceProgress,
   onScanProgress,
@@ -35,6 +37,10 @@ const TOAST_COOLDOWN_MS = 45_000;
 function App() {
   const [total, setTotal] = useState(0);
   const [ready, setReady] = useState(0);
+  // Curation counts: the favorites tab badge, and the timeline's own cell count
+  // (total library minus the soft-archived).
+  const [favorites, setFavorites] = useState(0);
+  const [hiddenCount, setHiddenCount] = useState(0);
   const [scanning, setScanning] = useState(false);
   const [rescanning, setRescanning] = useState(false);
   const [roots, setRoots] = useState<string[]>([]);
@@ -43,7 +49,11 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [faceScanned, setFaceScanned] = useState(0);
   const [faceEligible, setFaceEligible] = useState(0);
-  const [view, setView] = useState<"timeline" | "people" | "places">("timeline");
+  const [view, setView] = useState<"timeline" | "favorites" | "people" | "places" | "hidden">(
+    "timeline",
+  );
+  // A transient result line for an import/export action.
+  const [curationNote, setCurationNote] = useState<string | null>(null);
   // Settings menu (Add folder / Rescan / folders), tucked behind the gear.
   const [showSettings, setShowSettings] = useState(false);
   // Two-click guard on the destructive "start people over" reset.
@@ -74,6 +84,8 @@ function App() {
       .then((s) => {
         setTotal(s.total);
         setReady(s.ready);
+        setFavorites(s.favorites);
+        setHiddenCount(s.hidden);
       })
       .catch(() => {});
   }, []);
@@ -236,6 +248,35 @@ function App() {
   // Stable prop for the memoized People — an inline lambda would defeat the memo.
   const handleFocusConsumed = useCallback(() => setFocusClusterId(null), []);
 
+  // A star/hide toggle changed a curation count — refresh the badges.
+  const handleCurationChanged = useCallback(() => refreshStats(), [refreshStats]);
+
+  const flashCuration = useCallback((msg: string) => {
+    setCurationNote(msg);
+    window.setTimeout(() => setCurationNote(null), 6000);
+  }, []);
+
+  const handleExport = useCallback(() => {
+    setShowSettings(false);
+    exportCuration()
+      .then((n) => {
+        if (n != null) flashCuration(`Exported ${n.toLocaleString()} favorited or hidden ${n === 1 ? "photo" : "photos"}.`);
+      })
+      .catch(() => flashCuration("Couldn't export."));
+  }, [flashCuration]);
+
+  const handleImport = useCallback(() => {
+    setShowSettings(false);
+    importCuration()
+      .then((n) => {
+        if (n == null) return;
+        refreshStats();
+        setRefreshKey((k) => k + 1); // reflect imported flags in the open grid
+        flashCuration(`Imported flags for ${n.toLocaleString()} ${n === 1 ? "photo" : "photos"}.`);
+      })
+      .catch(() => flashCuration("That isn't a Solar curation file."));
+  }, [flashCuration, refreshStats]);
+
   // Jump to the new person and open their name field straight away.
   const nameNewPerson = useCallback(() => {
     setNewPerson((p) => {
@@ -296,10 +337,16 @@ function App() {
         {total > 0 && (
           <nav className="view-nav tb-tabs">
             <button
-              className={view === "timeline" ? "on" : ""}
+              className={view === "timeline" || view === "hidden" ? "on" : ""}
               onClick={() => setView("timeline")}
             >
               Timeline
+            </button>
+            <button
+              className={view === "favorites" ? "on" : ""}
+              onClick={() => setView("favorites")}
+            >
+              Favorites
             </button>
             <button
               className={view === "people" ? "on" : ""}
@@ -410,6 +457,34 @@ function App() {
                     </>
                   )}
                   <div className="menu-sep" />
+                  <div className="menu-head">Curation</div>
+                  {hiddenCount > 0 && (
+                    <button
+                      className="menu-item"
+                      onClick={() => {
+                        setShowSettings(false);
+                        setView("hidden");
+                      }}
+                    >
+                      <span className="menu-ic">◕</span>
+                      <span className="menu-label">
+                        Hidden photos
+                        <span className="menu-hint">{hiddenCount.toLocaleString()} soft-archived — review or restore</span>
+                      </span>
+                    </button>
+                  )}
+                  <button className="menu-item" onClick={handleExport}>
+                    <span className="menu-ic">↑</span>
+                    <span className="menu-label">
+                      Export favorites &amp; hidden
+                      <span className="menu-hint">a JSON backup you keep — survives a cache wipe</span>
+                    </span>
+                  </button>
+                  <button className="menu-item" onClick={handleImport}>
+                    <span className="menu-ic">↓</span>
+                    <span className="menu-label">Import favorites &amp; hidden</span>
+                  </button>
+                  <div className="menu-sep" />
                   {confirmReset ? (
                     <div className="menu-confirm">
                       <span className="menu-confirm-q">
@@ -459,11 +534,67 @@ function App() {
           <People focusClusterId={focusClusterId} onFocusConsumed={handleFocusConsumed} />
         ) : view === "places" ? (
           <Places />
+        ) : view === "favorites" ? (
+          favorites > 0 ? (
+            <PhotoGrid
+              key="favorites"
+              total={favorites}
+              byDate
+              refreshKey={refreshKey}
+              filter="favorites"
+              onCurationChanged={handleCurationChanged}
+            />
+          ) : (
+            <div className="empty">
+              <p>No favorites yet.</p>
+              <p className="muted">
+                Hover a photo and tap the heart — or open one and tap it there — to collect
+                your best here. It's a view, not a copy: your files never move.
+              </p>
+            </div>
+          )
+        ) : view === "hidden" ? (
+          <div className="curated-view">
+            <div className="curated-head">
+              <button className="ghost-btn" onClick={() => setView("timeline")}>
+                ‹ Back
+              </button>
+              <span className="curated-title">
+                Hidden photos · {hiddenCount.toLocaleString()}
+              </span>
+              <span className="curated-hint">
+                Hidden photos are kept out of your timeline, People, and Places — but never
+                deleted. Hover any and tap the eye to restore it.
+              </span>
+            </div>
+            {hiddenCount > 0 ? (
+              <PhotoGrid
+                key="hidden"
+                total={hiddenCount}
+                byDate
+                refreshKey={refreshKey}
+                filter="hidden"
+                onCurationChanged={handleCurationChanged}
+              />
+            ) : (
+              <div className="empty">
+                <p>Nothing hidden.</p>
+                <p className="muted">Photos you hide from the timeline collect here.</p>
+              </div>
+            )}
+          </div>
         ) : (
           // Discovery order while a scan runs (append-only, no reflow); snap to
           // the newest-first timeline otherwise. refreshKey forces a refetch
           // when the library changes on disk.
-          <PhotoGrid total={total} byDate={!scanning} refreshKey={refreshKey} />
+          <PhotoGrid
+            key="timeline"
+            total={scanning ? total : Math.max(0, total - hiddenCount)}
+            byDate={!scanning}
+            refreshKey={refreshKey}
+            filter="visible"
+            onCurationChanged={handleCurationChanged}
+          />
         )
       ) : (
         <div className="empty">
@@ -475,6 +606,17 @@ function App() {
           </p>
           <button className="pick-btn empty-add" onClick={handleAdd} disabled={busy}>
             {scanning ? "Scanning…" : "Add folder"}
+          </button>
+        </div>
+      )}
+
+      {curationNote && (
+        <div className="toast" role="status">
+          <div className="toast-body">
+            <div className="toast-sub">{curationNote}</div>
+          </div>
+          <button className="toast-x" aria-label="Dismiss" onClick={() => setCurationNote(null)}>
+            ✕
           </button>
         </div>
       )}

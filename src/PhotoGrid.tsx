@@ -24,12 +24,15 @@ import {
   getPhotosRange,
   onThumbDownloading,
   onThumbReady,
+  setPhotoFavorite,
+  setPhotoHidden,
   setVisibleRange,
   thumbUrl,
   STATUS_READY,
   STATUS_CLOUD,
   STATUS_DOWNLOADING,
   STATUS_FAILED,
+  type PhotoFilter,
   type PhotoRow,
 } from "./api";
 
@@ -42,12 +45,24 @@ function PhotoGrid({
   total,
   byDate,
   refreshKey,
+  filter = "visible",
+  onCurationChanged,
 }: {
   total: number;
   byDate: boolean;
   refreshKey: number;
+  /** Which curation slice this grid shows (timeline / favorites / hidden). */
+  filter?: PhotoFilter;
+  /** Called after a star/hide toggle so the parent can refresh counts and, when
+   *  the toggle changed this view's membership, trigger a scroll-preserving
+   *  refetch (via a bumped refreshKey/curation counter). */
+  onCurationChanged?: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Local favorite overrides (id → on) so a star fills instantly without a
+  // refetch; seeded from row data, authoritative until the next load.
+  const favRef = useRef<Map<number, boolean>>(new Map());
+  const isFav = (photo: PhotoRow) => favRef.current.get(photo.id) ?? photo.favorite ?? false;
 
   // --- Photo data, kept in refs so frequent updates don't re-render on their
   // own. A `tick` state, bumped at most once per animation frame, drives the
@@ -68,7 +83,7 @@ function PhotoGrid({
     if (existing) return existing.id;
     const c = Math.floor(i / CHUNK);
     try {
-      const rows = await getPhotosRange(c * CHUNK, CHUNK, byDate);
+      const rows = await getPhotosRange(c * CHUNK, CHUNK, byDate, filter);
       rows.forEach((row, k) => {
         photosRef.current[c * CHUNK + k] = row;
         if (row.status === STATUS_READY) readyRef.current.add(row.id);
@@ -78,7 +93,7 @@ function PhotoGrid({
     } catch {
       return null;
     }
-  }, [byDate]);
+  }, [byDate, filter]);
 
   const invalidatePending = useRef(false);
   const invalidate = useCallback(() => {
@@ -89,6 +104,59 @@ function PhotoGrid({
       setTick((t) => t + 1);
     });
   }, []);
+
+  // Drop the loaded index→photo map and refetch the visible span — WITHOUT
+  // touching scrollTop. Used when a toggle removes a photo from this view: the
+  // photos below compact up by one cell, but the pixel offset stays, so the user
+  // keeps their place (Principle 2). Distinct from the refreshKey reset, which
+  // starts fresh at the top for a whole-library change.
+  const softRefetch = useCallback(() => {
+    photosRef.current = [];
+    loadedChunks.current.clear();
+    invalidate();
+  }, [invalidate]);
+
+  // Star toggle: fills instantly (favRef override), persists, and — in the
+  // Favorites view, where un-starring removes the photo — refetches in place.
+  const toggleFavorite = useCallback(
+    (photo: PhotoRow) => {
+      const next = !(favRef.current.get(photo.id) ?? photo.favorite ?? false);
+      favRef.current.set(photo.id, next);
+      invalidate();
+      setPhotoFavorite(photo.id, next).catch(() => {});
+      if (filter === "favorites" && !next) softRefetch();
+      onCurationChanged?.();
+    },
+    [filter, invalidate, softRefetch, onCurationChanged],
+  );
+
+  // Hide (timeline/favorites) or restore (hidden view): the photo leaves this
+  // view, so refetch in place. Files are never touched — just the flag. A grid
+  // hide is instant and easy to fat-finger, so it always offers an Undo.
+  const undoTimer = useRef<number | undefined>(undefined);
+  const setHidden = useCallback(
+    (photo: PhotoRow, hidden: boolean) => {
+      setPhotoHidden(photo.id, hidden).catch(() => {});
+      softRefetch();
+      onCurationChanged?.();
+      if (undoTimer.current) window.clearTimeout(undoTimer.current);
+      setHideUndo({ id: photo.id, hidden });
+      undoTimer.current = window.setTimeout(() => setHideUndo(null), 6000);
+    },
+    [softRefetch, onCurationChanged],
+  );
+  // The last hide/restore, revertable for a few seconds.
+  const [hideUndo, setHideUndo] = useState<{ id: number; hidden: boolean } | null>(null);
+  const undoHide = useCallback(() => {
+    setHideUndo((u) => {
+      if (u) {
+        setPhotoHidden(u.id, !u.hidden).catch(() => {});
+        softRefetch();
+        onCurationChanged?.();
+      }
+      return null;
+    });
+  }, [softRefetch, onCurationChanged]);
 
   // As the library grows during a live scan, the chunk that held the previous
   // last photo may have been loaded only partially — evict it so it refetches.
@@ -258,7 +326,7 @@ function PhotoGrid({
     for (let c = firstChunk; c <= lastChunk; c++) {
       if (loadedChunks.current.has(c)) continue;
       loadedChunks.current.add(c);
-      getPhotosRange(c * CHUNK, CHUNK, byDate)
+      getPhotosRange(c * CHUNK, CHUNK, byDate, filter)
         .then((rows) => {
           rows.forEach((row, i) => {
             photosRef.current[c * CHUNK + i] = row;
@@ -282,7 +350,7 @@ function PhotoGrid({
       }
       setVisibleRange(ids).catch(() => {});
     }, 80);
-  }, [virtualRows, columns, total, byDate, invalidate]);
+  }, [virtualRows, columns, total, byDate, filter, invalidate]);
 
   // Scrubber geometry, read fresh each render (the virtualizer re-renders on
   // scroll, so this stays in sync without a separate scroll-position state).
@@ -315,10 +383,11 @@ function PhotoGrid({
             const index = rowStart + c;
             if (index >= total) break;
             const photo = photosRef.current[index];
+            const fav = photo ? isFav(photo) : false;
             cells.push(
               <div
                 key={index}
-                className="cell"
+                className={`cell${fav ? " is-fav" : ""}`}
                 role="button"
                 tabIndex={-1}
                 onClick={() => setViewerIndex(index)}
@@ -330,6 +399,33 @@ function PhotoGrid({
                 }}
               >
                 {renderCellContent(photo)}
+                {photo && (
+                  <div className="cell-actions">
+                    <button
+                      className={`cell-fav${fav ? " on" : ""}`}
+                      title={fav ? "Remove favorite" : "Favorite"}
+                      aria-label={fav ? "Remove favorite" : "Favorite"}
+                      aria-pressed={fav}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleFavorite(photo);
+                      }}
+                    >
+                      <HeartGlyph filled={fav} />
+                    </button>
+                    <button
+                      className="cell-hide"
+                      title={filter === "hidden" ? "Restore to timeline" : "Hide from timeline"}
+                      aria-label={filter === "hidden" ? "Restore to timeline" : "Hide from timeline"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setHidden(photo, filter !== "hidden");
+                      }}
+                    >
+                      {filter === "hidden" ? <EyeGlyph /> : <EyeOffGlyph />}
+                    </button>
+                  </div>
+                )}
               </div>,
             );
           }
@@ -373,6 +469,16 @@ function PhotoGrid({
         ) : null}
       </div>
     )}
+    {hideUndo && (
+      <div className="undo-toast">
+        <span>
+          {hideUndo.hidden ? "Hidden from timeline" : "Restored to timeline"}
+        </span>
+        <button className="undo-btn" onClick={undoHide}>
+          Undo
+        </button>
+      </div>
+    )}
     </div>
     {viewerIndex !== null && (
       <Lightbox
@@ -380,6 +486,12 @@ function PhotoGrid({
         total={total}
         resolveId={resolveId}
         onClose={() => setViewerIndex(null)}
+        onCorrection={() => {
+          // A favorite/hide from the viewer: re-pull so the grid underneath
+          // reflects it (and counts update), keeping the user's scroll place.
+          softRefetch();
+          onCurationChanged?.();
+        }}
       />
     )}
     </>
@@ -448,6 +560,36 @@ function CloudGlyph() {
         fill="currentColor"
         d="M19 18H6a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 16.9 9.2 3.5 3.5 0 0 1 19 18Z"
       />
+    </svg>
+  );
+}
+
+function HeartGlyph({ filled }: { filled: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+      fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20.3l-1.45-1.32C5.4 14.24 2 11.16 2 7.5 2 4.42 4.42 2 7.5 2c1.74 0 3.41.81 4.5 2.09C13.09 2.81 14.76 2 16.5 2 19.58 2 22 4.42 22 7.5c0 3.66-3.4 6.74-8.55 11.49L12 20.3z" />
+    </svg>
+  );
+}
+
+function EyeOffGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+      fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19M6.6 6.6A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.4-1.6" />
+      <path d="M1 1l22 22" />
+    </svg>
+  );
+}
+
+function EyeGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+      fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12s3-8 10-8 10 8 10 8-3 8-10 8-10-8-10-8z" />
+      <circle cx="12" cy="12" r="3" />
     </svg>
   );
 }

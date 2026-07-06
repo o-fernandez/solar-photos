@@ -75,6 +75,12 @@ pub fn init(conn: &Connection) -> Result<()> {
         "ALTER TABLE photos ADD COLUMN geo_scanned INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // The curation layer: user-set flags that annotate WITHOUT touching files —
+    // a favorite star and a "hidden" (soft-archive) flag. Never derived from the
+    // photos, so they survive rescans (UPDATE-by-path keeps the row) and are the
+    // one thing worth exporting (see export_curation).
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0", []);
     // The timeline orders on COALESCE(taken_ts, mtime); index it for fast paging.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_photos_sort ON photos(COALESCE(taken_ts, mtime));
@@ -807,10 +813,10 @@ pub fn cannot_link_pairs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
 /// (a photo with two of their faces still appears once).
 pub fn person_photos(conn: &Connection, group: i64) -> Result<Vec<PhotoRow>> {
     let mut stmt = conn.prepare(
-        "SELECT p.id, p.thumb_status, COALESCE(p.taken_ts, p.mtime) AS ts
+        "SELECT p.id, p.thumb_status, COALESCE(p.taken_ts, p.mtime) AS ts, p.favorite
          FROM photos p
          JOIN faces f ON f.photo_id = p.id
-         WHERE COALESCE(-f.identity_id, f.cluster_id) = ?1 AND f.ignored = 0
+         WHERE COALESCE(-f.identity_id, f.cluster_id) = ?1 AND f.ignored = 0 AND p.hidden = 0
          GROUP BY p.id
          ORDER BY ts DESC, p.id DESC",
     )?;
@@ -819,6 +825,7 @@ pub fn person_photos(conn: &Connection, group: i64) -> Result<Vec<PhotoRow>> {
             id: r.get(0)?,
             status: r.get(1)?,
             ts: r.get(2)?,
+            favorite: r.get::<_, i64>(3)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1217,14 +1224,22 @@ pub fn cloud_jobs_after(conn: &Connection, after_id: i64, limit: i64) -> Result<
 
 /// (total photos, thumbnails ready) — drives the header progress readout and
 /// lets a cold start render the grid immediately from cached state.
-pub fn stats(conn: &Connection) -> Result<(i64, i64)> {
+/// (total indexed, thumbnails ready, favorites, hidden). `total` stays the whole
+/// library (the honest size + the progress denominator); the timeline subtracts
+/// `hidden` for its own cell count.
+pub fn stats(conn: &Connection) -> Result<(i64, i64, i64, i64)> {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
     let ready: i64 = conn.query_row(
         "SELECT COUNT(*) FROM photos WHERE thumb_status = ?1",
         [STATUS_READY],
         |r| r.get(0),
     )?;
-    Ok((total, ready))
+    let favorites: i64 =
+        conn.query_row("SELECT COUNT(*) FROM photos WHERE favorite = 1 AND hidden = 0", [], |r| {
+            r.get(0)
+        })?;
+    let hidden: i64 = conn.query_row("SELECT COUNT(*) FROM photos WHERE hidden = 1", [], |r| r.get(0))?;
+    Ok((total, ready, favorites, hidden))
 }
 
 /// One grid cell's worth of data: a stable id, its thumbnail status, and the
@@ -1234,32 +1249,119 @@ pub struct PhotoRow {
     pub id: i64,
     pub status: i64,
     pub ts: i64,
+    /// The favorite star — so a grid cell can render its state without a second
+    /// query (defaults false for rows from queries that don't select it).
+    #[serde(default)]
+    pub favorite: bool,
 }
 
-/// Fetch a contiguous window of the library.
+/// Which slice of the library a grid is showing. The curation layer turns one
+/// timeline into three views without moving any data.
+#[derive(Clone, Copy)]
+pub enum PhotoFilter {
+    /// The timeline: everything not soft-archived.
+    Visible,
+    /// The favorites view: starred and not hidden.
+    Favorites,
+    /// The hidden view: the soft archive itself (for browsing / un-hiding).
+    Hidden,
+}
+
+impl PhotoFilter {
+    /// The SQL predicate this filter adds (always a valid `WHERE` body).
+    fn predicate(self) -> &'static str {
+        match self {
+            PhotoFilter::Visible => "hidden = 0",
+            PhotoFilter::Favorites => "favorite = 1 AND hidden = 0",
+            PhotoFilter::Hidden => "hidden = 1",
+        }
+    }
+
+    /// Parse the frontend's tag; unknown falls back to the timeline.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "favorites" => PhotoFilter::Favorites,
+            "hidden" => PhotoFilter::Hidden,
+            _ => PhotoFilter::Visible,
+        }
+    }
+}
+
+/// Fetch a contiguous window of the library under a curation filter.
 ///
 /// Two orderings:
 ///   * "discovery" (by id) — used *during* a live scan, so newly found photos
 ///     only ever append to the end and the view never reshuffles (Principle 2).
 ///   * "date" — newest-first by capture date (mtime fallback). Used once the
 ///     scan finishes (the "snap to timeline" moment) and on every cold start.
-pub fn photos_range(conn: &Connection, offset: i64, limit: i64, by_date: bool) -> Result<Vec<PhotoRow>> {
-    let sql = if by_date {
-        "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts FROM photos
-         ORDER BY ts DESC, id DESC LIMIT ?1 OFFSET ?2"
-    } else {
-        "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts FROM photos
-         ORDER BY id LIMIT ?1 OFFSET ?2"
-    };
-    let mut stmt = conn.prepare(sql)?;
+pub fn photos_range(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+    by_date: bool,
+    filter: PhotoFilter,
+) -> Result<Vec<PhotoRow>> {
+    let order = if by_date { "ts DESC, id DESC" } else { "id" };
+    let sql = format!(
+        "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts, favorite FROM photos
+         WHERE {} ORDER BY {} LIMIT ?1 OFFSET ?2",
+        filter.predicate(),
+        order,
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit, offset], |r| {
         Ok(PhotoRow {
             id: r.get(0)?,
             status: r.get(1)?,
             ts: r.get(2)?,
+            favorite: r.get::<_, i64>(3)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Set (or clear) a photo's favorite star.
+pub fn set_favorite(conn: &Connection, id: i64, on: bool) -> Result<()> {
+    conn.execute("UPDATE photos SET favorite = ?1 WHERE id = ?2", rusqlite::params![on as i64, id])?;
+    Ok(())
+}
+
+/// Soft-archive (or restore) a photo. Files are never touched — this only sets a
+/// flag every browse query filters on.
+pub fn set_hidden(conn: &Connection, id: i64, on: bool) -> Result<()> {
+    conn.execute("UPDATE photos SET hidden = ?1 WHERE id = ?2", rusqlite::params![on as i64, id])?;
+    Ok(())
+}
+
+/// The curation snapshot to export: every photo that carries a flag, keyed by the
+/// stable thing across machines and cache wipes — its path. Clean rows (no flag)
+/// are omitted so the file stays small.
+pub fn curation_rows(conn: &Connection) -> Result<Vec<(String, bool, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, favorite, hidden FROM photos WHERE favorite = 1 OR hidden = 1",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Apply an imported curation snapshot by path (OR-merged into current flags, so
+/// importing never clears a star you set since the export). Returns how many rows
+/// matched a photo in this library.
+pub fn apply_curation(conn: &mut Connection, rows: &[(String, bool, bool)]) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut applied = 0usize;
+    {
+        let mut up = tx.prepare(
+            "UPDATE photos SET favorite = MAX(favorite, ?2), hidden = MAX(hidden, ?3) WHERE path = ?1",
+        )?;
+        for (path, fav, hid) in rows {
+            applied += up.execute(rusqlite::params![path, *fav as i64, *hid as i64])?;
+        }
+    }
+    tx.commit()?;
+    Ok(applied)
 }
 
 /// Photos missing a capture date (id, path) — used to backfill filename dates
@@ -1326,7 +1428,8 @@ pub fn geo_backfill_batch(conn: &Connection, limit: i64) -> Result<Vec<(i64, Str
 /// entire dataset in one compact read (fine at 100k; it's four numbers a row).
 pub fn geo_points(conn: &Connection) -> Result<Vec<(i64, f64, f64, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, lat, lon, COALESCE(taken_ts, mtime) FROM photos WHERE lat IS NOT NULL",
+        "SELECT id, lat, lon, COALESCE(taken_ts, mtime) FROM photos
+         WHERE lat IS NOT NULL AND hidden = 0",
     )?;
     let rows =
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
@@ -1359,12 +1462,19 @@ pub fn path_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
 
 /// Detail shown in the viewer chrome: (full path, timestamp). The timestamp is
 /// the capture date once we have it, else the file's modified-time.
-pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64)>> {
+pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64, bool, bool)>> {
     let row = conn
         .query_row(
-            "SELECT path, COALESCE(taken_ts, mtime) FROM photos WHERE id = ?1",
+            "SELECT path, COALESCE(taken_ts, mtime), favorite, hidden FROM photos WHERE id = ?1",
             [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            },
         )
         .ok();
     Ok(row)
@@ -1413,6 +1523,54 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         conn
+    }
+
+    fn insert_photo(conn: &Connection, id: i64, path: &str) {
+        conn.execute(
+            "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status) VALUES (?1, ?2, 0, 0, '', 1)",
+            rusqlite::params![id, path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn curation_filters_and_roundtrips() {
+        let conn = test_conn();
+        insert_photo(&conn, 1, "/a.jpg");
+        insert_photo(&conn, 2, "/b.jpg");
+        insert_photo(&conn, 3, "/c.jpg");
+        set_favorite(&conn, 1, true);
+        set_hidden(&conn, 2, true);
+
+        // Filters slice the one library three ways.
+        let ids = |f: PhotoFilter| {
+            photos_range(&conn, 0, 10, false, f).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(PhotoFilter::Visible), vec![1, 3], "hidden drops from the timeline");
+        assert_eq!(ids(PhotoFilter::Favorites), vec![1]);
+        assert_eq!(ids(PhotoFilter::Hidden), vec![2]);
+        // total stays the whole library; favorites/hidden counted separately.
+        assert_eq!(stats(&conn).unwrap(), (3, 3, 1, 1));
+
+        // Export carries only flagged rows, keyed by path.
+        let exported = curation_rows(&conn).unwrap();
+        assert_eq!(exported.len(), 2);
+
+        // Applying to a fresh library restores by path, OR-merged (a star set
+        // since the export is never cleared).
+        let mut fresh = test_conn();
+        insert_photo(&fresh, 9, "/a.jpg"); // same path, different id
+        insert_photo(&fresh, 8, "/b.jpg");
+        set_favorite(&fresh, 8, true); // /b.jpg already starred locally
+        let applied = apply_curation(&mut fresh, &exported).unwrap();
+        assert_eq!(applied, 2, "both paths matched");
+        assert_eq!(ids_of(&fresh, PhotoFilter::Favorites), vec![9]); // /a.jpg starred by import
+        // /b.jpg keeps its local star AND gains the imported hidden flag.
+        assert_eq!(ids_of(&fresh, PhotoFilter::Hidden), vec![8]);
+    }
+
+    fn ids_of(conn: &Connection, f: PhotoFilter) -> Vec<i64> {
+        photos_range(conn, 0, 10, false, f).unwrap().into_iter().map(|r| r.id).collect()
     }
 
     fn insert_face(conn: &Connection, id: i64, cluster: i64, identity: Option<i64>, confirmed: bool) {

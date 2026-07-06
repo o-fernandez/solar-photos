@@ -18,6 +18,8 @@ import {
   getFacesInPhoto,
   getPhotoDetail,
   ignoreFaces,
+  setPhotoFavorite,
+  setPhotoHidden,
   nameCluster,
   nameFaces,
   onClusterProgress,
@@ -400,6 +402,27 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     fn?.();
   };
 
+  // Favorite / hide from the viewer: flip the flag on the open photo. Optimistic
+  // (updates `detail` immediately), then persists and tells the opener so the grid
+  // underneath reflects it — a hidden photo leaves the timeline on close, a star
+  // fills its cell. Files are never touched.
+  const toggleFavorite = () => {
+    if (id == null || !detail) return;
+    const next = !detail.favorite;
+    setDetail({ ...detail, favorite: next });
+    setPhotoFavorite(id, next).then(() => onCorrection?.()).catch(() => {});
+  };
+  const toggleHidden = () => {
+    if (id == null || !detail) return;
+    const next = !detail.hidden;
+    setDetail({ ...detail, hidden: next });
+    flashUndo(next ? "Hidden from the timeline" : "Restored to the timeline", () => {
+      if (id != null) setPhotoHidden(id, !next).then(() => onCorrection?.()).catch(() => {});
+      setDetail((d) => (d ? { ...d, hidden: !next } : d));
+    });
+    setPhotoHidden(id, next).then(() => onCorrection?.()).catch(() => {});
+  };
+
   const when = detail ? formatWhen(detail.timestamp) : "";
 
   return (
@@ -414,6 +437,46 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
       >
         ✕
       </button>
+
+      {detail && (
+        <>
+          <button
+            className={`viewer-btn viewer-fav${detail.favorite ? " on" : ""}`}
+            aria-label={detail.favorite ? "Remove favorite" : "Favorite"}
+            aria-pressed={detail.favorite}
+            title={detail.favorite ? "Remove favorite" : "Favorite"}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleFavorite();
+            }}
+          >
+            <svg width="21" height="21" viewBox="0 0 24 24" fill={detail.favorite ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 20.3l-1.45-1.32C5.4 14.24 2 11.16 2 7.5 2 4.42 4.42 2 7.5 2c1.74 0 3.41.81 4.5 2.09C13.09 2.81 14.76 2 16.5 2 19.58 2 22 4.42 22 7.5c0 3.66-3.4 6.74-8.55 11.49L12 20.3z" />
+            </svg>
+          </button>
+          <button
+            className="viewer-btn viewer-hide"
+            aria-label={detail.hidden ? "Restore to timeline" : "Hide from timeline"}
+            title={detail.hidden ? "Restore to timeline" : "Hide from timeline"}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleHidden();
+            }}
+          >
+            {detail.hidden ? (
+              <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M2 12s3-8 10-8 10 8 10 8-3 8-10 8-10-8-10-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            ) : (
+              <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18 18 0 0 1-2.16 3.19M6.6 6.6A18 18 0 0 0 2 12s3 8 10 8a9 9 0 0 0 5.4-1.6" />
+                <path d="M1 1l22 22" />
+              </svg>
+            )}
+          </button>
+        </>
+      )}
 
       {faces.length > 0 && (
         <button
