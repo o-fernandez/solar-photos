@@ -1295,7 +1295,71 @@ impl PhotoFilter {
     }
 }
 
-/// Fetch a contiguous window of the library under a curation filter.
+// ---------------------------------------------------------------------------
+// Timeline search. A free-text query is split on whitespace and every token
+// must match — a 4-digit year matches the photo's (capture-date) year, an
+// English month name (3+ letters, "jun" or "june") matches its month, and any
+// other token is a case-insensitive substring of the file's PATH, so folder
+// names ("wedding", "iceland") match alongside filenames. All local, all over
+// data already indexed — search never reads a file.
+// ---------------------------------------------------------------------------
+
+/// Month number for an English month name or its 3+-letter prefix.
+fn month_number(t: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    if t.len() < 3 {
+        return None; // "ma" is ambiguous (march/may); real prefixes start at 3
+    }
+    MONTHS.iter().position(|m| m.starts_with(t)).map(|i| i as u32 + 1)
+}
+
+/// Escape LIKE wildcards in a user token (queries use `ESCAPE '\'`).
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// The search query as SQL: a (possibly empty) `" AND …"` fragment to append to
+/// a photos WHERE clause, plus its string parameters in order.
+fn search_where(query: &str) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut params: Vec<String> = Vec::new();
+    for tok in query.split_whitespace() {
+        let t = tok.to_lowercase();
+        if let Ok(y) = t.parse::<i64>() {
+            if (1900..=2100).contains(&y) {
+                sql.push_str(" AND strftime('%Y', COALESCE(taken_ts, mtime), 'unixepoch') = ?");
+                params.push(y.to_string());
+                continue;
+            }
+        }
+        if let Some(m) = month_number(&t) {
+            sql.push_str(" AND strftime('%m', COALESCE(taken_ts, mtime), 'unixepoch') = ?");
+            params.push(format!("{m:02}"));
+            continue;
+        }
+        sql.push_str(" AND path LIKE ? ESCAPE '\\'");
+        params.push(format!("%{}%", like_escape(&t)));
+    }
+    (sql, params)
+}
+
+/// How many photos a filter + optional search match — the virtualized grid's
+/// cell count when a search narrows the view.
+pub fn photos_count(conn: &Connection, filter: PhotoFilter, search: Option<&str>) -> Result<i64> {
+    let (cond, params) = search_where(search.unwrap_or(""));
+    let sql = format!(
+        "SELECT COUNT(*) FROM photos WHERE {}{}",
+        filter.predicate(),
+        cond,
+    );
+    Ok(conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?)
+}
+
+/// Fetch a contiguous window of the library under a curation filter and an
+/// optional search query (every token must match — see `search_where`).
 ///
 /// Two orderings:
 ///   * "discovery" (by id) — used *during* a live scan, so newly found photos
@@ -1308,16 +1372,23 @@ pub fn photos_range(
     limit: i64,
     by_date: bool,
     filter: PhotoFilter,
+    search: Option<&str>,
 ) -> Result<Vec<PhotoRow>> {
     let order = if by_date { "ts DESC, id DESC" } else { "id" };
+    let (cond, params) = search_where(search.unwrap_or(""));
+    // limit/offset are typed i64s from the IPC layer — inlining them keeps the
+    // bound parameters homogeneous (the search's strings).
     let sql = format!(
         "SELECT id, thumb_status, COALESCE(taken_ts, mtime) AS ts, favorite FROM photos
-         WHERE {} ORDER BY {} LIMIT ?1 OFFSET ?2",
+         WHERE {}{} ORDER BY {} LIMIT {} OFFSET {}",
         filter.predicate(),
+        cond,
         order,
+        limit,
+        offset,
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([limit, offset], |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
         Ok(PhotoRow {
             id: r.get(0)?,
             status: r.get(1)?,
@@ -1576,7 +1647,7 @@ mod tests {
 
         // Filters slice the one library three ways.
         let ids = |f: PhotoFilter| {
-            photos_range(&conn, 0, 10, false, f).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>()
+            photos_range(&conn, 0, 10, false, f, None).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>()
         };
         assert_eq!(ids(PhotoFilter::Visible), vec![1, 3], "hidden drops from the timeline");
         assert_eq!(ids(PhotoFilter::Favorites), vec![1]);
@@ -1602,7 +1673,37 @@ mod tests {
     }
 
     fn ids_of(conn: &Connection, f: PhotoFilter) -> Vec<i64> {
-        photos_range(conn, 0, 10, false, f).unwrap().into_iter().map(|r| r.id).collect()
+        photos_range(conn, 0, 10, false, f, None).unwrap().into_iter().map(|r| r.id).collect()
+    }
+
+    /// Search: every token must match — years/months against the capture date,
+    /// anything else as a path substring (so folder names count) — and LIKE
+    /// wildcards inside a token are matched literally.
+    #[test]
+    fn search_matches_path_year_and_month() {
+        let conn = test_conn();
+        // 2019-06-01 and 2020-06-01 (UTC), plus an undated oddly-named file.
+        conn.execute_batch(
+            "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status, taken_ts) VALUES
+               (1, '/lib/Iceland trip/IMG_1.jpg', 0, 0, '', 1, 1559347200),
+               (2, '/lib/Beach/IMG_2.jpg',        0, 0, '', 1, 1590969600),
+               (3, '/lib/Beach/IMG_100%_off.jpg', 0, 0, '', 1, NULL);",
+        )
+        .unwrap();
+        let find = |q: &str| {
+            photos_range(&conn, 0, 10, false, PhotoFilter::Visible, Some(q))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("iceland"), vec![1], "folder names match, case-insensitively");
+        assert_eq!(find("2019"), vec![1], "a 4-digit year matches the capture year");
+        assert_eq!(find("june"), vec![1, 2], "a month name matches across years");
+        assert_eq!(find("jun 2020"), vec![2], "tokens combine (AND)");
+        assert_eq!(find("beach 2019"), Vec::<i64>::new(), "no photo satisfies both");
+        assert_eq!(find("100%_off"), vec![3], "LIKE wildcards are literal");
+        assert_eq!(photos_count(&conn, PhotoFilter::Visible, Some("june")).unwrap(), 2);
     }
 
     fn insert_face(conn: &Connection, id: i64, cluster: i64, identity: Option<i64>, confirmed: bool) {

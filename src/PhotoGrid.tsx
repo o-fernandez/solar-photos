@@ -46,6 +46,7 @@ function PhotoGrid({
   byDate,
   refreshKey,
   filter = "visible",
+  search,
   onCurationChanged,
 }: {
   total: number;
@@ -53,6 +54,9 @@ function PhotoGrid({
   refreshKey: number;
   /** Which curation slice this grid shows (timeline / favorites / hidden). */
   filter?: PhotoFilter;
+  /** Free-text search narrowing this grid (the ⌘F timeline results view). The
+   *  caller supplies the matching `total` from countPhotos. */
+  search?: string;
   /** Called after a star/hide toggle so the parent can refresh counts and, when
    *  the toggle changed this view's membership, trigger a scroll-preserving
    *  refetch (via a bumped refreshKey/curation counter). */
@@ -83,7 +87,7 @@ function PhotoGrid({
     if (existing) return existing.id;
     const c = Math.floor(i / CHUNK);
     try {
-      const rows = await getPhotosRange(c * CHUNK, CHUNK, byDate, filter);
+      const rows = await getPhotosRange(c * CHUNK, CHUNK, byDate, filter, search);
       rows.forEach((row, k) => {
         photosRef.current[c * CHUNK + k] = row;
         if (row.status === STATUS_READY) readyRef.current.add(row.id);
@@ -93,7 +97,7 @@ function PhotoGrid({
     } catch {
       return null;
     }
-  }, [byDate, filter]);
+  }, [byDate, filter, search]);
 
   const invalidatePending = useRef(false);
   const invalidate = useCallback(() => {
@@ -170,10 +174,11 @@ function PhotoGrid({
     invalidate();
   }, [total, invalidate]);
 
-  // Reset when the ordering changes (scan finished: discovery → date) or the
-  // library changed on disk (add / rescan / remove → refreshKey). The
-  // index→photo mapping is order-dependent, so drop it and refetch from the top;
-  // readyRef/downloadingRef are id-based and stay valid. The discovery→date flip
+  // Reset when the ordering changes (scan finished: discovery → date), the
+  // library changed on disk (add / rescan / remove → refreshKey), or the search
+  // query changed (different result set entirely). The index→photo mapping is
+  // order-dependent, so drop it and refetch from the top; readyRef/
+  // downloadingRef are id-based and stay valid. The discovery→date flip
   // reorders everything under the user, so it announces itself briefly.
   const firstOrder = useRef(true);
   const prevByDate = useRef(byDate);
@@ -196,7 +201,7 @@ function PhotoGrid({
       const t = window.setTimeout(() => setSortNote(false), 5000);
       return () => window.clearTimeout(t);
     }
-  }, [byDate, refreshKey, invalidate]);
+  }, [byDate, refreshKey, search, invalidate]);
 
   // --- Timeline scrubber ---
   const [scrubbing, setScrubbing] = useState(false);
@@ -326,7 +331,7 @@ function PhotoGrid({
     for (let c = firstChunk; c <= lastChunk; c++) {
       if (loadedChunks.current.has(c)) continue;
       loadedChunks.current.add(c);
-      getPhotosRange(c * CHUNK, CHUNK, byDate, filter)
+      getPhotosRange(c * CHUNK, CHUNK, byDate, filter, search)
         .then((rows) => {
           rows.forEach((row, i) => {
             photosRef.current[c * CHUNK + i] = row;
@@ -350,7 +355,7 @@ function PhotoGrid({
       }
       setVisibleRange(ids).catch(() => {});
     }, 80);
-  }, [virtualRows, columns, total, byDate, filter, invalidate]);
+  }, [virtualRows, columns, total, byDate, filter, search, invalidate]);
 
   // Scrubber geometry, read fresh each render (the virtualizer re-renders on
   // scroll, so this stays in sync without a separate scroll-position state).

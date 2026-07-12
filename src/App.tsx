@@ -5,6 +5,7 @@ import Places from "./Places";
 import Home from "./Home";
 import {
   addFolder,
+  countPhotos,
   exportCuration,
   faceCropUrl,
   getClusters,
@@ -57,6 +58,17 @@ function App() {
   const [openPerson, setOpenPerson] = useState<Cluster | null>(null);
   // A transient result line for an import/export action.
   const [curationNote, setCurationNote] = useState<string | null>(null);
+  // Timeline search (⌘F): the live input, the debounced query the grid actually
+  // runs, its match count, and the named people whose names match (chips that
+  // jump to their page). All local: file/folder names + capture dates.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchInput, setSearchInput] = useState("");
+  const [search, setSearch] = useState("");
+  const [searchCount, setSearchCount] = useState(0);
+  const [searchPeople, setSearchPeople] = useState<Cluster[]>([]);
+  const allPeopleRef = useRef<Cluster[]>([]);
+  const searchRef = useRef("");
+  searchRef.current = search;
   // Settings menu (Add folder / Rescan / folders), tucked behind the gear.
   const [showSettings, setShowSettings] = useState(false);
   // Two-click guard on the destructive "start people over" reset.
@@ -262,8 +274,71 @@ function App() {
     [],
   );
 
-  // A star/hide toggle changed a curation count — refresh the badges.
-  const handleCurationChanged = useCallback(() => refreshStats(), [refreshStats]);
+  // A star/hide toggle changed a curation count — refresh the badges (and the
+  // search tally, so hiding a result doesn't leave the count stale).
+  const handleCurationChanged = useCallback(() => {
+    refreshStats();
+    if (searchRef.current) {
+      countPhotos("visible", searchRef.current).then(setSearchCount).catch(() => {});
+    }
+  }, [refreshStats]);
+
+  // --- Timeline search plumbing ---
+  const searchBoxRef = useRef<HTMLInputElement>(null);
+  const openSearch = useCallback(() => {
+    setView("timeline");
+    setSearchOpen(true);
+    // Focus works whether the box just mounted (autoFocus) or was already open.
+    window.setTimeout(() => searchBoxRef.current?.focus(), 0);
+    // The person-chip candidates, loaded once per open (names change rarely).
+    getClusters()
+      .then((cs) => {
+        allPeopleRef.current = cs.filter((c) => c.name != null);
+      })
+      .catch(() => {});
+  }, []);
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchInput("");
+    setSearch("");
+    setSearchPeople([]);
+  }, []);
+
+  // Debounce keystrokes into the applied query, then fetch its match count and
+  // person-name matches together — the grid re-renders once per settled query.
+  useEffect(() => {
+    const q = searchInput.trim();
+    const t = window.setTimeout(() => {
+      setSearch(q);
+      if (!q) {
+        setSearchPeople([]);
+        return;
+      }
+      countPhotos("visible", q).then(setSearchCount).catch(() => setSearchCount(0));
+      const ql = q.toLowerCase();
+      setSearchPeople(
+        allPeopleRef.current.filter((c) => c.name!.toLowerCase().includes(ql)).slice(0, 6),
+      );
+    }, 250);
+    return () => window.clearTimeout(t);
+  }, [searchInput]);
+
+  // ⌘F (anywhere) or "/" (outside a text field) opens the search.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const typing = t != null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        openSearch();
+      } else if (e.key === "/" && !typing) {
+        e.preventDefault();
+        openSearch();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openSearch]);
 
   const flashCuration = useCallback((msg: string) => {
     setCurationNote(msg);
@@ -384,6 +459,33 @@ function App() {
         )}
 
         <div className="tb-side tb-right">
+          {total > 0 &&
+            (searchOpen && view === "timeline" ? (
+              <input
+                ref={searchBoxRef}
+                className="people-search tb-search"
+                type="search"
+                autoFocus
+                placeholder="Search — name, folder, month, year"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") closeSearch();
+                }}
+              />
+            ) : (
+              <button
+                className="tb-gear"
+                aria-label="Search photos (⌘F)"
+                title="Search photos (⌘F)"
+                onClick={openSearch}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M20 20l-4.2-4.2" />
+                </svg>
+              </button>
+            ))}
           <div className="settings">
             <button
               className="tb-gear"
@@ -607,6 +709,50 @@ function App() {
               <div className="empty">
                 <p>Nothing hidden.</p>
                 <p className="muted">Photos you hide from the timeline collect here.</p>
+              </div>
+            )}
+          </div>
+        ) : search ? (
+          // Search results: a date-ordered grid narrowed to the query, with a
+          // tally strip and person-name chips that jump to a person's page.
+          <div className="curated-view">
+            <div className="search-strip">
+              <span>
+                <b>{searchCount.toLocaleString()}</b>{" "}
+                {searchCount === 1 ? "photo matches" : "photos match"} “{search}”
+              </span>
+              {searchPeople.map((c) => (
+                <button
+                  key={c.cluster_id}
+                  className="search-person"
+                  title={`See ${c.name}`}
+                  onClick={() => handleOpenPerson(c)}
+                >
+                  <img src={faceCropUrl(c.cover_face_id)} alt="" draggable={false} />
+                  {c.name}
+                </button>
+              ))}
+              <button className="ghost-btn search-clear" onClick={closeSearch}>
+                Clear
+              </button>
+            </div>
+            {searchCount > 0 ? (
+              <PhotoGrid
+                key="search"
+                total={searchCount}
+                byDate
+                refreshKey={refreshKey}
+                filter="visible"
+                search={search}
+                onCurationChanged={handleCurationChanged}
+              />
+            ) : (
+              <div className="empty">
+                <p>Nothing matches “{search}”.</p>
+                <p className="muted">
+                  Search looks at file and folder names, years (“2019”) and month names
+                  (“june”) — and matching people appear above, one tap from their page.
+                </p>
               </div>
             )}
           </div>

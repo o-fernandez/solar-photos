@@ -271,8 +271,9 @@ fn get_library_stats(state: tauri::State<'_, AppState>) -> Result<LibraryStats, 
 }
 
 /// Fetch a contiguous window of photo rows (id + thumbnail status) under a
-/// curation filter ("visible" | "favorites" | "hidden"), in discovery or date
-/// order. The virtualized grid asks for only the ranges it is about to display.
+/// curation filter ("visible" | "favorites" | "hidden") and an optional search
+/// query, in discovery or date order. The virtualized grid asks for only the
+/// ranges it is about to display.
 #[tauri::command]
 fn get_photos_range(
     state: tauri::State<'_, AppState>,
@@ -280,10 +281,30 @@ fn get_photos_range(
     limit: i64,
     by_date: bool,
     filter: Option<String>,
+    search: Option<String>,
 ) -> Result<Vec<db::PhotoRow>, String> {
     let f = db::PhotoFilter::parse(filter.as_deref().unwrap_or("visible"));
     let conn = state.conn.lock().unwrap();
-    db::photos_range(&conn, offset, limit, by_date, f).map_err(|e| e.to_string())
+    db::photos_range(&conn, offset, limit, by_date, f, normalized_search(&search))
+        .map_err(|e| e.to_string())
+}
+
+/// How many photos a filter + search match — the grid's cell count while a
+/// search narrows the timeline.
+#[tauri::command]
+fn count_photos(
+    state: tauri::State<'_, AppState>,
+    filter: Option<String>,
+    search: Option<String>,
+) -> Result<i64, String> {
+    let f = db::PhotoFilter::parse(filter.as_deref().unwrap_or("visible"));
+    let conn = state.conn.lock().unwrap();
+    db::photos_count(&conn, f, normalized_search(&search)).map_err(|e| e.to_string())
+}
+
+/// A search argument worth passing down: non-empty after trimming.
+fn normalized_search(search: &Option<String>) -> Option<&str> {
+    search.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// "On this day" — photos taken on today's month-and-day in past years, for the
@@ -2247,6 +2268,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_library_stats,
             get_photos_range,
+            count_photos,
             get_photo_detail,
             add_folder,
             rescan,

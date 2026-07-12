@@ -42,14 +42,22 @@ export function getLibraryStats(): Promise<LibraryStats> {
 
 /** Fetch a contiguous window of photo rows. `byDate` = newest-first timeline
  *  order; otherwise discovery order (used while a scan is still running).
- *  `filter` selects the curation slice (default the visible timeline). */
+ *  `filter` selects the curation slice (default the visible timeline);
+ *  `search` narrows it to a free-text query (file/folder names, years,
+ *  month names — every token must match). */
 export function getPhotosRange(
   offset: number,
   limit: number,
   byDate: boolean,
   filter: PhotoFilter = "visible",
+  search?: string,
 ): Promise<PhotoRow[]> {
-  return invoke("get_photos_range", { offset, limit, byDate, filter });
+  return invoke("get_photos_range", { offset, limit, byDate, filter, search: search ?? null });
+}
+
+/** How many photos a filter + search query match — the search grid's size. */
+export function countPhotos(filter: PhotoFilter, search: string): Promise<number> {
+  return invoke("count_photos", { filter, search });
 }
 
 /** Photos taken on today's month-and-day in past years — the Home shelf.

@@ -2843,3 +2843,47 @@ body,
 .rf-progress .rf-x {
   margin-left: auto;
 }
+
+/* --- Timeline search (⌘F): the top-bar box and the results strip. --- */
+.tb-search {
+  width: 230px;
+}
+.search-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid #ececec;
+  font-size: 13px;
+  color: #666;
+  flex: 0 0 auto;
+}
+.search-strip b {
+  color: #1a1a1a;
+}
+/* A matching named person — one tap from their page. */
+.search-person {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #e0e0e0;
+  background: #fff;
+  border-radius: 999px;
+  padding: 3px 10px 3px 4px;
+  font-size: 12.5px;
+  color: #1a1a1a;
+  cursor: pointer;
+}
+.search-person:hover {
+  border-color: #f5a623;
+}
+.search-person img {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.search-clear {
+  margin-left: auto;
+}
