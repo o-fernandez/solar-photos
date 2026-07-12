@@ -12,6 +12,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PersonView from "./PersonView";
+import PersonPicker from "./PersonPicker";
 import ReviewFocus from "./ReviewFocus";
 import {
   faceCropUrl,
@@ -29,7 +30,6 @@ import {
   type IdentityGrowth,
   type ReviewQueue,
 } from "./api";
-import { usePickerNav } from "./pickerNav";
 
 // While the library is still being scanned, the incremental assign path spawns a
 // swarm of 1–3-photo fragments that mostly vanish after consolidation — pure noise
@@ -236,16 +236,6 @@ function People({
     setDraft(c.name ?? "");
   };
 
-  // The named people whose name contains what you're typing (excluding the one
-  // you're editing) — the merge-into-an-existing-person suggestions. Biggest first.
-  const nameMatches = (self: Cluster): Cluster[] => {
-    const q = draft.trim().toLowerCase();
-    if (!q) return [];
-    return clusters
-      .filter((c) => c.cluster_id !== self.cluster_id && c.name && c.name.toLowerCase().includes(q))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5);
-  };
   // The existing person whose name is *exactly* what you typed (case-insensitive) —
   // the signal that naming should merge rather than create a duplicate tile.
   const exactNameMatch = (self: Cluster, name: string): Cluster | undefined => {
@@ -255,20 +245,6 @@ function People({
       (c) => c.cluster_id !== self.cluster_id && c.name != null && c.name.toLowerCase() === q,
     );
   };
-
-  // The tile being renamed and its live suggestions — lifted out of renderTile so
-  // the keyboard-nav hook has a single home (only one tile edits at a time).
-  const editingCluster =
-    editing != null ? clusters.find((c) => c.cluster_id === editing) ?? null : null;
-  const editMatches = editingCluster ? nameMatches(editingCluster) : [];
-  // Enter commits the typed name; ↑/↓ opt into the merge suggestions first.
-  const editNav = usePickerNav(
-    editMatches.length,
-    (i) => {
-      if (editingCluster) mergeInto(editingCluster, editMatches[i]);
-    },
-    { startUnselected: true },
-  );
 
   // Fold this group into an existing person (chosen from the suggestions, or typed
   // as an exact name match). The named person survives; the growth card then offers
@@ -347,43 +323,23 @@ function People({
         )}
       </div>
       {editing === c.cluster_id ? (
-        <div className="pname-combo" onClick={(e) => e.stopPropagation()}>
-          <input
-            className="pname-input"
-            autoFocus
-            value={draft}
-            placeholder="Name"
-            onChange={(e) => {
-              setDraft(e.target.value);
-              editNav.resetHighlight();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setEditing(null);
-              else if (editNav.onNavKey(e)) return;
-              else if (e.key === "Enter") commitEdit(c);
-            }}
-            onBlur={() => commitEdit(c)}
-          />
-          {editMatches.length > 0 && (
-            // preventDefault keeps the input from blurring (and commit-naming the
-            // group) before a suggestion click runs its merge.
-            <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
-              <li className="name-suggest-head">Add to an existing person</li>
-              {editMatches.map((m, i) => (
-                <li
-                  key={m.cluster_id}
-                  className={`name-suggest-item${editNav.highlight === i ? " hi" : ""}`}
-                  onMouseEnter={() => editNav.setHighlight(i)}
-                  onClick={() => mergeInto(c, m)}
-                >
-                  <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                  <span className="ns-name">{m.name}</span>
-                  <span className="ns-count">{m.count.toLocaleString()}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+        // Enter commits the typed name; ↑/↓ opt into the merge suggestions first.
+        <PersonPicker
+          variant="combo"
+          people={clusters}
+          excludeId={c.cluster_id}
+          query={draft}
+          onQueryChange={setDraft}
+          placeholder="Name"
+          header="Add to an existing person"
+          showCounts
+          limit={5}
+          commitsText
+          commitOnBlur
+          onCommitText={() => commitEdit(c)}
+          onPick={(m) => mergeInto(c, m)}
+          onEscape={() => setEditing(null)}
+        />
       ) : c.name ? (
         <span className="pname-row">
           <span className="pname">{c.name}</span>

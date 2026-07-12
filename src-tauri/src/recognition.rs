@@ -596,10 +596,13 @@ pub fn compute_identity_growth(
     if named.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
+    // Packed once and shared by the whole pass — the per-identity clones of the
+    // full embedding set were its dominant allocation cost (O(people × library)).
     let all_faces = db::face_cluster_embeddings(conn)?;
+    let face_matrix = cluster::FaceMatrix::new(&all_faces);
     // How well every candidate matches each confirmed identity (incl. "not X"
     // splits) — so we don't suggest a group that's decisively someone else's.
-    let matches = cluster_identity_matches(conn)?;
+    let matches = cluster_identity_matches_with(conn, face_matrix.as_ref())?;
     // Co-occurrence veto for candidates (see auto_fold_confident).
     let (cluster_photos, identity_photos) = cooccurrence_maps(conn)?;
 
@@ -624,15 +627,12 @@ pub fn compute_identity_growth(
         // Match against the anchor's dominant core, not a possibly-polluted full set.
         let core = anchor_core(anchor);
         // The fold-in target is the identity's own (stable) group key; its own
-        // faces are excluded from the candidate search by that same key.
+        // faces are masked out of the candidate search by that same key.
         let into = -identity_id;
-        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
-            .iter()
-            .filter(|(_, g, _)| *g != into)
-            .cloned()
-            .collect();
-
-        let mut cands = cluster::identity_candidates(&core, &others);
+        let mut cands = match &face_matrix {
+            Some(fm) => fm.identity_candidates(&core, Some(into)),
+            None => Vec::new(),
+        };
         // Strongest matches first, and drop any cluster the user said isn't this person.
         cands.sort_by(|a, b| b.max_sim.partial_cmp(&a.max_sim).unwrap());
         let mut candidates = Vec::new();
@@ -903,21 +903,27 @@ pub fn anchor_core(embs: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
 pub fn cluster_identity_matches(
     conn: &Connection,
 ) -> anyhow::Result<std::collections::HashMap<i64, Vec<(i64, f32)>>> {
-    use std::collections::HashMap;
     let all_faces = db::face_cluster_embeddings(conn)?;
+    cluster_identity_matches_with(conn, cluster::FaceMatrix::new(&all_faces).as_ref())
+}
+
+/// The shared-matrix form of [`cluster_identity_matches`]: the growth pass packs
+/// the face set once and reuses it here, instead of paying a second full pack.
+/// `None` (an empty library) yields an empty map.
+fn cluster_identity_matches_with(
+    conn: &Connection,
+    face_matrix: Option<&cluster::FaceMatrix>,
+) -> anyhow::Result<std::collections::HashMap<i64, Vec<(i64, f32)>>> {
+    use std::collections::HashMap;
     let mut per_cluster: HashMap<i64, Vec<(i64, f32)>> = HashMap::new();
+    let Some(fm) = face_matrix else { return Ok(per_cluster) };
     for identity_id in db::confirmed_identity_ids(conn)? {
         let anchor = db::confirmed_anchor_embeddings(conn, identity_id, 64)?;
         if anchor.len() < COMPETITOR_MIN {
             continue; // no confirmed evidence to compete with
         }
         let core = anchor_core(anchor);
-        let others: Vec<(i64, i64, Vec<f32>)> = all_faces
-            .iter()
-            .filter(|(_, g, _)| *g != -identity_id)
-            .cloned()
-            .collect();
-        for c in cluster::identity_candidates(&core, &others) {
+        for c in fm.identity_candidates(&core, Some(-identity_id)) {
             per_cluster.entry(c.cluster_id).or_default().push((identity_id, c.max_sim));
         }
     }

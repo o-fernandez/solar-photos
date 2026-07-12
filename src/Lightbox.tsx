@@ -12,7 +12,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   confirmFacesIntoCluster,
-  faceCropUrl,
   getClusterGeneration,
   getClusters,
   getFacesInPhoto,
@@ -33,7 +32,7 @@ import {
   type PhotoDetail,
   type PhotoFace,
 } from "./api";
-import { usePickerNav } from "./pickerNav";
+import PersonPicker from "./PersonPicker";
 
 interface Props {
   index: number;
@@ -380,13 +379,12 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     async (face: PhotoFace, name: string) => {
       setOpenFace(null);
       if (face.cluster_id == null || !name) return;
-      const prev = face.name ?? "";
       try {
-        // Naming may promote the group to a new (negative, stable) key — undo
-        // must rename THAT group, not the possibly-dead positive id.
-        const g = await nameCluster(face.cluster_id, name, genRef.current);
+        // The backend token restores the prior name AND the confirmed flags the
+        // naming wrote — renaming back by hand left the vouching behind.
+        const { undo } = await nameCluster(face.cluster_id, name, genRef.current);
         flashUndo(`Named ${name}`, () =>
-          nameCluster(g, prev, genRef.current).then(afterChange).catch(() => {}),
+          undoCorrection(undo).then(afterChange).catch(() => {}),
         );
         afterChange();
       } catch {
@@ -709,77 +707,49 @@ function FaceMenu({
   // at the action menu and drop into "rename" or "move just this face" on demand.
   const [mode, setMode] = useState<"root" | "name" | "move">(unnamed ? "name" : "root");
   const [draft, setDraft] = useState("");
-  const pickTarget = (m: Cluster) => onConfirmFaceInto(m);
-  const nameNew = (nm: string) => onNameFaceOnly(nm);
 
+  // The exact-match probe: when the typed text IS an existing person, the
+  // "+ Name “X”" row is redundant (that person's own row commits the same thing).
   const q = draft.trim().toLowerCase();
-  const matches = people
-    .filter((c) => c.cluster_id !== face.cluster_id && c.name)
-    .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
-    .slice(0, 6);
   const exact = q ? people.find((c) => c.name && c.name.toLowerCase() === q) : undefined;
-
-  // ↑/↓ + Enter over the rows; the top match is Enter's default, so a half-typed
-  // name picks the person instead of minting a near-duplicate. "Ignore" stays
-  // click-only — too destructive for a stray Enter.
-  const nameRows = matches.length + (draft.trim() && !exact ? 1 : 0);
-  const nameNav = usePickerNav(nameRows, (i) => {
-    if (i < matches.length) pickTarget(matches[i]);
-    else nameNew(draft.trim());
-  });
-  const moveNav = usePickerNav(matches.length + 1, (i) => {
-    if (i < matches.length) onReassignExisting(matches[i]);
-    else onReassignNew(draft.trim() || undefined);
-  });
 
   return (
     <div className="face-menu" style={placement} onClick={(e) => e.stopPropagation()}>
-      {/* Unnamed: one unified "name or pick a person" combobox. */}
+      {/* Unnamed: one unified "name or pick a person" combobox. The top match is
+          Enter's default; "Ignore" stays click-only — too destructive for a
+          stray Enter. */}
       {unnamed && (
-        <div className="fm-move">
-          <input
-            className="pname-input fm-input"
-            autoFocus
-            value={draft}
-            placeholder="Name, or pick a person"
-            onChange={(e) => {
-              setDraft(e.target.value);
-              nameNav.resetHighlight();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") onClose();
-              else nameNav.onNavKey(e);
-            }}
-          />
-          <div className="fm-hint">
-            Applies to this face — look-alikes group up as Solar learns
-          </div>
-          <ul className="fm-matches">
-            {matches.map((m, i) => (
-              <li
-                key={m.cluster_id}
-                className={`fm-match${nameNav.highlight === i ? " hi" : ""}`}
-                onMouseEnter={() => nameNav.setHighlight(i)}
-                onClick={() => pickTarget(m)}
-              >
-                <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                <span className="ns-name">{m.name}</span>
-              </li>
-            ))}
-            {draft.trim() && !exact && (
-              <li
-                className={`fm-match fm-new${nameNav.highlight === matches.length ? " hi" : ""}`}
-                onMouseEnter={() => nameNav.setHighlight(matches.length)}
-                onClick={() => nameNew(draft.trim())}
-              >
-                + Name “{draft.trim()}”
-              </li>
-            )}
-            <li className="fm-match danger" onClick={onIgnore}>
-              Ignore this face
-            </li>
-          </ul>
-        </div>
+        <PersonPicker
+          variant="menu"
+          people={people}
+          excludeId={face.cluster_id}
+          query={draft}
+          onQueryChange={setDraft}
+          placeholder="Name, or pick a person"
+          hint="Applies to this face — look-alikes group up as Solar learns"
+          matchAll
+          onPick={onConfirmFaceInto}
+          trailing={[
+            ...(draft.trim() && !exact
+              ? [
+                  {
+                    key: "new",
+                    className: "fm-new",
+                    content: <>+ Name “{draft.trim()}”</>,
+                    onPick: () => onNameFaceOnly(draft.trim()),
+                  },
+                ]
+              : []),
+            {
+              key: "ignore",
+              className: "danger",
+              content: "Ignore this face",
+              onPick: onIgnore,
+              nav: false,
+            },
+          ]}
+          onEscape={onClose}
+        />
       )}
 
       {/* Named: rename the person, move just this face, or ignore. */}
@@ -814,42 +784,25 @@ function FaceMenu({
       )}
 
       {!unnamed && mode === "move" && (
-        <div className="fm-move">
-          <input
-            className="pname-input fm-input"
-            autoFocus
-            value={draft}
-            placeholder="Move to which person?"
-            onChange={(e) => {
-              setDraft(e.target.value);
-              moveNav.resetHighlight();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setMode("root");
-              else moveNav.onNavKey(e);
-            }}
-          />
-          <ul className="fm-matches">
-            {matches.map((m, i) => (
-              <li
-                key={m.cluster_id}
-                className={`fm-match${moveNav.highlight === i ? " hi" : ""}`}
-                onMouseEnter={() => moveNav.setHighlight(i)}
-                onClick={() => onReassignExisting(m)}
-              >
-                <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                <span className="ns-name">{m.name}</span>
-              </li>
-            ))}
-            <li
-              className={`fm-match fm-new${moveNav.highlight === matches.length ? " hi" : ""}`}
-              onMouseEnter={() => moveNav.setHighlight(matches.length)}
-              onClick={() => onReassignNew(draft.trim() || undefined)}
-            >
-              + New person{draft.trim() ? ` “${draft.trim()}”` : ""}
-            </li>
-          </ul>
-        </div>
+        <PersonPicker
+          variant="menu"
+          people={people}
+          excludeId={face.cluster_id}
+          query={draft}
+          onQueryChange={setDraft}
+          placeholder="Move to which person?"
+          matchAll
+          onPick={onReassignExisting}
+          trailing={[
+            {
+              key: "new",
+              className: "fm-new",
+              content: <>+ New person{draft.trim() ? ` “${draft.trim()}”` : ""}</>,
+              onPick: () => onReassignNew(draft.trim() || undefined),
+            },
+          ]}
+          onEscape={() => setMode("root")}
+        />
       )}
 
       <button className="fm-close" aria-label="Close" onClick={onClose}>

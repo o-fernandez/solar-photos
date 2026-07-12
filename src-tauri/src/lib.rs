@@ -11,10 +11,12 @@
 //!
 //! Two thumbnail pipelines run side by side:
 //!   * the **local** queue — many workers, draining local files eagerly;
-//!   * the **cloud** queue — a few workers, fed only on demand with the
-//!     cloud-only photos the user has scrolled to. We never bulk-download a
-//!     cloud library; we fetch-and-thumbnail what's on screen, then cache it
-//!     forever.
+//!   * the **cloud** queue — a few workers, fed from two sources: the cloud-only
+//!     photos the user has scrolled to (promoted to the priority lane so what's
+//!     on screen always downloads first), and a slow background backfill
+//!     (`spawn_cloud_backfill`) that works through the rest of the library so it
+//!     eventually becomes browsable without waiting on the network. Nothing is
+//!     fetched twice: every downloaded original is thumbnailed and cached forever.
 
 mod cluster;
 mod db;
@@ -37,7 +39,7 @@ use db::Job;
 use thumbs::ThumbQueue;
 use recognition::{
     auto_fold_confident, build_review_queue, compute_identity_growth, compute_merge_suggestions,
-    photo_constraints, IdentityGrowth, MergeSuggestion, PersonLook, ReviewItem, ReviewQueue,
+    photo_constraints, IdentityGrowth, PersonLook, ReviewItem, ReviewQueue,
 };
 
 /// How many concurrent cloud downloads we allow. Bounded so a slow network
@@ -62,8 +64,6 @@ struct AppState {
     cloud_queue: Arc<ThumbQueue>,
     /// Guards against two full rescans running at once (e.g. launch + manual).
     rescanning: Arc<AtomicBool>,
-    /// When true, the face worker pauses (e.g. user toggled it off).
-    faces_paused: Arc<AtomicBool>,
     /// Guards against two re-clusters running at once (migration + manual + sweep).
     reclustering: Arc<AtomicBool>,
     /// Set when a re-cluster is requested while one is already running, so the request
@@ -99,7 +99,6 @@ struct AppState {
 #[derive(Default)]
 struct SuggestionCache {
     generation: i64,
-    merges: Vec<MergeSuggestion>,
     growth: Vec<IdentityGrowth>,
     queue: Vec<ReviewItem>,
 }
@@ -524,16 +523,19 @@ fn get_face_progress(state: tauri::State<'_, AppState>) -> Result<FaceProgress, 
     Ok(FaceProgress { scanned, eligible })
 }
 
-#[tauri::command]
-fn set_faces_paused(state: tauri::State<'_, AppState>, paused: bool) {
-    state.faces_paused.store(paused, Ordering::Relaxed);
-}
-
 /// The detected people (clusters), biggest first, with a cover face each.
 #[tauri::command]
 fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>, String> {
     let conn = state.conn.lock().unwrap();
     db::clusters_overview(&conn).map_err(|e| e.to_string())
+}
+
+/// What naming returns: the canonical group key to keep following (naming a
+/// positive group promotes it to a durable negative key) plus the undo token.
+#[derive(serde::Serialize)]
+struct NameOutcome {
+    group: i64,
+    undo: CorrectionUndo,
 }
 
 /// Naming is the highest-stakes mutation — it confirms every face in the cluster
@@ -548,18 +550,26 @@ fn name_cluster(
     cluster_id: i64,
     name: String,
     expected_generation: Option<i64>,
-) -> Result<i64, String> {
-    ensure_generation(&state, expected_generation)?;
-    let group = {
-        let conn = state.conn.lock().unwrap();
-        db::name_group(&conn, cluster_id, &name).map_err(|e| e.to_string())?
+) -> Result<NameOutcome, String> {
+    let outcome = {
+        let conn = lock_checked(&state, expected_generation)?;
+        // Captured BEFORE the write: naming confirms the group's faces (and may
+        // bind them to a fresh identity), and the identity may already carry a
+        // name — both must round-trip through undo.
+        let prior = capture_group_states(&conn, &[cluster_id]).map_err(|e| e.to_string())?;
+        let prior_name = db::group_name(&conn, cluster_id).map_err(|e| e.to_string())?;
+        let group = db::name_group(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
+        // A negative result means an identity's name was written (or cleared);
+        // a positive one means nothing happened (clearing an unnamed group).
+        let renamed = (group < 0).then(|| (-group, prior_name));
+        NameOutcome { group, undo: CorrectionUndo { renamed, ..CorrectionUndo::faces_only(prior) } }
     };
     // Confirming a person adds exemplars, which can re-home other people's
     // wrongly-folded look-alikes — so re-derive the folds competitively (self-heal).
     if !name.trim().is_empty() {
         schedule_refold(app);
     }
-    Ok(group)
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -570,9 +580,8 @@ fn merge_clusters(
     from: i64,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         // If exactly one side carries a name, that side survives — folding a named
         // person INTO an unnamed pile would silently un-name them.
         let (into, from) = if db::group_name(&conn, from).map_err(|e| e.to_string())?.is_some()
@@ -665,6 +674,11 @@ struct CorrectionUndo {
     /// candidate); kept alongside the single-pair field the older paths use.
     added_cannot_links: Vec<(i64, i64)>,
     added_same_photo_ok: Vec<(i64, i64)>,
+    /// A name this action wrote: the identity and its name BEFORE the action
+    /// (`None` = it was unnamed). Restoring face states alone would leave the
+    /// label behind — and naming is what confirms faces as user-vouched, so an
+    /// undo that kept it would forge exemplars out of a taken-back action.
+    renamed: Option<(i64, Option<String>)>,
 }
 
 impl CorrectionUndo {
@@ -675,6 +689,7 @@ impl CorrectionUndo {
             added_cannot_link: None,
             added_cannot_links: Vec::new(),
             added_same_photo_ok: Vec::new(),
+            renamed: None,
         }
     }
 }
@@ -716,8 +731,7 @@ fn reassign_faces_to_cluster(
     target_cluster_id: i64,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
-    let mut conn = state.conn.lock().unwrap();
+    let mut conn = lock_checked(&state, expected_generation)?;
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     // Both sides become durable identities; record "not the same" between them.
     let source_id =
@@ -739,8 +753,7 @@ fn reassign_faces_to_new_person(
     name: Option<String>,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
-    let mut conn = state.conn.lock().unwrap();
+    let mut conn = lock_checked(&state, expected_generation)?;
     let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
     let source_id =
         db::ensure_identity_for_group(&conn, source_cluster_id).map_err(|e| e.to_string())?;
@@ -769,6 +782,9 @@ fn reassign_faces_to_new_person(
     Ok(CorrectionUndo {
         new_cluster_id: Some(-new_id),
         added_cannot_link: added,
+        // The fresh identity's name (when one was given) is this action's write —
+        // undo clears it so no named ghost lingers for merge-by-name lookups.
+        renamed: trimmed.map(|_| (new_id, None)),
         ..CorrectionUndo::faces_only(prior)
     })
 }
@@ -801,9 +817,8 @@ fn confirm_faces_into_cluster(
     target_cluster_id: i64,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     {
-        let mut conn = state.conn.lock().unwrap();
+        let mut conn = lock_checked(&state, expected_generation)?;
         let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
         let target_id =
             db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
@@ -866,6 +881,10 @@ fn undo_correction(
             db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
         }
         db::remove_same_photo_ok(&conn, &undo.added_same_photo_ok).map_err(|e| e.to_string())?;
+        if let Some((identity, name)) = &undo.renamed {
+            db::restore_identity_name(&conn, *identity, name.as_deref())
+                .map_err(|e| e.to_string())?;
+        }
     }
     schedule_refold(app);
     Ok(())
@@ -881,6 +900,8 @@ struct CorrectionUndoArg {
     added_cannot_links: Vec<(i64, i64)>,
     #[serde(default)]
     added_same_photo_ok: Vec<(i64, i64)>,
+    #[serde(default)]
+    renamed: Option<(i64, Option<String>)>,
 }
 
 /// Record a cannot-link between two identities unless it already exists or they're
@@ -897,24 +918,9 @@ fn record_cannot_link_if_new(
     Ok(Some((a, b)))
 }
 
-/// The cached "same person?" suggestions from the last clustering pass. Instant —
-/// the heavy pass ran in the background when clustering settled. Empty while a
-/// pass is running or the cache is from an older generation (no stale cards).
-#[tauri::command]
-fn get_merge_suggestions(state: tauri::State<'_, AppState>) -> Result<Vec<MergeSuggestion>, String> {
-    if state.reclustering.load(Ordering::SeqCst) {
-        return Ok(Vec::new());
-    }
-    let cache = state.suggestion_cache.lock().unwrap();
-    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
-        Ok(cache.merges.clone())
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-/// The cached growth cards from the last clustering pass — see
-/// [`get_merge_suggestions`] for the caching rationale.
+/// The cached growth cards from the last clustering pass. Instant — the heavy
+/// pass ran in the background when clustering settled. Empty while a pass is
+/// running or the cache is from an older generation (no stale cards).
 #[tauri::command]
 fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
     if state.reclustering.load(Ordering::SeqCst) {
@@ -953,11 +959,10 @@ fn absorb_clusters(
     clusters: Vec<i64>,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let mut touched = clusters.clone();
     touched.push(into);
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
         let into_identity =
             db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
@@ -1003,9 +1008,8 @@ fn reject_merge(
     from: i64,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
         let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
         let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
@@ -1031,9 +1035,8 @@ fn not_this_person(
     other_cluster_id: i64,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &[person_cluster_id, other_cluster_id])
             .map_err(|e| e.to_string())?;
         // Mint identities for both sides + cannot-link, then confirm the rejected group
@@ -1065,11 +1068,10 @@ fn not_these_people(
     person_cluster_ids: Vec<i64>,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let mut touched = person_cluster_ids.clone();
     touched.push(other_cluster_id);
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
         let other =
             db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
@@ -1202,27 +1204,31 @@ fn name_faces(
     name: String,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("a name is required".into());
     }
     let undo = {
-        let mut conn = state.conn.lock().unwrap();
+        let mut conn = lock_checked(&state, expected_generation)?;
         let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
         // An existing person with this exact name adopts the faces; otherwise a
-        // fresh identity is minted and named.
-        let identity = if let Some(group) =
+        // fresh identity is minted and named — and that name is this action's
+        // write, so undo clears it (no named ghost for merge-by-name lookups).
+        let (identity, renamed) = if let Some(group) =
             db::group_for_name(&conn, trimmed).map_err(|e| e.to_string())?
         {
-            db::ensure_identity_for_group(&conn, group).map_err(|e| e.to_string())?
+            (db::ensure_identity_for_group(&conn, group).map_err(|e| e.to_string())?, None)
         } else {
             let id = db::new_identity(&conn).map_err(|e| e.to_string())?;
             let _ = db::name_group(&conn, -id, trimmed).map_err(|e| e.to_string())?;
-            id
+            (id, Some((id, None)))
         };
         db::set_faces_person(&mut conn, &face_ids, identity).map_err(|e| e.to_string())?;
-        CorrectionUndo { new_cluster_id: Some(-identity), ..CorrectionUndo::faces_only(prior) }
+        CorrectionUndo {
+            new_cluster_id: Some(-identity),
+            renamed,
+            ..CorrectionUndo::faces_only(prior)
+        }
     };
     schedule_refold(app);
     Ok(undo)
@@ -1241,11 +1247,10 @@ fn not_this_person_many(
     other_cluster_ids: Vec<i64>,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let mut touched = other_cluster_ids.clone();
     touched.push(person_cluster_id);
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
         let person =
             db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
@@ -1280,9 +1285,8 @@ fn resolve_same_photo(
     same_person: bool,
     expected_generation: Option<i64>,
 ) -> Result<CorrectionUndo, String> {
-    ensure_generation(&state, expected_generation)?;
     let undo = {
-        let conn = state.conn.lock().unwrap();
+        let conn = lock_checked(&state, expected_generation)?;
         let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
         if same_person {
             // Resolve the blocked face pairs BEFORE any identity minting shifts
@@ -1325,23 +1329,6 @@ fn resolve_same_photo(
     prune_suggestion_cache(&state, &[into, from]);
     schedule_refold(app);
     Ok(undo)
-}
-
-/// Wipe all face data — detections, clusters, names, identities, decisions — and
-/// re-arm the sweep so the whole library is analyzed from scratch. For testing the
-/// recognition experience end-to-end on a clean slate.
-#[tauri::command]
-fn reset_face_recognition(app: tauri::AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    {
-        let conn = state.conn.lock().unwrap();
-        db::reset_faces_for_recompute(&conn).map_err(|e| e.to_string())?;
-    }
-    // Drop cached cover crops too; they point at now-deleted faces.
-    let _ = std::fs::remove_dir_all(&state.faces_dir);
-    let _ = std::fs::create_dir_all(&state.faces_dir);
-    let _ = app.emit("faces-progress", FaceProgress { scanned: 0, eligible: 0 });
-    Ok(())
 }
 
 /// Fast "start people over": clear every decision (identities, names, cannot-links)
@@ -1408,8 +1395,10 @@ fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
     }
     let mut special = who;
     special.extend(twins);
+    // The pairwise merges feed the queue but aren't served on their own, so they
+    // aren't cached — the queue items carry everything the review flow needs.
     let queue = build_review_queue(&merges, &growth, special);
-    *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, merges, growth, queue };
+    *state.suggestion_cache.lock().unwrap() = SuggestionCache { generation, growth, queue };
 }
 
 /// Guard for mutations holding positive (appearance) group keys: a full re-cluster
@@ -1446,7 +1435,6 @@ fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
     };
     let mut cache = state.suggestion_cache.lock().unwrap();
     cache.queue.retain(|i| !touches(i));
-    cache.merges.retain(|m| !(set.contains(&m.into) || set.contains(&m.from)));
     for g in cache.growth.iter_mut() {
         g.strong_groups.retain(|x| !set.contains(&x.cluster_id));
         g.strong_clusters.retain(|c| !set.contains(c));
@@ -1464,6 +1452,21 @@ fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), Stri
         }
         _ => Ok(()),
     }
+}
+
+/// Acquire the UI connection AND verify the generation *under that lock*. The
+/// re-cluster bumps the generation and commits its renumbering while holding
+/// this same lock (see `run_recluster`), so a mutation either ran entirely
+/// before the renumbering or sees the new generation and is refused — checking
+/// before locking left a window where a stale card slipped through and wrote
+/// against freshly-renumbered ids.
+fn lock_checked<'a>(
+    state: &'a AppState,
+    expected: Option<i64>,
+) -> Result<std::sync::MutexGuard<'a, Connection>, String> {
+    let conn = state.conn.lock().unwrap();
+    ensure_generation(state, expected)?;
+    Ok(conn)
 }
 
 /// How long a burst of corrections may extend before the self-heal pass runs.
@@ -1641,12 +1644,20 @@ fn run_recluster(app: AppHandle) {
                     let _ = app2.emit("cluster-progress", ClusterProgress { running: true, fraction: f });
                 }
             });
-            db::set_face_clusters(&mut conn, &assignments)?;
-            // The positive (appearance) keys were just renumbered — the only event
-            // that can invalidate a group id the UI holds — so this is the one
-            // place the generation bumps. Identity keys pass through untouched:
+            // Committing renumbered positive (appearance) keys is the only event
+            // that can invalidate a group id the UI holds, so this is the one
+            // place the generation bumps. It bumps BEFORE the commit, under the
+            // UI connection's lock: every mutation re-checks the generation under
+            // that same lock (`lock_checked`), so it either finished before the
+            // renumbering or is refused — never both check against the old world
+            // and write into the new one. Identity keys pass through untouched:
             // names, confirmations and tiles need no re-anchoring at all.
-            app.state::<AppState>().cluster_gen.fetch_add(1, Ordering::SeqCst);
+            {
+                let state = app.state::<AppState>();
+                let _ui = state.conn.lock().unwrap();
+                state.cluster_gen.fetch_add(1, Ordering::SeqCst);
+                db::set_face_clusters(&mut conn, &assignments)?;
+            }
             // Re-derive the tentative folds against the fresh appearance layer
             // (see `auto_fold_confident`).
             let _ = auto_fold_confident(&conn)?;
@@ -1670,13 +1681,6 @@ fn run_recluster(app: AppHandle) {
             run_auto_fold(app_for_rerun);
         }
     });
-}
-
-/// Rebuild all clusters from scratch (purity-biased), in the background. Safe to
-/// call anytime; overlapping calls are ignored.
-#[tauri::command]
-fn recluster(app: tauri::AppHandle) {
-    run_recluster(app);
 }
 
 /// The current clustering generation — fetched with a people list so later
@@ -1759,7 +1763,6 @@ fn spawn_face_workers(
     preview_dir: PathBuf,
     yunet: PathBuf,
     sface: PathBuf,
-    paused: Arc<AtomicBool>,
 ) {
     use std::sync::mpsc;
 
@@ -1835,10 +1838,6 @@ fn spawn_face_workers(
         // tidy them up — the incremental path keeps things usable in the meantime.
         let mut pending_consolidation: u64 = 0;
         loop {
-            if paused.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                continue;
-            }
             // Top up the pool's backlog.
             while outstanding < target_outstanding {
                 let batch = db::claim_faces_batch(&mut conn, claim_batch).unwrap_or_default();
@@ -2159,8 +2158,7 @@ pub fn run() {
             local_queue.enqueue(pending);
 
             // Background face sweep. Resolve the bundled models and start the
-            // worker pool + coordinator; paused-flag shared with commands.
-            let faces_paused = Arc::new(AtomicBool::new(false));
+            // worker pool + coordinator.
             let yunet = resolve_model(app.handle(), "yunet.onnx");
             let sface = resolve_model(app.handle(), "sface.onnx");
             spawn_face_workers(
@@ -2169,7 +2167,6 @@ pub fn run() {
                 preview_dir.clone(),
                 yunet,
                 sface,
-                faces_paused.clone(),
             );
 
             // One-time backfill: give photos missing a capture date one parsed
@@ -2210,7 +2207,6 @@ pub fn run() {
                 local_queue,
                 cloud_queue,
                 rescanning: Arc::new(AtomicBool::new(false)),
-                faces_paused,
                 reclustering: Arc::new(AtomicBool::new(false)),
                 recluster_pending: Arc::new(AtomicBool::new(false)),
                 fold_pending: Arc::new(AtomicBool::new(false)),
@@ -2258,11 +2254,9 @@ pub fn run() {
             remove_folder,
             set_visible_range,
             get_face_progress,
-            set_faces_paused,
             get_clusters,
             name_cluster,
             merge_clusters,
-            get_merge_suggestions,
             get_identity_growth,
             get_review_queue,
             get_cluster_generation,
@@ -2283,9 +2277,7 @@ pub fn run() {
             export_curation,
             import_curation,
             get_on_this_day,
-            reset_face_recognition,
             reset_face_decisions,
-            recluster,
             cluster_debug,
             get_person_photos,
             get_person_looks,

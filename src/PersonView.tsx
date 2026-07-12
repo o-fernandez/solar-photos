@@ -15,6 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
 import FacePeek from "./FacePeek";
+import PersonPicker from "./PersonPicker";
 import {
   absorbClusters,
   detachFaces,
@@ -48,7 +49,6 @@ import {
   type PersonLook,
   type PhotoRow,
 } from "./api";
-import { usePickerNav } from "./pickerNav";
 
 const GAP = 4; // px between cells (matches the timeline grid)
 const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill width
@@ -260,16 +260,9 @@ export default function PersonView({
     }, 80);
   }, [virtualRows, columns, total, shown]);
 
-  // Existing people whose name contains the draft (merge-into-existing suggestions),
-  // and the one that matches it exactly — the signal that naming should merge, not
-  // rename. Mirrors the People grid so renaming here behaves the same.
-  const nameMatches = (q: string): Cluster[] => {
-    const s = q.trim().toLowerCase();
-    if (!s) return [];
-    return people
-      .filter((c) => c.cluster_id !== groupId && c.name && c.name.toLowerCase().includes(s))
-      .slice(0, 5);
-  };
+  // The existing person whose name matches the draft exactly — the signal that
+  // naming should merge, not rename. Mirrors the People grid so renaming here
+  // behaves the same. (The contains-matches live inside PersonPicker.)
   const exactNameMatch = (q: string): Cluster | undefined => {
     const s = q.trim().toLowerCase();
     if (!s) return undefined;
@@ -295,8 +288,8 @@ export default function PersonView({
       return;
     }
     nameCluster(groupId, value, genRef.current)
-      .then((g) => {
-        setGroupId(g);
+      .then(({ group }) => {
+        setGroupId(group);
         setName(value || null);
       })
       .catch(() => flashNotice("People were just reorganized — try that again."));
@@ -580,34 +573,6 @@ export default function PersonView({
       .catch(() => flashNotice("People were just reorganized — try that again."));
   };
 
-  // Named people other than the one we're viewing, filtered by a typeahead — shared by
-  // the multi-select move picker and the per-look move picker.
-  const filterPeople = (q: string) =>
-    people
-      .filter((c) => c.cluster_id !== groupId && c.name)
-      .filter((c) => (q.trim() ? c.name!.toLowerCase().includes(q.trim().toLowerCase()) : true))
-      .slice(0, 6);
-  const pickMatches = useMemo(() => filterPeople(pickQuery), [people, pickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
-  const lookPickMatches = useMemo(() => filterPeople(lookPickQuery), [people, lookPickQuery, groupId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ↑/↓ + Enter in the pickers: Enter takes the highlighted row — the top match by
-  // default, so a half-typed name never silently mints a duplicate person. The
-  // "+ New person" row is the explicit last row.
-  const pickNav = usePickerNav(pickMatches.length + 1, (i) => {
-    if (i < pickMatches.length) moveToPerson(pickMatches[i]);
-    else moveToNewPerson(pickQuery.trim() || undefined);
-  });
-  const lookNav = usePickerNav(lookPickMatches.length + 1, (i) => {
-    if (i < lookPickMatches.length) moveLookToPerson(lookPickMatches[i]);
-    else moveLookToNewPerson(lookPickQuery.trim() || undefined);
-  });
-  // The rename combobox starts un-highlighted: Enter commits the typed name;
-  // arrows opt into the merge suggestions.
-  const renameMatches = editing ? nameMatches(draft) : [];
-  const renameNav = usePickerNav(renameMatches.length, (i) => mergeThisInto(renameMatches[i]), {
-    startUnselected: true,
-  });
-
   // Esc walks back the transient layers: picker → selection → look. Ignored while
   // the Lightbox is open (it owns Esc) or while typing in a field.
   useEffect(() => {
@@ -637,43 +602,24 @@ export default function PersonView({
       <img className="person-avatar" src={faceCropUrl(cluster.cover_face_id)} alt="" draggable={false} />
       <div className="person-meta">
         {editing ? (
-          <div className="pname-combo">
-            <input
-              className="pname-input"
-              autoFocus
-              value={draft}
-              placeholder="Name"
-              onChange={(e) => {
-                setDraft(e.target.value);
-                renameNav.resetHighlight();
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") setEditing(false);
-                else if (renameNav.onNavKey(e)) return;
-                else if (e.key === "Enter") commitName();
-              }}
-              onBlur={commitName}
-            />
-            {renameMatches.length > 0 && (
-              // preventDefault keeps the input from blurring (and rename-committing)
-              // before a suggestion click runs its merge.
-              <ul className="name-suggest" onMouseDown={(e) => e.preventDefault()}>
-                <li className="name-suggest-head">Add to an existing person</li>
-                {renameMatches.map((m, i) => (
-                  <li
-                    key={m.cluster_id}
-                    className={`name-suggest-item${renameNav.highlight === i ? " hi" : ""}`}
-                    onMouseEnter={() => renameNav.setHighlight(i)}
-                    onClick={() => mergeThisInto(m)}
-                  >
-                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                    <span className="ns-name">{m.name}</span>
-                    <span className="ns-count">{m.count.toLocaleString()}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          // Starts un-highlighted: Enter commits the typed name; ↑/↓ opt into
+          // the merge suggestions.
+          <PersonPicker
+            variant="combo"
+            people={people}
+            excludeId={groupId}
+            query={draft}
+            onQueryChange={setDraft}
+            placeholder="Name"
+            header="Add to an existing person"
+            showCounts
+            limit={5}
+            commitsText
+            commitOnBlur
+            onCommitText={commitName}
+            onPick={mergeThisInto}
+            onEscape={() => setEditing(false)}
+          />
         ) : name ? (
           <button
             className="person-name"
@@ -768,43 +714,28 @@ export default function PersonView({
             {activeLook.photos.toLocaleString()} in this look
           </span>
           {lookPicking ? (
-            <div className="sb-picker">
-              <input
-                className="pname-input"
-                autoFocus
-                value={lookPickQuery}
-                placeholder="Move to which person?"
-                onChange={(e) => {
-                  setLookPickQuery(e.target.value);
-                  lookNav.resetHighlight();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") setLookPicking(false);
-                  else lookNav.onNavKey(e);
-                }}
-              />
-              <ul className="sb-matches">
-                {lookPickMatches.map((m, i) => (
-                  <li
-                    key={m.cluster_id}
-                    className={`sb-match${lookNav.highlight === i ? " hi" : ""}`}
-                    onMouseEnter={() => lookNav.setHighlight(i)}
-                    onClick={() => moveLookToPerson(m)}
-                  >
-                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                    <span className="ns-name">{m.name}</span>
-                    <span className="ns-count">{m.count.toLocaleString()}</span>
-                  </li>
-                ))}
-                <li
-                  className={`sb-match sb-new${lookNav.highlight === lookPickMatches.length ? " hi" : ""}`}
-                  onMouseEnter={() => lookNav.setHighlight(lookPickMatches.length)}
-                  onClick={() => moveLookToNewPerson(lookPickQuery.trim() || undefined)}
-                >
-                  + New person{lookPickQuery.trim() ? ` “${lookPickQuery.trim()}”` : ""}
-                </li>
-              </ul>
-            </div>
+            <PersonPicker
+              variant="bar"
+              people={people}
+              excludeId={groupId}
+              query={lookPickQuery}
+              onQueryChange={setLookPickQuery}
+              placeholder="Move to which person?"
+              showCounts
+              matchAll
+              onPick={moveLookToPerson}
+              trailing={[
+                {
+                  key: "new",
+                  className: "sb-new",
+                  content: (
+                    <>+ New person{lookPickQuery.trim() ? ` “${lookPickQuery.trim()}”` : ""}</>
+                  ),
+                  onPick: () => moveLookToNewPerson(lookPickQuery.trim() || undefined),
+                },
+              ]}
+              onEscape={() => setLookPicking(false)}
+            />
           ) : activeLook.likely_other_name != null ? (
             // A flagged look: affirm it's this person, accept the suggestion, or pick.
             <>
@@ -989,43 +920,28 @@ export default function PersonView({
         <div className="select-bar">
           <span className="sb-count">{selected.size} selected</span>
           {picking ? (
-            <div className="sb-picker">
-              <input
-                className="pname-input"
-                autoFocus
-                value={pickQuery}
-                placeholder="Move to which person?"
-                onChange={(e) => {
-                  setPickQuery(e.target.value);
-                  pickNav.resetHighlight();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") setPicking(false);
-                  else pickNav.onNavKey(e);
-                }}
-              />
-              <ul className="sb-matches">
-                {pickMatches.map((m, i) => (
-                  <li
-                    key={m.cluster_id}
-                    className={`sb-match${pickNav.highlight === i ? " hi" : ""}`}
-                    onMouseEnter={() => pickNav.setHighlight(i)}
-                    onClick={() => moveToPerson(m)}
-                  >
-                    <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-                    <span className="ns-name">{m.name}</span>
-                    <span className="ns-count">{m.count.toLocaleString()}</span>
-                  </li>
-                ))}
-                <li
-                  className={`sb-match sb-new${pickNav.highlight === pickMatches.length ? " hi" : ""}`}
-                  onMouseEnter={() => pickNav.setHighlight(pickMatches.length)}
-                  onClick={() => moveToNewPerson(pickQuery.trim() || undefined)}
-                >
-                  + New person{pickQuery.trim() ? ` “${pickQuery.trim()}”` : ""}
-                </li>
-              </ul>
-            </div>
+            // Enter takes the highlighted row — the top match by default, so a
+            // half-typed name never silently mints a duplicate person.
+            <PersonPicker
+              variant="bar"
+              people={people}
+              excludeId={groupId}
+              query={pickQuery}
+              onQueryChange={setPickQuery}
+              placeholder="Move to which person?"
+              showCounts
+              matchAll
+              onPick={moveToPerson}
+              trailing={[
+                {
+                  key: "new",
+                  className: "sb-new",
+                  content: <>+ New person{pickQuery.trim() ? ` “${pickQuery.trim()}”` : ""}</>,
+                  onPick: () => moveToNewPerson(pickQuery.trim() || undefined),
+                },
+              ]}
+              onEscape={() => setPicking(false)}
+            />
           ) : (
             <>
               <button className="sb-btn" onClick={() => setPicking(true)}>

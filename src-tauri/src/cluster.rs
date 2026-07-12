@@ -465,69 +465,99 @@ pub struct GrowthCandidate {
     pub max_sim: f32,
 }
 
-/// Anchored confidence propagation — the engine behind "you confirmed Omar, here
-/// are 40 more groups that are also Omar." Given a confirmed identity's `anchor`
-/// face profile and every *other* clustered face, return the clusters whose faces
-/// confidently match the anchor.
-///
-/// This is safe to reach where unsupervised clustering dares not, for two reasons:
-/// the anchor is **human-confirmed** (not a drifting centroid), and matching is to
-/// the anchor only — never chained cluster→cluster — so it can't fuse strangers the
-/// way transitive merging would. With these embeddings, different people sit far
-/// below [`TAU_LINK`], so a cluster whose faces clear it against Omar's profile is
-/// Omar. We require a *majority* of the cluster to match, so a single stray face
-/// can't drag a mixed group in.
-pub fn identity_candidates(
-    anchor: &[Vec<f32>],
-    others: &[(i64, i64, Vec<f32>)],
-) -> Vec<GrowthCandidate> {
-    if anchor.is_empty() || others.is_empty() {
-        return Vec::new();
-    }
-    let dim = anchor[0].len();
-    let a = Array2::from_shape_vec(
-        (anchor.len(), dim),
-        anchor.iter().flat_map(|e| normalized(e)).collect(),
-    )
-    .expect("uniform anchor length");
-    let o = Array2::from_shape_vec(
-        (others.len(), dim),
-        others.iter().flat_map(|(_, _, e)| normalized(e)).collect(),
-    )
-    .expect("uniform other length");
-    // Each other face's score = the mean of its top-K anchor similarities, not the
-    // single max: max grows with anchor-set size, so a person with 60 confirmed
-    // faces outbid one with 6 for the same candidate — few-exemplar people (babies,
-    // exactly the contested ones) kept losing their own faces. Top-K mean is
-    // size-invariant once an identity has K exemplars.
-    const ANCHOR_TOP_K: usize = 3;
-    let sims = o.dot(&a.t()); // (others x anchor)
-    use std::collections::HashMap;
-    // cluster_id -> (size, matched, max_sim)
-    let mut tally: HashMap<i64, (usize, usize, f32)> = HashMap::new();
-    for (i, (_, cid, _)) in others.iter().enumerate() {
-        let mut row: Vec<f32> = sims.row(i).iter().cloned().collect();
-        row.sort_unstable_by(|x, y| y.partial_cmp(x).unwrap());
-        let k = ANCHOR_TOP_K.min(row.len());
-        let best = row[..k].iter().sum::<f32>() / k as f32;
-        let e = tally.entry(*cid).or_insert((0, 0, 0.0));
-        e.0 += 1;
-        if best >= TAU_LINK {
-            e.1 += 1;
-            e.2 = e.2.max(best);
+/// The in-pool face set packed ONCE into a normalized matrix, shared across
+/// every identity's candidate search in a pass. The predecessor free function
+/// took an `others` slice, so each caller cloned the whole embedding set (minus
+/// its own group) and re-packed this matrix per confirmed identity — O(people ×
+/// library) allocations per self-heal pass. Rows the caller wants excluded are
+/// masked at tally time instead (`skip_group`), which wastes only the skipped
+/// rows' dot products — a person's own faces are a sliver of the library.
+pub struct FaceMatrix {
+    /// One L2-normalized embedding per row.
+    mat: Array2<f32>,
+    /// Each row's display group, aligned with `mat`.
+    groups: Vec<i64>,
+}
+
+impl FaceMatrix {
+    /// Pack `(face_id, group, embedding)` rows. `None` when there are no faces.
+    pub fn new(faces: &[(i64, i64, Vec<f32>)]) -> Option<Self> {
+        if faces.is_empty() {
+            return None;
         }
+        let dim = faces[0].2.len();
+        let mut data = Vec::with_capacity(faces.len() * dim);
+        for (_, _, e) in faces {
+            data.extend(normalized(e));
+        }
+        let mat = Array2::from_shape_vec((faces.len(), dim), data).expect("uniform embedding length");
+        Some(FaceMatrix { mat, groups: faces.iter().map(|(_, g, _)| *g).collect() })
     }
-    tally
-        .into_iter()
-        // A confident candidate: most of the cluster matches the anchor, with at
-        // least a couple of corroborating faces (or the whole of a tiny cluster).
-        .filter(|&(_, (size, matched, _))| matched * 2 >= size && matched >= 2.min(size).max(1))
-        .map(|(cluster_id, (size, _matched, max_sim))| GrowthCandidate {
-            cluster_id,
-            size,
-            max_sim,
-        })
-        .collect()
+
+    /// Anchored confidence propagation — the engine behind "you confirmed Omar,
+    /// here are 40 more groups that are also Omar." Given a confirmed identity's
+    /// `anchor` face profile, return the clusters whose faces confidently match
+    /// it; `skip_group` masks the identity's own group out of the candidates.
+    ///
+    /// This is safe to reach where unsupervised clustering dares not, for two
+    /// reasons: the anchor is **human-confirmed** (not a drifting centroid), and
+    /// matching is to the anchor only — never chained cluster→cluster — so it
+    /// can't fuse strangers the way transitive merging would. With these
+    /// embeddings, different people sit far below [`TAU_LINK`], so a cluster
+    /// whose faces clear it against Omar's profile is Omar. We require a
+    /// *majority* of the cluster to match, so a single stray face can't drag a
+    /// mixed group in.
+    pub fn identity_candidates(
+        &self,
+        anchor: &[Vec<f32>],
+        skip_group: Option<i64>,
+    ) -> Vec<GrowthCandidate> {
+        if anchor.is_empty() {
+            return Vec::new();
+        }
+        let dim = self.mat.ncols();
+        let a = Array2::from_shape_vec(
+            (anchor.len(), dim),
+            anchor.iter().flat_map(|e| normalized(e)).collect(),
+        )
+        .expect("uniform anchor length");
+        // Each face's score = the mean of its top-K anchor similarities, not the
+        // single max: max grows with anchor-set size, so a person with 60 confirmed
+        // faces outbid one with 6 for the same candidate — few-exemplar people (babies,
+        // exactly the contested ones) kept losing their own faces. Top-K mean is
+        // size-invariant once an identity has K exemplars.
+        const ANCHOR_TOP_K: usize = 3;
+        let sims = self.mat.dot(&a.t()); // (faces x anchor)
+        use std::collections::HashMap;
+        // cluster_id -> (size, matched, max_sim)
+        let mut tally: HashMap<i64, (usize, usize, f32)> = HashMap::new();
+        for (i, &cid) in self.groups.iter().enumerate() {
+            if Some(cid) == skip_group {
+                continue;
+            }
+            let mut row: Vec<f32> = sims.row(i).iter().cloned().collect();
+            row.sort_unstable_by(|x, y| y.partial_cmp(x).unwrap());
+            let k = ANCHOR_TOP_K.min(row.len());
+            let best = row[..k].iter().sum::<f32>() / k as f32;
+            let e = tally.entry(cid).or_insert((0, 0, 0.0));
+            e.0 += 1;
+            if best >= TAU_LINK {
+                e.1 += 1;
+                e.2 = e.2.max(best);
+            }
+        }
+        tally
+            .into_iter()
+            // A confident candidate: most of the cluster matches the anchor, with at
+            // least a couple of corroborating faces (or the whole of a tiny cluster).
+            .filter(|&(_, (size, matched, _))| matched * 2 >= size && matched >= 2.min(size).max(1))
+            .map(|(cluster_id, (size, _matched, max_sim))| GrowthCandidate {
+                cluster_id,
+                size,
+                max_sim,
+            })
+            .collect()
+    }
 }
 
 /// In-memory state for incremental assignment of newly-detected faces. Holds every
@@ -881,8 +911,12 @@ mod tests {
         for (k, e) in blob(dim, 8, 4).into_iter().enumerate() {
             others.push((100 + k as i64, 3, e));
         }
-        let cands = identity_candidates(&anchor, &others);
+        let fm = FaceMatrix::new(&others).expect("non-empty face set");
+        let cands = fm.identity_candidates(&anchor, None);
         assert!(cands.iter().any(|c| c.cluster_id == 2), "same person must be offered");
         assert!(!cands.iter().any(|c| c.cluster_id == 3), "a stranger must never be offered");
+        // The mask keeps an identity's own group out of its candidate list.
+        let masked = fm.identity_candidates(&anchor, Some(2));
+        assert!(!masked.iter().any(|c| c.cluster_id == 2), "skip_group must mask the own group");
     }
 }

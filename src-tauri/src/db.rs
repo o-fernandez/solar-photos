@@ -13,10 +13,10 @@ use std::path::Path;
 pub const STATUS_PENDING: i64 = 0; // local file, queued for thumbnailing
 pub const STATUS_READY: i64 = 1; // thumbnail cached on disk
 pub const STATUS_FAILED: i64 = 2; // local file we couldn't decode
-/// Cloud-only original (not downloaded locally). We do NOT thumbnail these up
-/// front — that would mean bulk-downloading the whole library. They wait as
-/// placeholders until the user scrolls to them (see on-demand handling in
-/// `lib.rs`), at which point they move to DOWNLOADING.
+/// Cloud-only original (not downloaded locally). Shown as a placeholder until it
+/// is fetched — either on demand when the user scrolls to it (it then moves to
+/// DOWNLOADING) or, quietly and lower-priority, by the background backfill that
+/// works through the library (see `spawn_cloud_backfill` in `lib.rs`).
 pub const STATUS_CLOUD: i64 = 3;
 /// A cloud-only original the user has scrolled to; we're fetching + thumbnailing
 /// it now. On success it becomes READY; on failure it falls back to CLOUD so a
@@ -50,7 +50,6 @@ pub fn init(conn: &Connection) -> Result<()> {
             taken_ts     INTEGER,
             seen         INTEGER NOT NULL DEFAULT 0
          );
-         CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
          CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(thumb_status);
          CREATE TABLE IF NOT EXISTS roots (
             id   INTEGER PRIMARY KEY,
@@ -97,16 +96,17 @@ pub fn init(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
          CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
-         CREATE TABLE IF NOT EXISTS cluster_names (
-            -- legacy (pre identity-centric grouping); names now live on
-            -- identities. Kept so a downgrade doesn't lose the schema; unused.
-            cluster_id INTEGER PRIMARY KEY,
-            name       TEXT NOT NULL
-         );
          CREATE TABLE IF NOT EXISTS app_meta (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
          );",
+    )?;
+    // Clean-up migrations: the legacy cluster_names table (names moved to
+    // identities under identity-centric grouping — nothing read it since) and a
+    // path index made redundant by the column's UNIQUE constraint.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS cluster_names;
+         DROP INDEX IF EXISTS idx_photos_path;",
     )?;
     // Durable person records. Unlike cluster ids — which are reassigned from
     // scratch on every re-cluster — an identity id is permanent, so it carries
@@ -449,7 +449,6 @@ pub fn cluster_face_ids(conn: &Connection, group: i64) -> Result<Vec<i64>> {
 pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM faces;
-         DELETE FROM cluster_names;
          DELETE FROM identities;
          DELETE FROM cannot_link;
          DELETE FROM same_photo_ok;
@@ -466,7 +465,6 @@ pub fn reset_faces_for_recompute(conn: &Connection) -> Result<()> {
 pub fn clear_face_decisions(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM identities;
-         DELETE FROM cluster_names;
          DELETE FROM cannot_link;
          UPDATE faces SET identity_id = NULL, ignored = 0, confirmed = 0, cluster_id = id;",
     )?;
@@ -573,6 +571,16 @@ pub fn group_name(conn: &Connection, group: i64) -> Result<Option<String>> {
         .query_row("SELECT name FROM identities WHERE id = ?1", [-group], |r| r.get(0))
         .unwrap_or(None);
     Ok(name)
+}
+
+/// Put an identity's name back to a captured prior value (`None` = it was
+/// unnamed) — the name half of undoing a naming action.
+pub fn restore_identity_name(conn: &Connection, identity: i64, name: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE identities SET name = ?1 WHERE id = ?2",
+        rusqlite::params![name, identity],
+    )?;
+    Ok(())
 }
 
 /// Mint a brand-new (unnamed) durable identity — the person record behind a
@@ -1563,8 +1571,8 @@ mod tests {
         insert_photo(&conn, 1, "/a.jpg");
         insert_photo(&conn, 2, "/b.jpg");
         insert_photo(&conn, 3, "/c.jpg");
-        set_favorite(&conn, 1, true);
-        set_hidden(&conn, 2, true);
+        set_favorite(&conn, 1, true).unwrap();
+        set_hidden(&conn, 2, true).unwrap();
 
         // Filters slice the one library three ways.
         let ids = |f: PhotoFilter| {
@@ -1585,7 +1593,7 @@ mod tests {
         let mut fresh = test_conn();
         insert_photo(&fresh, 9, "/a.jpg"); // same path, different id
         insert_photo(&fresh, 8, "/b.jpg");
-        set_favorite(&fresh, 8, true); // /b.jpg already starred locally
+        set_favorite(&fresh, 8, true).unwrap(); // /b.jpg already starred locally
         let applied = apply_curation(&mut fresh, &exported).unwrap();
         assert_eq!(applied, 2, "both paths matched");
         assert_eq!(ids_of(&fresh, PhotoFilter::Favorites), vec![9]); // /a.jpg starred by import
@@ -1764,6 +1772,30 @@ mod tests {
         assert_eq!(identity_of_face(&conn, 2), Some(1));
         assert!(!confirmed_of(&conn, 1), "tentative face must return to unconfirmed");
         assert!(confirmed_of(&conn, 2), "user-vouched face must stay confirmed");
+    }
+
+    /// Undoing a naming must revert BOTH halves of what it wrote: the identity's
+    /// name (via restore_identity_name) and the faces' confirmed/bound state (via
+    /// restore_face_states). Leaving either behind forges user-vouched exemplars
+    /// — or a named ghost — out of an action the user took back.
+    #[test]
+    fn naming_undo_roundtrip() {
+        let mut conn = test_conn();
+        insert_face(&conn, 1, 10, None, false); // fresh appearance cluster
+        let prior = capture_face_states(&conn, &[1]).unwrap();
+        let prior_name = group_name(&conn, 10).unwrap();
+        assert_eq!(prior_name, None, "a positive group is by definition unnamed");
+
+        let group = name_group(&conn, 10, "Omar").unwrap();
+        assert!(group < 0, "naming promotes to a durable identity key");
+        assert!(confirmed_of(&conn, 1), "naming vouches for the group's faces");
+        assert_eq!(group_for_name(&conn, "Omar").unwrap(), Some(group));
+
+        restore_face_states(&mut conn, &prior).unwrap();
+        restore_identity_name(&conn, -group, prior_name.as_deref()).unwrap();
+        assert_eq!(identity_of_face(&conn, 1), None, "face back to its cluster");
+        assert!(!confirmed_of(&conn, 1), "no forged vouching survives the undo");
+        assert_eq!(group_for_name(&conn, "Omar").unwrap(), None, "no named ghost");
     }
 
     /// Detach returns a face to its appearance cluster; ignore hides it from every

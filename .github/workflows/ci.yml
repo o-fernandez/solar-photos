@@ -1,0 +1,43 @@
+# CI: frontend typecheck + build, then the Rust test suite.
+#
+# Runs on macOS because the backend builds ONNX Runtime with the CoreML
+# execution provider (see src-tauri/Cargo.toml) — there is no Linux build of
+# this crate configuration to test against.
+#
+# tauri-build validates that every `bundle.resources` entry exists, even for a
+# plain `cargo test`, so the workflow fetches the real face models (small, and
+# their presence is what production builds ship) and stubs the 45 MB offline
+# basemap with an empty file — nothing in the test suite reads its bytes, and
+# the app itself treats a missing/empty basemap as "map not bundled".
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Frontend: npm run build is `tsc && vite build`, so this is the
+      # typecheck and the bundle in one step (and produces dist/, which the
+      # Tauri config points at).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      # Backend: bundled resources first (see header), then the test suite.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: ./scripts/fetch-models.sh
+      - run: mkdir -p src-tauri/basemap && touch src-tauri/basemap/world.pmtiles
+      - run: cargo test --manifest-path src-tauri/Cargo.toml

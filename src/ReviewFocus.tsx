@@ -23,7 +23,7 @@
 // M (it's a mix…), → (skip), Esc (close). Each answer advances; the tally makes
 // progress felt.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   absorbClusters,
   confirmFacesIntoCluster,
@@ -46,7 +46,7 @@ import {
   type ReviewItem,
   type ReviewQueue,
 } from "./api";
-import { usePickerNav } from "./pickerNav";
+import PersonPicker from "./PersonPicker";
 import FacePeek from "./FacePeek";
 
 /** Reverses one answer on the backend. */
@@ -257,17 +257,6 @@ export default function ReviewFocus({
       .catch(() => flashNote("Couldn't undo that."));
   }, [lastAnswer, flashNote]);
 
-  // The named people the "someone else…" picker offers (excluding the proposed one).
-  const pickMatches = useMemo(() => {
-    const q = pickQuery.trim().toLowerCase();
-    const excluded =
-      item && (item.kind === "maybe" || item.kind === "strong_batch") ? item.into : null;
-    return people
-      .filter((c) => c.name && c.cluster_id !== excluded)
-      .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
-      .slice(0, 6);
-  }, [people, pickQuery, item]);
-
   // The cluster under review that "someone else…" reassigns (single-group kinds).
   const pickTargetCluster =
     item?.kind === "maybe" ? item.group.cluster_id : item?.kind === "who_is_this" ? item.cluster_id : null;
@@ -288,11 +277,11 @@ export default function ReviewFocus({
     if (pickTargetCluster == null || !name.trim()) return;
     const nm = name.trim();
     // Naming the cluster mints the person directly (and schedules the re-cluster);
-    // undo renames the (now canonical) group back to unnamed.
+    // the backend token reverts both the name and the confirmed flags it wrote.
     act(
       async () => {
-        const g = await nameCluster(pickTargetCluster, nm, generation);
-        return () => nameCluster(g, "");
+        const { undo } = await nameCluster(pickTargetCluster, nm, generation);
+        return () => undoCorrection(undo);
       },
       pickPhotos,
       `Named ${nm}`,
@@ -321,21 +310,6 @@ export default function ReviewFocus({
       `Someone else — not ${names.join(" or ")}`,
     );
   };
-
-  // ↑/↓ + Enter in the "someone else…" picker: Enter takes the highlighted row —
-  // the TOP MATCH by default, so typing "Cami" ⏎ picks Camila instead of minting
-  // a new person named "Cami". The "+ New person" row is the last row.
-  const pickOffset = showNeither ? 1 : 0;
-  const pickRowCount = pickOffset + pickMatches.length + (pickQuery.trim() ? 1 : 0);
-  const pickNav = usePickerNav(pickRowCount, (i) => {
-    if (showNeither && i === 0) {
-      pickNeither();
-      return;
-    }
-    const k = i - pickOffset;
-    if (k < pickMatches.length) pickPerson(pickMatches[k]);
-    else pickNewPerson(pickQuery.trim());
-  });
 
   // "It's a mix…": the group genuinely holds more than one person. Load its full
   // face set so the user can tag each face — a candidate person, or "someone else"
@@ -996,58 +970,53 @@ export default function ReviewFocus({
   };
 
   function renderPicker() {
+    // Enter takes the highlighted row — the TOP MATCH by default, so typing
+    // "Cami" ⏎ picks Camila instead of minting a new person named "Cami".
     return (
-      <div className="sb-picker rf-picker">
-        <input
-          className="pname-input"
-          autoFocus
-          value={pickQuery}
-          placeholder="Who is it?"
-          onChange={(e) => {
-            setPickQuery(e.target.value);
-            pickNav.resetHighlight();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") setPicking(false);
-            else pickNav.onNavKey(e);
-          }}
-        />
-        <ul className="sb-matches">
-          {showNeither && (
-            <li
-              className={`sb-match sb-neither${pickNav.highlight === 0 ? " hi" : ""}`}
-              onMouseEnter={() => pickNav.setHighlight(0)}
-              onClick={pickNeither}
-            >
-              <span className="ns-name">Just someone else</span>
-              <span className="sb-neither-sub">
-                not them — leave unnamed, name them later in People if you like
-              </span>
-            </li>
-          )}
-          {pickMatches.map((m, i) => (
-            <li
-              key={m.cluster_id}
-              className={`sb-match${pickNav.highlight === i + pickOffset ? " hi" : ""}`}
-              onMouseEnter={() => pickNav.setHighlight(i + pickOffset)}
-              onClick={() => pickPerson(m)}
-            >
-              <img className="ns-face" src={faceCropUrl(m.cover_face_id)} alt="" draggable={false} />
-              <span className="ns-name">{m.name}</span>
-              <span className="ns-count">{m.count.toLocaleString()}</span>
-            </li>
-          ))}
-          {pickQuery.trim() && (
-            <li
-              className={`sb-match sb-new${pickNav.highlight === pickMatches.length + pickOffset ? " hi" : ""}`}
-              onMouseEnter={() => pickNav.setHighlight(pickMatches.length + pickOffset)}
-              onClick={() => pickNewPerson(pickQuery.trim())}
-            >
-              + New person “{pickQuery.trim()}”
-            </li>
-          )}
-        </ul>
-      </div>
+      <PersonPicker
+        variant="bar"
+        className="rf-picker"
+        people={people}
+        excludeId={item && (item.kind === "maybe" || item.kind === "strong_batch") ? item.into : null}
+        query={pickQuery}
+        onQueryChange={setPickQuery}
+        placeholder="Who is it?"
+        showCounts
+        matchAll
+        onPick={pickPerson}
+        leading={
+          showNeither
+            ? [
+                {
+                  key: "neither",
+                  className: "sb-neither",
+                  content: (
+                    <>
+                      <span className="ns-name">Just someone else</span>
+                      <span className="sb-neither-sub">
+                        not them — leave unnamed, name them later in People if you like
+                      </span>
+                    </>
+                  ),
+                  onPick: pickNeither,
+                },
+              ]
+            : []
+        }
+        trailing={
+          pickQuery.trim()
+            ? [
+                {
+                  key: "new",
+                  className: "sb-new",
+                  content: <>+ New person “{pickQuery.trim()}”</>,
+                  onPick: () => pickNewPerson(pickQuery.trim()),
+                },
+              ]
+            : []
+        }
+        onEscape={() => setPicking(false)}
+      />
     );
   }
 

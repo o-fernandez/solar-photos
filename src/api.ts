@@ -7,8 +7,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
-/** Thumbnail status, mirrored from the Rust side. */
-export const STATUS_PENDING = 0;
+/** Thumbnail status, mirrored from the Rust side (0 = pending is the implicit
+ *  default; the UI only ever branches on the states below). */
 export const STATUS_READY = 1;
 export const STATUS_FAILED = 2;
 /** Cloud-only original, not downloaded — shown as a placeholder until visited. */
@@ -195,11 +195,6 @@ export function onFaceProgress(cb: (p: FaceProgress) => void): Promise<UnlistenF
   return listen<FaceProgress>("faces-progress", (e) => cb(e.payload));
 }
 
-/** Pause or resume the background face sweep. */
-export function setFacesPaused(paused: boolean): Promise<void> {
-  return invoke("set_faces_paused", { paused });
-}
-
 /** One person-group tile. `cluster_id` is the display-group key: negative for a
  *  durable identity (a person — stable across every pass), positive for an
  *  unassigned appearance cluster (renumbered only by a full re-cluster). Opaque
@@ -216,17 +211,24 @@ export function getClusters(): Promise<Cluster[]> {
   return invoke("get_clusters");
 }
 
-/** Name (or rename, or clear with "") a person-group. Naming a fresh (positive)
- *  group promotes it to a durable identity under a NEW negative key — the promise
- *  resolves to the canonical key, which callers keeping the page open must adopt.
- *  `expectedGeneration` guards a positive id against a background re-cluster
- *  renumbering it between load and commit — naming confirms every face in the
- *  group, so acting on a stale id would mislabel a stranger durably. */
+/** What naming returns: the canonical group key to keep following (naming a
+ *  fresh positive group promotes it to a durable NEGATIVE key), plus an undo
+ *  token that reverts both the name and the confirmed-face flags it wrote. */
+export interface NameOutcome {
+  group: number;
+  undo: CorrectionUndo;
+}
+
+/** Name (or rename, or clear with "") a person-group. Callers keeping the page
+ *  open must adopt the returned canonical key. `expectedGeneration` guards a
+ *  positive id against a background re-cluster renumbering it between load and
+ *  commit — naming confirms every face in the group, so acting on a stale id
+ *  would mislabel a stranger durably. */
 export function nameCluster(
   clusterId: number,
   name: string,
   expectedGeneration?: number,
-): Promise<number> {
+): Promise<NameOutcome> {
   return invoke("name_cluster", {
     clusterId,
     name,
@@ -245,25 +247,6 @@ export function mergeClusters(
   expectedGeneration?: number,
 ): Promise<CorrectionUndo> {
   return invoke("merge_clusters", { into, from, expectedGeneration: expectedGeneration ?? null });
-}
-
-export interface MergeSuggestion {
-  into: number;
-  from: number;
-  /** Example face ids per side (highest confidence) — the merge card's strips. */
-  into_faces: number[];
-  from_faces: number[];
-  into_name: string | null;
-  similarity: number;
-  /** Faces on the smaller side — the payoff of resolving this suggestion. */
-  photos: number;
-  /** Clustering generation this card was computed at — pass back to mutations. */
-  generation: number;
-}
-
-/** "Same person?" suggestions — likely over-splits to fold together. */
-export function getMergeSuggestions(): Promise<MergeSuggestion[]> {
-  return invoke("get_merge_suggestions");
 }
 
 /** One less-certain growth candidate — reviewed on its own as a yes/no chip. */
@@ -482,16 +465,6 @@ export function resetFaceDecisions(): Promise<string> {
   return invoke("reset_face_decisions");
 }
 
-/** Wipe all face data and re-scan from scratch (for testing the experience clean). */
-export function resetFaceRecognition(): Promise<void> {
-  return invoke("reset_face_recognition");
-}
-
-/** Rebuild all clusters from scratch (purity-biased) in the background. */
-export function recluster(): Promise<void> {
-  return invoke("recluster");
-}
-
 export interface ClusterProgress {
   running: boolean;
   fraction: number;
@@ -612,6 +585,8 @@ export interface CorrectionUndo {
   added_cannot_links?: [number, number][];
   /** Same-photo exceptions added by a "same person — collage" answer. */
   added_same_photo_ok: [number, number][];
+  /** A name the action wrote: the identity and its name before (null = unnamed). */
+  renamed?: [number, string | null] | null;
 }
 
 /** Faces detected in one photo (for the in-photo overlay), highest score first. */
@@ -716,6 +691,7 @@ export function undoCorrection(undo: CorrectionUndo): Promise<void> {
       added_cannot_link: undo.added_cannot_link,
       added_cannot_links: undo.added_cannot_links ?? [],
       added_same_photo_ok: undo.added_same_photo_ok ?? [],
+      renamed: undo.renamed ?? null,
     },
   });
 }

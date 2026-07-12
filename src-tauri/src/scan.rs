@@ -11,8 +11,10 @@
 //!
 //! Cloud awareness: reading a file's metadata does NOT download it. We detect
 //! cloud-only originals (macOS marks un-downloaded File Provider files as
-//! "dataless") and register them as placeholders without thumbnailing — we do
-//! not bulk-download a cloud library. Those wait until the user scrolls to them.
+//! "dataless") and register them as placeholders without thumbnailing, so the
+//! scan itself never forces a download. Their pixels arrive later, through the
+//! cloud queue: on demand when the user scrolls to them, or gradually via the
+//! background backfill (see `spawn_cloud_backfill` in `lib.rs`).
 
 use anyhow::Result;
 use jwalk::WalkDir;
