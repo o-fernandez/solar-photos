@@ -34,6 +34,7 @@ import {
   reassignFacesToCluster,
   reassignFacesToNewPerson,
   rejectMerge,
+  setReviewActive,
   setVisibleRange,
   thumbUrl,
   undoCorrection,
@@ -185,6 +186,20 @@ export default function PersonView({
     reloadPhotos();
     loadLooks();
   }, [reloadPhotos, loadLooks]);
+
+  // Reviewing a person is where you accept their look-alike suggestions in context,
+  // so hold the debounced self-heal pass for as long as this page is open (same lever
+  // the focus-review session uses). Corrections still apply — and their badges still
+  // update — instantly; only the "Reorganizing people…" re-derive waits. Without this
+  // the pass could fire mid-review, or the moment you returned to the grid, wiping the
+  // suggestion badges you were working through. Closing the page (unmount) releases it,
+  // and the grid's own debounce then bridges the gap to whichever person you open next.
+  useEffect(() => {
+    setReviewActive(true).catch(() => {});
+    return () => {
+      setReviewActive(false).catch(() => {});
+    };
+  }, []);
 
   // Fill cells whose thumbnails finish while the page is open.
   useEffect(() => {

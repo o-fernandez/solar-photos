@@ -1467,7 +1467,17 @@ fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), Stri
 }
 
 /// How long a burst of corrections may extend before the self-heal pass runs.
-const REFOLD_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
+/// Sized for the *rhythm of reviewing*, not a single click: after accepting a few
+/// suggestions on one person and returning to the grid, the user needs time to read
+/// the badges and open the next person before the pass fires and "Reorganizing
+/// people…" wipes the grid out from under them. A short window fired between people
+/// (the "I can only check one person at a time" complaint); this lets a whole batch
+/// of 5–10 people flow, coalescing into one reorganize once they actually pause.
+/// The badges themselves stay correct throughout regardless — each correction prunes
+/// the suggestion cache synchronously; only the deeper re-derive waits for this.
+/// (While a person's page or the focus-review session is open, the pass is deferred
+/// outright via `review_active`, so this window only governs idle time on the grid.)
+const REFOLD_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Debounced [`run_auto_fold`]: a correction's DB writes apply immediately, but the
 /// self-heal re-derive waits for a quiet moment, so a review session (answer,
