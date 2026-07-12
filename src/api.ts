@@ -76,6 +76,16 @@ export function setPhotoHidden(id: number, hidden: boolean): Promise<void> {
   return invoke("set_photo_hidden", { id, hidden });
 }
 
+/** Toggle the favorite star on a whole selection at once. */
+export function setPhotosFavorite(ids: number[], favorite: boolean): Promise<void> {
+  return invoke("set_photos_favorite", { ids, favorite });
+}
+
+/** Soft-archive (or restore) a whole selection — flags only, files untouched. */
+export function setPhotosHidden(ids: number[], hidden: boolean): Promise<void> {
+  return invoke("set_photos_hidden", { ids, hidden });
+}
+
 /** Write favorites + hidden to a JSON file the user picks (curation backup that
  *  outlives the cache dir). Returns how many flagged photos were written. */
 export async function exportCuration(): Promise<number | null> {

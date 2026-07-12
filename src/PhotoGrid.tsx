@@ -25,7 +25,8 @@ import {
   onThumbDownloading,
   onThumbReady,
   setPhotoFavorite,
-  setPhotoHidden,
+  setPhotosFavorite,
+  setPhotosHidden,
   setVisibleRange,
   thumbUrl,
   STATUS_READY,
@@ -79,6 +80,50 @@ function PhotoGrid({
 
   // The viewer: which library index is open (null = closed).
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+
+  // Multi-select for bulk curation: the selected photo ids, plus the last
+  // toggled index so shift-click extends a range. Ids are stable across
+  // refetches; unloaded gaps inside a shift-range are skipped (ranges are
+  // almost always within the visible, loaded span).
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const anchorIndexRef = useRef<number | null>(null);
+  const handleCellSelect = useCallback((index: number, shiftRange: boolean) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (shiftRange && anchorIndexRef.current != null) {
+        const lo = Math.min(anchorIndexRef.current, index);
+        const hi = Math.max(anchorIndexRef.current, index);
+        for (let i = lo; i <= hi; i++) {
+          const r = photosRef.current[i];
+          if (r) next.add(r.id);
+        }
+      } else {
+        const r = photosRef.current[index];
+        if (r) {
+          if (next.has(r.id)) next.delete(r.id);
+          else next.add(r.id);
+        }
+      }
+      return next;
+    });
+    anchorIndexRef.current = index;
+  }, []);
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    anchorIndexRef.current = null;
+  }, []);
+
+  // Esc clears the selection — unless the viewer owns Esc or a field is focused.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || viewerIndex !== null || selected.size === 0) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      clearSelection();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewerIndex, selected, clearSelection]);
 
   // Resolve the photo id at an index for the viewer, loading its chunk if the
   // grid hasn't fetched that far yet.
@@ -134,33 +179,55 @@ function PhotoGrid({
     [filter, invalidate, softRefetch, onCurationChanged],
   );
 
-  // Hide (timeline/favorites) or restore (hidden view): the photo leaves this
-  // view, so refetch in place. Files are never touched — just the flag. A grid
-  // hide is instant and easy to fat-finger, so it always offers an Undo.
+  // Hide (timeline/favorites) or restore (hidden view), for one photo or a
+  // whole selection: the photos leave this view, so refetch in place. Files are
+  // never touched — just the flag. A grid hide is instant and easy to
+  // fat-finger, so it always offers one Undo covering the whole batch.
   const undoTimer = useRef<number | undefined>(undefined);
-  const setHidden = useCallback(
-    (photo: PhotoRow, hidden: boolean) => {
-      setPhotoHidden(photo.id, hidden).catch(() => {});
+  const applyHide = useCallback(
+    (ids: number[], hidden: boolean) => {
+      if (ids.length === 0) return;
+      setPhotosHidden(ids, hidden)
+        .then(() => onCurationChanged?.())
+        .catch(() => {});
       softRefetch();
-      onCurationChanged?.();
       if (undoTimer.current) window.clearTimeout(undoTimer.current);
-      setHideUndo({ id: photo.id, hidden });
+      setHideUndo({ ids, hidden });
       undoTimer.current = window.setTimeout(() => setHideUndo(null), 6000);
     },
     [softRefetch, onCurationChanged],
   );
-  // The last hide/restore, revertable for a few seconds.
-  const [hideUndo, setHideUndo] = useState<{ id: number; hidden: boolean } | null>(null);
+  // The last hide/restore (single or bulk), revertable for a few seconds.
+  const [hideUndo, setHideUndo] = useState<{ ids: number[]; hidden: boolean } | null>(null);
   const undoHide = useCallback(() => {
     setHideUndo((u) => {
       if (u) {
-        setPhotoHidden(u.id, !u.hidden).catch(() => {});
+        setPhotosHidden(u.ids, !u.hidden)
+          .then(() => onCurationChanged?.())
+          .catch(() => {});
         softRefetch();
-        onCurationChanged?.();
       }
       return null;
     });
   }, [softRefetch, onCurationChanged]);
+
+  // Bulk curation over the selection. Favorites fill instantly through the same
+  // favRef overrides a single star uses; hide goes through applyHide so the
+  // whole batch shares one Undo.
+  const bulkFavorite = (on: boolean) => {
+    const ids = [...selected];
+    ids.forEach((id) => favRef.current.set(id, on));
+    invalidate();
+    setPhotosFavorite(ids, on)
+      .then(() => onCurationChanged?.())
+      .catch(() => {});
+    if (filter === "favorites" && !on) softRefetch();
+    clearSelection();
+  };
+  const bulkHide = () => {
+    applyHide([...selected], filter !== "hidden");
+    clearSelection();
+  };
 
   // As the library grows during a live scan, the chunk that held the previous
   // last photo may have been loaded only partially — evict it so it refetches.
@@ -389,13 +456,18 @@ function PhotoGrid({
             if (index >= total) break;
             const photo = photosRef.current[index];
             const fav = photo ? isFav(photo) : false;
+            const isSelected = photo != null && selected.has(photo.id);
             cells.push(
               <div
                 key={index}
-                className={`cell${fav ? " is-fav" : ""}`}
+                className={`cell${fav ? " is-fav" : ""}${isSelected ? " selected" : ""}`}
                 role="button"
                 tabIndex={-1}
-                onClick={() => setViewerIndex(index)}
+                // Once a selection is underway, taps add/remove from it (shift
+                // extends the range); otherwise a tap opens the photo.
+                onClick={(e) =>
+                  selected.size > 0 ? handleCellSelect(index, e.shiftKey) : setViewerIndex(index)
+                }
                 style={{
                   width: cellSize,
                   height: cellSize,
@@ -404,6 +476,20 @@ function PhotoGrid({
                 }}
               >
                 {renderCellContent(photo)}
+                {photo && (
+                  <button
+                    className={`person-select${isSelected ? " on" : ""}`}
+                    title={isSelected ? "Selected" : "Select"}
+                    aria-label={isSelected ? "Deselect photo" : "Select photo"}
+                    aria-pressed={isSelected}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCellSelect(index, e.shiftKey);
+                    }}
+                  >
+                    {isSelected ? "✓" : ""}
+                  </button>
+                )}
                 {photo && (
                   <div className="cell-actions">
                     <button
@@ -424,7 +510,7 @@ function PhotoGrid({
                       aria-label={filter === "hidden" ? "Restore to timeline" : "Hide from timeline"}
                       onClick={(e) => {
                         e.stopPropagation();
-                        setHidden(photo, filter !== "hidden");
+                        applyHide([photo.id], filter !== "hidden");
                       }}
                     >
                       {filter === "hidden" ? <EyeGlyph /> : <EyeOffGlyph />}
@@ -474,10 +560,31 @@ function PhotoGrid({
         ) : null}
       </div>
     )}
+    {selected.size > 0 && (
+      <div className="select-bar">
+        <span className="sb-count">{selected.size} selected</span>
+        <button className="sb-btn" onClick={() => bulkFavorite(true)}>
+          Favorite
+        </button>
+        <button className="sb-btn" onClick={() => bulkFavorite(false)}>
+          Unfavorite
+        </button>
+        <button className="sb-btn" onClick={bulkHide}>
+          {filter === "hidden" ? "Restore" : "Hide"}
+        </button>
+        <button className="sb-btn ghost" onClick={clearSelection}>
+          Cancel
+        </button>
+      </div>
+    )}
     {hideUndo && (
       <div className="undo-toast">
         <span>
-          {hideUndo.hidden ? "Hidden from timeline" : "Restored to timeline"}
+          {hideUndo.ids.length === 1
+            ? hideUndo.hidden
+              ? "Hidden from timeline"
+              : "Restored to timeline"
+            : `${hideUndo.ids.length} photos ${hideUndo.hidden ? "hidden" : "restored"}`}
         </span>
         <button className="undo-btn" onClick={undoHide}>
           Undo

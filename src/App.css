@@ -971,7 +971,8 @@ body,
 .person-cell {
   position: relative;
 }
-/* Multi-select checkbox on a person-page cell (top-left, like Photos). */
+/* Multi-select checkbox on a grid cell (top-left, like Photos) — shared by
+   the timeline/favorites/hidden grids and the person page. */
 .person-select {
   position: absolute;
   top: 6px;
@@ -993,7 +994,7 @@ body,
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
   transition: opacity 0.12s, background 0.12s;
 }
-.person-cell:hover .person-select {
+.cell:hover .person-select {
   opacity: 1;
 }
 .person-select.on {
@@ -1002,11 +1003,11 @@ body,
   border-color: #fff;
 }
 /* Selected cell: dim + accent ring so the chunk reads as a group. */
-.person-cell.selected .thumb,
-.person-cell.selected .cell-overlay {
+.cell.selected .thumb,
+.cell.selected .cell-overlay {
   filter: brightness(0.82);
 }
-.person-cell.selected {
+.cell.selected {
   outline: 3px solid #f5a623;
   outline-offset: -3px;
   border-radius: 3px;

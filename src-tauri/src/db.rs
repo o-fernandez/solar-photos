@@ -1412,6 +1412,30 @@ pub fn set_hidden(conn: &Connection, id: i64, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Set one curation flag on many photos, chunked under SQLite's bind-variable
+/// cap. `column` comes only from the two wrappers below — never user input.
+fn set_flag_many(conn: &Connection, column: &str, ids: &[i64], on: bool) -> Result<()> {
+    for chunk in ids.chunks(900) {
+        let sql = format!(
+            "UPDATE photos SET {column} = {} WHERE id IN ({})",
+            on as i64,
+            placeholders(chunk.len())
+        );
+        conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+    Ok(())
+}
+
+/// Toggle the favorite star on a whole selection at once.
+pub fn set_favorite_many(conn: &Connection, ids: &[i64], on: bool) -> Result<()> {
+    set_flag_many(conn, "favorite", ids, on)
+}
+
+/// Soft-archive (or restore) a whole selection at once — flags only.
+pub fn set_hidden_many(conn: &Connection, ids: &[i64], on: bool) -> Result<()> {
+    set_flag_many(conn, "hidden", ids, on)
+}
+
 /// The curation snapshot to export: every photo that carries a flag, keyed by the
 /// stable thing across machines and cache wipes — its path. Clean rows (no flag)
 /// are omitted so the file stays small.

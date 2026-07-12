@@ -329,6 +329,28 @@ fn set_photo_hidden(state: tauri::State<'_, AppState>, id: i64, hidden: bool) ->
     db::set_hidden(&conn, id, hidden).map_err(|e| e.to_string())
 }
 
+/// Toggle the favorite star on a whole selection at once.
+#[tauri::command]
+fn set_photos_favorite(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+    favorite: bool,
+) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::set_favorite_many(&conn, &ids, favorite).map_err(|e| e.to_string())
+}
+
+/// Soft-archive (or restore) a whole selection at once — flags only.
+#[tauri::command]
+fn set_photos_hidden(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+    hidden: bool,
+) -> Result<(), String> {
+    let conn = state.conn.lock().unwrap();
+    db::set_hidden_many(&conn, &ids, hidden).map_err(|e| e.to_string())
+}
+
 /// One JSON line per flagged photo — the curation snapshot the user owns.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CurationEntry {
@@ -2296,6 +2318,8 @@ pub fn run() {
             read_basemap_range,
             set_photo_favorite,
             set_photo_hidden,
+            set_photos_favorite,
+            set_photos_hidden,
             export_curation,
             import_curation,
             get_on_this_day,
