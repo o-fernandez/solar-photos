@@ -19,6 +19,7 @@
 //!     fetched twice: every downloaded original is thumbnailed and cached forever.
 
 mod cluster;
+mod commands;
 mod db;
 mod faces;
 mod meta;
@@ -39,7 +40,7 @@ use db::Job;
 use thumbs::ThumbQueue;
 use recognition::{
     auto_fold_confident, build_review_queue, compute_identity_growth, compute_merge_suggestions,
-    photo_constraints, IdentityGrowth, PersonLook, ReviewItem, ReviewQueue,
+    photo_constraints, IdentityGrowth, ReviewItem,
 };
 
 /// How many concurrent cloud downloads we allow. Bounded so a slow network
@@ -47,64 +48,64 @@ use recognition::{
 const CLOUD_WORKERS: usize = 3;
 
 /// Application-wide state, shared across command handlers and the protocol.
-struct AppState {
+pub(crate) struct AppState {
     /// Path to the SQLite file (the scan thread opens its own connection here).
-    db_path: PathBuf,
+    pub(crate) db_path: PathBuf,
     /// Directory holding cached thumbnail JPEGs.
-    cache_dir: PathBuf,
+    pub(crate) cache_dir: PathBuf,
     /// Directory holding cached large viewer previews.
-    preview_dir: PathBuf,
+    pub(crate) preview_dir: PathBuf,
     /// Directory holding cached cover-face crops.
-    faces_dir: PathBuf,
+    pub(crate) faces_dir: PathBuf,
     /// A single connection for the (UI-driven) command handlers.
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     /// Local-file thumbnail queue (drained eagerly).
-    local_queue: Arc<ThumbQueue>,
+    pub(crate) local_queue: Arc<ThumbQueue>,
     /// Cloud-file queue (fed on demand with what's currently visible).
-    cloud_queue: Arc<ThumbQueue>,
+    pub(crate) cloud_queue: Arc<ThumbQueue>,
     /// Guards against two full rescans running at once (e.g. launch + manual).
-    rescanning: Arc<AtomicBool>,
+    pub(crate) rescanning: Arc<AtomicBool>,
     /// Guards against two re-clusters running at once (migration + manual + sweep).
-    reclustering: Arc<AtomicBool>,
+    pub(crate) reclustering: Arc<AtomicBool>,
     /// Set when a re-cluster is requested while one is already running, so the request
     /// isn't dropped — the running pass re-runs once on finish.
-    recluster_pending: Arc<AtomicBool>,
+    pub(crate) recluster_pending: Arc<AtomicBool>,
     /// Set when a self-heal fold is requested while a fold/re-cluster is already
     /// running, so the correction that requested it still gets its re-derive.
-    fold_pending: Arc<AtomicBool>,
+    pub(crate) fold_pending: Arc<AtomicBool>,
     /// Monotonic clustering generation: bumped ONLY when a full re-cluster renumbers
     /// the positive (appearance) group keys. Identity groups (negative keys) are
     /// durable and never invalidated, and fold passes move no ids at all — so
     /// suggestion payloads carry the generation they were computed at, and mutations
     /// verify it (see `ensure_generation`) against genuinely rare renumbering.
-    cluster_gen: Arc<AtomicI64>,
+    pub(crate) cluster_gen: Arc<AtomicI64>,
     /// People suggestions computed at the end of the last clustering pass (see
     /// `refresh_suggestion_cache`). The get_* commands read this instantly instead of
     /// recomputing full-library passes per tab-open while holding the DB lock.
-    suggestion_cache: Arc<Mutex<SuggestionCache>>,
+    pub(crate) suggestion_cache: Arc<Mutex<SuggestionCache>>,
     /// Debounce token for `schedule_refold`: only the newest pending request fires.
-    recluster_epoch: Arc<AtomicU64>,
+    pub(crate) recluster_epoch: Arc<AtomicU64>,
     /// True while a focus-review session is open. The debounced self-heal pass is
     /// held during a session — it re-derives tentative folds, which would change the
     /// remaining cards' contents mid-answer; answers apply instantly either way.
-    review_active: Arc<AtomicBool>,
+    pub(crate) review_active: Arc<AtomicBool>,
     /// Set when a due self-heal pass was held by an active review session, so it
     /// runs as soon as the session ends.
-    recluster_deferred: Arc<AtomicBool>,
+    pub(crate) recluster_deferred: Arc<AtomicBool>,
 }
 
 /// The People suggestions as of one clustering generation. Served only while
 /// `generation` still matches `cluster_gen` — a mismatch means clustering moved on,
 /// and serving nothing beats serving cards whose cluster ids now point elsewhere.
 #[derive(Default)]
-struct SuggestionCache {
-    generation: i64,
-    growth: Vec<IdentityGrowth>,
-    queue: Vec<ReviewItem>,
+pub(crate) struct SuggestionCache {
+    pub(crate) generation: i64,
+    pub(crate) growth: Vec<IdentityGrowth>,
+    pub(crate) queue: Vec<ReviewItem>,
 }
 
 /// A monotonic-ish generation stamp for mark-and-sweep pruning.
-fn now_gen() -> i64 {
+pub(crate) fn now_gen() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -136,7 +137,7 @@ pub(crate) fn background_qos() {
 
 /// Remove a set of photos' cached files (thumbnail + preview) after they've been
 /// pruned or their root removed.
-fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
+pub(crate) fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
     for &id in ids {
         let _ = std::fs::remove_file(thumbs::thumb_path(cache_dir, id));
         let _ = std::fs::remove_file(thumbs::preview_path(preview_dir, id));
@@ -146,7 +147,7 @@ fn delete_cache_files(cache_dir: &Path, preview_dir: &Path, ids: &[i64]) {
 /// Remove the cached cover-crop files for a set of faces. Call BEFORE deleting the
 /// face rows (the crop path is keyed by face id, found via the rows) — pruned and
 /// removed photos used to leave their crops on disk forever.
-fn delete_face_crop_files(faces_dir: &Path, face_ids: &[i64]) {
+pub(crate) fn delete_face_crop_files(faces_dir: &Path, face_ids: &[i64]) {
     for &fid in face_ids {
         let _ = std::fs::remove_file(faces::face_crop_path(faces_dir, fid));
     }
@@ -196,7 +197,7 @@ fn spawn_cloud_backfill(db_path: PathBuf, cloud_queue: Arc<ThumbQueue>) {
 /// files, or files under a removed root) — including their cached thumbnails.
 /// This is the "second launch shows the truth" reconciliation (Principle 4). It
 /// runs in the background and never blocks the UI; a guard prevents overlap.
-fn rescan_all(app: AppHandle) {
+pub(crate) fn rescan_all(app: AppHandle) {
     let state = app.state::<AppState>();
     if state.rescanning.swap(true, Ordering::SeqCst) {
         return; // a rescan is already in progress
@@ -253,164 +254,12 @@ fn rescan_all(app: AppHandle) {
     });
 }
 
-/// Library counts for the header readout. On a repeat launch this returns the
-/// already-indexed totals immediately, so the grid can render without a rescan.
-#[derive(serde::Serialize)]
-struct LibraryStats {
-    total: i64,
-    ready: i64,
-    favorites: i64,
-    hidden: i64,
-}
-
-#[tauri::command]
-fn get_library_stats(state: tauri::State<'_, AppState>) -> Result<LibraryStats, String> {
-    let conn = state.conn.lock().unwrap();
-    let (total, ready, favorites, hidden) = db::stats(&conn).map_err(|e| e.to_string())?;
-    Ok(LibraryStats { total, ready, favorites, hidden })
-}
-
-/// Fetch a contiguous window of photo rows (id + thumbnail status) under a
-/// curation filter ("visible" | "favorites" | "hidden") and an optional search
-/// query, in discovery or date order. The virtualized grid asks for only the
-/// ranges it is about to display.
-#[tauri::command]
-fn get_photos_range(
-    state: tauri::State<'_, AppState>,
-    offset: i64,
-    limit: i64,
-    by_date: bool,
-    filter: Option<String>,
-    search: Option<String>,
-) -> Result<Vec<db::PhotoRow>, String> {
-    let f = db::PhotoFilter::parse(filter.as_deref().unwrap_or("visible"));
-    let conn = state.conn.lock().unwrap();
-    db::photos_range(&conn, offset, limit, by_date, f, normalized_search(&search))
-        .map_err(|e| e.to_string())
-}
-
-/// How many photos a filter + search match — the grid's cell count while a
-/// search narrows the timeline.
-#[tauri::command]
-fn count_photos(
-    state: tauri::State<'_, AppState>,
-    filter: Option<String>,
-    search: Option<String>,
-) -> Result<i64, String> {
-    let f = db::PhotoFilter::parse(filter.as_deref().unwrap_or("visible"));
-    let conn = state.conn.lock().unwrap();
-    db::photos_count(&conn, f, normalized_search(&search)).map_err(|e| e.to_string())
-}
-
-/// A search argument worth passing down: non-empty after trimming.
-fn normalized_search(search: &Option<String>) -> Option<&str> {
-    search.as_deref().map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// "On this day" — photos taken on today's month-and-day in past years, for the
-/// Home shelf. Empty when nothing was captured on this date.
-#[tauri::command]
-fn get_on_this_day(state: tauri::State<'_, AppState>) -> Result<Vec<db::PhotoRow>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::on_this_day(&conn).map_err(|e| e.to_string())
-}
-
-/// Toggle a photo's favorite star.
-#[tauri::command]
-fn set_photo_favorite(state: tauri::State<'_, AppState>, id: i64, favorite: bool) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::set_favorite(&conn, id, favorite).map_err(|e| e.to_string())
-}
-
-/// Soft-archive (or restore) a photo — a flag only; the file is never touched.
-#[tauri::command]
-fn set_photo_hidden(state: tauri::State<'_, AppState>, id: i64, hidden: bool) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::set_hidden(&conn, id, hidden).map_err(|e| e.to_string())
-}
-
-/// Toggle the favorite star on a whole selection at once.
-#[tauri::command]
-fn set_photos_favorite(
-    state: tauri::State<'_, AppState>,
-    ids: Vec<i64>,
-    favorite: bool,
-) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::set_favorite_many(&conn, &ids, favorite).map_err(|e| e.to_string())
-}
-
-/// Soft-archive (or restore) a whole selection at once — flags only.
-#[tauri::command]
-fn set_photos_hidden(
-    state: tauri::State<'_, AppState>,
-    ids: Vec<i64>,
-    hidden: bool,
-) -> Result<(), String> {
-    let conn = state.conn.lock().unwrap();
-    db::set_hidden_many(&conn, &ids, hidden).map_err(|e| e.to_string())
-}
-
-/// One JSON line per flagged photo — the curation snapshot the user owns.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CurationEntry {
-    path: String,
-    favorite: bool,
-    hidden: bool,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CurationFile {
-    /// Bumped if the shape ever changes; readers tolerate what they understand.
-    version: u32,
-    entries: Vec<CurationEntry>,
-}
-
-/// Write the favorites + hidden flags to a JSON file the user chooses, so their
-/// curation outlives the app's cache directory (it's the one thing here that
-/// isn't re-derivable from the photos). Keyed by path.
-#[tauri::command]
-fn export_curation(state: tauri::State<'_, AppState>, path: String) -> Result<usize, String> {
-    let rows = {
-        let conn = state.conn.lock().unwrap();
-        db::curation_rows(&conn).map_err(|e| e.to_string())?
-    };
-    let file = CurationFile {
-        version: 1,
-        entries: rows
-            .into_iter()
-            .map(|(path, favorite, hidden)| CurationEntry { path, favorite, hidden })
-            .collect(),
-    };
-    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-    let n = file.entries.len();
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(n)
-}
-
-/// Read a previously exported curation file and merge it into the library by path
-/// (flags are OR-merged — an import never clears a star). Returns how many entries
-/// matched a photo present in this library.
-#[tauri::command]
-fn import_curation(state: tauri::State<'_, AppState>, path: String) -> Result<usize, String> {
-    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let file: CurationFile = serde_json::from_str(&json)
-        .map_err(|_| "that isn't a Solar curation file".to_string())?;
-    let rows: Vec<(String, bool, bool)> = file
-        .entries
-        .into_iter()
-        .map(|e| (e.path, e.favorite, e.hidden))
-        .collect();
-    let mut conn = state.conn.lock().unwrap();
-    db::apply_curation(&mut conn, &rows).map_err(|e| e.to_string())
-}
-
 /// Progress payload for the streaming scan: how many photos are registered so
 /// far, and whether the walk has finished.
 #[derive(Clone, serde::Serialize)]
-struct ScanProgress {
-    found: i64,
-    done: bool,
+pub(crate) struct ScanProgress {
+    pub(crate) found: i64,
+    pub(crate) done: bool,
 }
 
 /// `thumb-ready` payload: which photo finished, and whether a thumbnail now
@@ -421,979 +270,11 @@ struct ThumbDone {
     ok: bool,
 }
 
-/// Add a folder to the library: remember it as a root and scan it. Returns
-/// immediately — the walk runs on a background thread, registering photos in
-/// batches and emitting `scan-progress` events so the grid grows live. This is
-/// what keeps the UI from freezing on a huge (or cloud-backed) folder (P1).
-#[tauri::command]
-fn add_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
-    {
-        let conn = state.conn.lock().unwrap();
-        let _ = db::add_root(&conn, &path);
-    }
-    let db_path = state.db_path.clone();
-    let queue = state.local_queue.clone();
-    let preview_dir = state.preview_dir.clone();
-    let faces_dir = state.faces_dir.clone();
-    std::thread::spawn(move || {
-        let gen = now_gen();
-        let progress = |found: i64, done: bool| {
-            let _ = app.emit("scan-progress", ScanProgress { found, done });
-        };
-        if let Err(e) = scan::run_scan(&db_path, &path, gen, queue, &preview_dir, &faces_dir, progress) {
-            eprintln!("scan failed: {e}");
-            let _ = app.emit("scan-progress", ScanProgress { found: 0, done: true });
-        }
-    });
-}
-
-/// Reconcile the whole library with disk (add new, prune deleted) in the
-/// background. Safe to call anytime; overlapping calls are ignored.
-#[tauri::command]
-fn rescan(app: tauri::AppHandle) {
-    rescan_all(app);
-}
-
-/// The folders the library is built from.
-#[tauri::command]
-fn list_roots(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::list_roots(&conn).map_err(|e| e.to_string())
-}
-
-/// Remove a folder from the library: drop its photos and their cached files,
-/// then tell the frontend the new total so it can refresh.
-#[tauri::command]
-fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
-    let removed = {
-        let conn = state.conn.lock().unwrap();
-        let ids = db::remove_root(&conn, &path).unwrap_or_default();
-        // Crops first — they're found via the face rows about to go.
-        let face_ids = db::face_ids_of_photos(&conn, &ids).unwrap_or_default();
-        delete_face_crop_files(&state.faces_dir, &face_ids);
-        let _ = db::delete_faces_for_photos(&conn, &ids);
-        ids
-    };
-    delete_cache_files(&state.cache_dir, &state.preview_dir, &removed);
-    let total = {
-        let conn = state.conn.lock().unwrap();
-        db::stats(&conn).map(|s| s.0).unwrap_or(0)
-    };
-    let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
-}
-
-/// Detail for the viewer chrome: filename + a timestamp (capture date when we
-/// have it, else file mtime).
-#[derive(serde::Serialize)]
-struct PhotoDetail {
-    filename: String,
-    /// Full path on disk — backs the viewer's "Show in Finder".
-    path: String,
-    timestamp: i64,
-    favorite: bool,
-    hidden: bool,
-}
-
-#[tauri::command]
-fn get_photo_detail(
-    state: tauri::State<'_, AppState>,
-    id: i64,
-) -> Result<Option<PhotoDetail>, String> {
-    let conn = state.conn.lock().unwrap();
-    let detail = db::detail(&conn, id).map_err(|e| e.to_string())?;
-    Ok(detail.map(|(path, timestamp, favorite, hidden)| {
-        let filename = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.clone());
-        PhotoDetail { filename, path, timestamp, favorite, hidden }
-    }))
-}
-
-/// Tell the backend which photos are currently on screen. Two effects:
-///   * local pending thumbnails for those photos jump the queue (Principle 3);
-///   * cloud-only photos among them are marked DOWNLOADING and promoted to the
-///     priority lane of the cloud queue, so visible cloud photos always load ahead
-///     of the background backfill working through the rest of the library.
-#[tauri::command]
-fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, AppState>, ids: Vec<i64>) {
-    // Prioritize visible local thumbnails (ignores ids not in the local queue).
-    state.local_queue.set_priority(ids.clone());
-
-    // Figure out which visible photos are cloud-only.
-    let conn = state.conn.lock().unwrap();
-    let rows = match db::lookup(&conn, &ids) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let mut cloud_jobs: Vec<Job> = Vec::new();
-    let mut newly_downloading: Vec<i64> = Vec::new();
-    for (id, status, path) in rows {
-        if status == db::STATUS_CLOUD || status == db::STATUS_DOWNLOADING {
-            cloud_jobs.push(Job { id, path });
-            if status == db::STATUS_CLOUD {
-                newly_downloading.push(id);
-            }
-        }
-    }
-    if !newly_downloading.is_empty() {
-        let _ = db::set_status_many(&conn, &newly_downloading, db::STATUS_DOWNLOADING);
-    }
-    drop(conn);
-
-    // Enqueue any not yet in the queue, then bump all visible cloud photos to
-    // the priority lane so they load before the background backfill (which stays
-    // queued in the normal lane rather than being dropped).
-    let cloud_ids: Vec<i64> = cloud_jobs.iter().map(|j| j.id).collect();
-    state.cloud_queue.enqueue(cloud_jobs);
-    state.cloud_queue.set_priority(cloud_ids);
-    if !newly_downloading.is_empty() {
-        let _ = app.emit("thumb-downloading", newly_downloading);
-    }
-}
-
 /// Progress of the background face sweep (drives the "Finding people…" readout).
 #[derive(Clone, serde::Serialize)]
-struct FaceProgress {
-    scanned: i64,
-    eligible: i64,
-}
-
-#[tauri::command]
-fn get_face_progress(state: tauri::State<'_, AppState>) -> Result<FaceProgress, String> {
-    let conn = state.conn.lock().unwrap();
-    let (scanned, eligible) = db::face_progress(&conn).map_err(|e| e.to_string())?;
-    Ok(FaceProgress { scanned, eligible })
-}
-
-/// The detected people (clusters), biggest first, with a cover face each.
-#[tauri::command]
-fn get_clusters(state: tauri::State<'_, AppState>) -> Result<Vec<db::ClusterRow>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::clusters_overview(&conn).map_err(|e| e.to_string())
-}
-
-/// What naming returns: the canonical group key to keep following (naming a
-/// positive group promotes it to a durable negative key) plus the undo token.
-#[derive(serde::Serialize)]
-struct NameOutcome {
-    group: i64,
-    undo: CorrectionUndo,
-}
-
-/// Naming is the highest-stakes mutation — it confirms every face in the cluster
-/// as user-vouched exemplars — and the cluster id was loaded from an earlier
-/// people list, so it needs the same staleness guard as the suggestion paths: a
-/// re-cluster between load and commit renumbers ids, and naming whatever cluster
-/// now holds the stale id would durably confirm a stranger's faces under the name.
-#[tauri::command]
-fn name_cluster(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    cluster_id: i64,
-    name: String,
-    expected_generation: Option<i64>,
-) -> Result<NameOutcome, String> {
-    let outcome = {
-        let conn = lock_checked(&state, expected_generation)?;
-        // Captured BEFORE the write: naming confirms the group's faces (and may
-        // bind them to a fresh identity), and the identity may already carry a
-        // name — both must round-trip through undo.
-        let prior = capture_group_states(&conn, &[cluster_id]).map_err(|e| e.to_string())?;
-        let prior_name = db::group_name(&conn, cluster_id).map_err(|e| e.to_string())?;
-        let group = db::name_group(&conn, cluster_id, &name).map_err(|e| e.to_string())?;
-        // A negative result means an identity's name was written (or cleared);
-        // a positive one means nothing happened (clearing an unnamed group).
-        let renamed = (group < 0).then(|| (-group, prior_name));
-        NameOutcome { group, undo: CorrectionUndo { renamed, ..CorrectionUndo::faces_only(prior) } }
-    };
-    // Confirming a person adds exemplars, which can re-home other people's
-    // wrongly-folded look-alikes — so re-derive the folds competitively (self-heal).
-    if !name.trim().is_empty() {
-        schedule_refold(app);
-    }
-    Ok(outcome)
-}
-
-#[tauri::command]
-fn merge_clusters(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    into: i64,
-    from: i64,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        // If exactly one side carries a name, that side survives — folding a named
-        // person INTO an unnamed pile would silently un-name them.
-        let (into, from) = if db::group_name(&conn, from).map_err(|e| e.to_string())?.is_some()
-            && db::group_name(&conn, into).map_err(|e| e.to_string())?.is_none()
-        {
-            (from, into)
-        } else {
-            (into, from)
-        };
-        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
-        // A user merge vouches for BOTH sides as one person — everything under the
-        // surviving identity is confirmed (sticky exemplars + must-links) after the
-        // fold. Confirming only one side let the next pass split the other right
-        // back off, and the same "same person?" card returned — the "didn't my
-        // answer register?" bug.
-        let into_identity =
-            db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
-        db::merge_group_into_identity(&conn, into_identity, from).map_err(|e| e.to_string())?;
-        db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
-        CorrectionUndo::faces_only(prior)
-    };
-    prune_suggestion_cache(&state, &[into, from]);
-    // The merge added exemplars — re-derive the folds competitively (self-heal).
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// Every photo containing this person, newest first (same ordering as the
-/// timeline) — backs the person page.
-#[tauri::command]
-fn get_person_photos(
-    state: tauri::State<'_, AppState>,
-    cluster_id: i64,
-) -> Result<Vec<db::PhotoRow>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::person_photos(&conn, cluster_id).map_err(|e| e.to_string())
-}
-
-/// The person's "looks" strip (see `recognition::person_looks`). Runs on a
-/// blocking-pool thread with its OWN connection: the leader-clustering over a big
-/// person's thousands of embeddings takes real time, and computing it while
-/// holding the shared UI connection stalled every avatar request behind the lock
-/// (the same disease the suggestion cache cured for the People tab).
-#[tauri::command]
-async fn get_person_looks(
-    state: tauri::State<'_, AppState>,
-    cluster_id: i64,
-) -> Result<Vec<PersonLook>, String> {
-    let db_path = state.db_path.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-        recognition::person_looks(&conn, cluster_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// The faces detected in one photo, with the person each belongs to — backs the
-/// in-photo overlay (name / reassign / ignore per face).
-#[tauri::command]
-fn get_faces_in_photo(
-    state: tauri::State<'_, AppState>,
-    photo_id: i64,
-) -> Result<Vec<db::PhotoFace>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::faces_in_photo(&conn, photo_id).map_err(|e| e.to_string())
-}
-
-/// Resolve a person-page multi-selection (photo ids + the person's cluster) to the
-/// actual face ids, so the frontend can hand them to reassign/ignore.
-#[tauri::command]
-fn face_ids_for_photos(
-    state: tauri::State<'_, AppState>,
-    photo_ids: Vec<i64>,
-    cluster_id: i64,
-) -> Result<Vec<i64>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::face_ids_in_photos_for_cluster(&conn, &photo_ids, cluster_id).map_err(|e| e.to_string())
-}
-
-/// What a correction returns so it can be undone exactly: the faces' prior state,
-/// the new person's group key when one was created, any cannot-link we added, and
-/// any same-photo exceptions we added (cluster-level review answers use these too).
-#[derive(Clone, serde::Serialize)]
-struct CorrectionUndo {
-    prior: Vec<db::FaceState>,
-    new_cluster_id: Option<i64>,
-    added_cannot_link: Option<(i64, i64)>,
-    /// Multi-pair form (a "neither of them" answer cannot-links against each
-    /// candidate); kept alongside the single-pair field the older paths use.
-    added_cannot_links: Vec<(i64, i64)>,
-    added_same_photo_ok: Vec<(i64, i64)>,
-    /// A name this action wrote: the identity and its name BEFORE the action
-    /// (`None` = it was unnamed). Restoring face states alone would leave the
-    /// label behind — and naming is what confirms faces as user-vouched, so an
-    /// undo that kept it would forge exemplars out of a taken-back action.
-    renamed: Option<(i64, Option<String>)>,
-}
-
-impl CorrectionUndo {
-    fn faces_only(prior: Vec<db::FaceState>) -> Self {
-        CorrectionUndo {
-            prior,
-            new_cluster_id: None,
-            added_cannot_link: None,
-            added_cannot_links: Vec::new(),
-            added_same_photo_ok: Vec::new(),
-            renamed: None,
-        }
-    }
-}
-
-/// Snapshot the face states of whole groups — what a cluster-level answer (merge /
-/// absorb / reject / not-this-person / same-photo) needs captured for exact undo.
-/// Chunked: a big person can hold thousands of faces, and SQLite caps the variables
-/// one `IN (…)` may carry.
-fn capture_group_states(
-    conn: &rusqlite::Connection,
-    groups: &[i64],
-) -> anyhow::Result<Vec<db::FaceState>> {
-    let mut ids: Vec<i64> = Vec::new();
-    for &g in groups {
-        ids.extend(db::cluster_face_ids(conn, g)?);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    let mut states = Vec::with_capacity(ids.len());
-    for chunk in ids.chunks(900) {
-        states.extend(db::capture_face_states(conn, chunk)?);
-    }
-    Ok(states)
-}
-
-/// Reassign faces to an **existing** person (their cluster). Binds them to that
-/// person's identity (must-link) and records a cannot-link from the source person,
-/// so the move is durable and the two never re-merge (§4/§5 of the spec).
-///
-/// The generation check matters here even though face ids are stable: the *target*
-/// cluster id came from a people list loaded earlier, and a re-cluster in between
-/// renumbers ids — binding the faces (confirmed!) to whatever cluster now holds
-/// that id would label them as the wrong person.
-#[tauri::command]
-fn reassign_faces_to_cluster(
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-    source_cluster_id: i64,
-    target_cluster_id: i64,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let mut conn = lock_checked(&state, expected_generation)?;
-    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-    // Both sides become durable identities; record "not the same" between them.
-    let source_id =
-        db::ensure_identity_for_group(&conn, source_cluster_id).map_err(|e| e.to_string())?;
-    let target_id =
-        db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
-    db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
-    let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) })
-}
-
-/// Reassign faces to a **new** person (an optional name). Splits them into a fresh
-/// identity + cluster and cannot-links them from the source person.
-#[tauri::command]
-fn reassign_faces_to_new_person(
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-    source_cluster_id: i64,
-    name: Option<String>,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let mut conn = lock_checked(&state, expected_generation)?;
-    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-    let source_id =
-        db::ensure_identity_for_group(&conn, source_cluster_id).map_err(|e| e.to_string())?;
-    // If the typed name is already a person, merge into them instead of minting a
-    // duplicate — moving "this is someone else: Mía" twice shouldn't make two Mías.
-    let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if let Some(nm) = trimmed {
-        if let Some(target) = db::group_for_name(&conn, nm).map_err(|e| e.to_string())? {
-            if target != source_cluster_id {
-                let target_id =
-                    db::ensure_identity_for_group(&conn, target).map_err(|e| e.to_string())?;
-                db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
-                let added = record_cannot_link_if_new(&conn, source_id, target_id).map_err(|e| e.to_string())?;
-                return Ok(CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) });
-            }
-        }
-    }
-    // Mint the durable identity for the split person and bind the faces to it —
-    // the new tile lives under the identity's stable (negative) group key.
-    let new_id = db::new_identity(&conn).map_err(|e| e.to_string())?;
-    db::set_faces_person(&mut conn, &face_ids, new_id).map_err(|e| e.to_string())?;
-    if let Some(nm) = trimmed {
-        let _ = db::name_group(&conn, -new_id, nm).map_err(|e| e.to_string())?;
-    }
-    let added = record_cannot_link_if_new(&conn, source_id, new_id).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo {
-        new_cluster_id: Some(-new_id),
-        added_cannot_link: added,
-        // The fresh identity's name (when one was given) is this action's write —
-        // undo clears it so no named ghost lingers for merge-by-name lookups.
-        renamed: trimmed.map(|_| (new_id, None)),
-        ..CorrectionUndo::faces_only(prior)
-    })
-}
-
-/// Every face in a cluster (face ids, best first) — backs the "Who is this?" split
-/// grid, where the user tags each contested face as one candidate or the other and so
-/// needs the whole cluster on screen, not the 3-face sample the card ships with.
-#[tauri::command]
-fn get_cluster_faces(
-    state: tauri::State<'_, AppState>,
-    cluster_id: i64,
-) -> Result<Vec<i64>, String> {
-    let conn = state.conn.lock().unwrap();
-    db::cluster_face_ids(&conn, cluster_id).map_err(|e| e.to_string())
-}
-
-/// Confirm a subset of faces into an existing person, leaving the rest of their
-/// current cluster untouched. Backs the "Who is this?" split: a contested cluster
-/// holds two people, so the user tags some faces as A and some as B and each batch is
-/// confirmed into that person. Unlike [`reassign_faces_to_cluster`] this records **no**
-/// cannot-link against the source — the source is an ephemeral contested cluster, and
-/// cannot-linking its untagged remainder from both people would strand faces that are
-/// in fact one of them, just not tagged this round. Kicks a (review-deferred)
-/// re-cluster so the remainder re-folds. Returns prior state for exact undo.
-#[tauri::command]
-fn confirm_faces_into_cluster(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-    target_cluster_id: i64,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    {
-        let mut conn = lock_checked(&state, expected_generation)?;
-        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-        let target_id =
-            db::ensure_identity_for_group(&conn, target_cluster_id).map_err(|e| e.to_string())?;
-        db::set_faces_person(&mut conn, &face_ids, target_id).map_err(|e| e.to_string())?;
-        drop(conn);
-        schedule_refold(app);
-        Ok(CorrectionUndo::faces_only(prior))
-    }
-}
-
-/// Ignore faces (drop from People for good). Returns prior state for undo.
-#[tauri::command]
-fn ignore_faces(
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-) -> Result<CorrectionUndo, String> {
-    let conn = state.conn.lock().unwrap();
-    let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-    db::ignore_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
-    Ok(CorrectionUndo::faces_only(prior))
-}
-
-/// "Not this person" without naming who they are: unbind the faces from their
-/// current person and let the self-heal pass re-home each by appearance (possibly
-/// several people, or none). Distinct from "move to a new person" (which forces
-/// them together) and "ignore" (which hides them). Returns prior state for exact
-/// undo — nothing but the identity layer moved.
-#[tauri::command]
-fn detach_faces(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-) -> Result<CorrectionUndo, String> {
-    let undo = {
-        let conn = state.conn.lock().unwrap();
-        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-        db::detach_faces(&conn, &face_ids).map_err(|e| e.to_string())?;
-        CorrectionUndo::faces_only(prior)
-    };
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// Undo any correction: restore the faces' prior grouping and drop any cannot-link
-/// or same-photo exceptions the correction added. Re-derives the folds afterward so
-/// the display reflects the restored state (deferred while a review session holds).
-#[tauri::command]
-fn undo_correction(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    undo: CorrectionUndoArg,
-) -> Result<(), String> {
-    {
-        let mut conn = state.conn.lock().unwrap();
-        db::restore_face_states(&mut conn, &undo.prior).map_err(|e| e.to_string())?;
-        if let Some((a, b)) = undo.added_cannot_link {
-            db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
-        }
-        for &(a, b) in &undo.added_cannot_links {
-            db::remove_cannot_link(&conn, a, b).map_err(|e| e.to_string())?;
-        }
-        db::remove_same_photo_ok(&conn, &undo.added_same_photo_ok).map_err(|e| e.to_string())?;
-        if let Some((identity, name)) = &undo.renamed {
-            db::restore_identity_name(&conn, *identity, name.as_deref())
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    schedule_refold(app);
-    Ok(())
-}
-
-/// Inbound form of [`CorrectionUndo`] (the frontend hands back what a correction
-/// returned). `new_cluster_id` isn't needed to undo, so it's omitted.
-#[derive(serde::Deserialize)]
-struct CorrectionUndoArg {
-    prior: Vec<db::FaceState>,
-    added_cannot_link: Option<(i64, i64)>,
-    #[serde(default)]
-    added_cannot_links: Vec<(i64, i64)>,
-    #[serde(default)]
-    added_same_photo_ok: Vec<(i64, i64)>,
-    #[serde(default)]
-    renamed: Option<(i64, Option<String>)>,
-}
-
-/// Record a cannot-link between two identities unless it already exists or they're
-/// the same identity. Returns the pair when newly added (so undo can remove it).
-fn record_cannot_link_if_new(
-    conn: &rusqlite::Connection,
-    a: i64,
-    b: i64,
-) -> anyhow::Result<Option<(i64, i64)>> {
-    if a == b || db::cannot_link_exists(conn, a, b)? {
-        return Ok(None);
-    }
-    db::add_cannot_link_ids(conn, a, b)?;
-    Ok(Some((a, b)))
-}
-
-/// The cached growth cards from the last clustering pass. Instant — the heavy
-/// pass ran in the background when clustering settled. Empty while a pass is
-/// running or the cache is from an older generation (no stale cards).
-#[tauri::command]
-fn get_identity_growth(state: tauri::State<'_, AppState>) -> Result<Vec<IdentityGrowth>, String> {
-    if state.reclustering.load(Ordering::SeqCst) {
-        return Ok(Vec::new());
-    }
-    let cache = state.suggestion_cache.lock().unwrap();
-    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
-        Ok(cache.growth.clone())
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-/// The unified review queue from the last clustering pass — the focus flow's feed.
-#[tauri::command]
-fn get_review_queue(state: tauri::State<'_, AppState>) -> Result<ReviewQueue, String> {
-    if state.reclustering.load(Ordering::SeqCst) {
-        return Ok(ReviewQueue::default());
-    }
-    let cache = state.suggestion_cache.lock().unwrap();
-    if cache.generation == state.cluster_gen.load(Ordering::SeqCst) {
-        Ok(ReviewQueue { generation: cache.generation, items: cache.queue.clone() })
-    } else {
-        Ok(ReviewQueue::default())
-    }
-}
-
-/// Fold a batch of look-alike clusters into a confirmed person in one action (the
-/// "merge all" button). Each absorb writes the durable must-link, so the whole
-/// person stays together through future re-clusters.
-#[tauri::command]
-fn absorb_clusters(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    into: i64,
-    clusters: Vec<i64>,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let mut touched = clusters.clone();
-    touched.push(into);
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
-        let into_identity =
-            db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
-        for from in clusters {
-            if from == into {
-                continue;
-            }
-            // Defense in depth (the suggestion pass already filters these): never
-            // absorb a group that IS a different named person. Unnamed-competitor
-            // confirmations are adopted instead — the user is explicitly assigning
-            // this group, which outranks that bookkeeping.
-            if db::group_is_other_named_person(&conn, from, Some(into_identity))
-                .map_err(|e| e.to_string())?
-            {
-                continue;
-            }
-            db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
-            // The user vouched for each absorbed group — confirm, then fold in.
-            db::confirm_group_faces(&conn, from, Some(into_identity))
-                .map_err(|e| e.to_string())?;
-            db::merge_group_into_identity(&conn, into_identity, from)
-                .map_err(|e| e.to_string())?;
-        }
-        CorrectionUndo::faces_only(prior)
-    };
-    prune_suggestion_cache(&state, &touched);
-    // Bulk-merging added exemplars — re-derive the folds competitively (self-heal).
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// "Not the same" on a merge prompt: record a durable cannot-link so the pair is
-/// never suggested again (survives re-clusters, unlike a dismissed-in-memory card).
-/// Both sides become durable *competitors* — their faces are confirmed under their
-/// (possibly unnamed) identities. Without that, the minted identity bindings were
-/// unconfirmed, `clear_unconfirmed_identities` wiped them on the very next pass,
-/// the cannot-link no longer matched either cluster, and the same "same person?"
-/// card came straight back — rejections between unnamed groups never stuck.
-#[tauri::command]
-fn reject_merge(
-    state: tauri::State<'_, AppState>,
-    into: i64,
-    from: i64,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
-        let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
-        let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
-        let added = record_cannot_link_if_new(&conn, ia, ib).map_err(|e| e.to_string())?;
-        db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
-        db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
-        CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
-    };
-    prune_suggestion_cache(&state, &[into, from]);
-    Ok(undo)
-}
-
-/// "Not <person>" on a review candidate: instead of a weak, per-group cannot-link, make
-/// the rejected group a *durable competitor* — confirm its faces as their own identity
-/// (an unnamed "someone else") and cannot-link it from the person. Because confirmed
-/// identities compete for faces, this generalizes: other look-alikes now get pulled
-/// toward the competitor and away from the person. Re-cluster so it takes effect.
-#[tauri::command]
-fn not_this_person(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    person_cluster_id: i64,
-    other_cluster_id: i64,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &[person_cluster_id, other_cluster_id])
-            .map_err(|e| e.to_string())?;
-        // Mint identities for both sides + cannot-link, then confirm the rejected group
-        // so it's a durable, competing exemplar (not wiped as a tentative machine label).
-        let person =
-            db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
-        let other =
-            db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
-        let added = record_cannot_link_if_new(&conn, person, other).map_err(|e| e.to_string())?;
-        db::confirm_identity_faces(&conn, other).map_err(|e| e.to_string())?;
-        CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
-    };
-    prune_suggestion_cache(&state, &[person_cluster_id, other_cluster_id]);
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// "Someone else" WITHOUT saying who: the contested group is none of the offered
-/// candidates, and the user can't (or won't) name them right now. Cannot-link the
-/// group from every candidate and confirm it as its own durable *unnamed*
-/// competitor — it stops being suggested as any of them, pulls its look-alikes
-/// away, and sits in People as an unnamed tile to name later (or never). The
-/// answer that was missing between "it's X" and "skip forever".
-#[tauri::command]
-fn not_these_people(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    other_cluster_id: i64,
-    person_cluster_ids: Vec<i64>,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let mut touched = person_cluster_ids.clone();
-    touched.push(other_cluster_id);
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
-        let other =
-            db::ensure_identity_for_group(&conn, other_cluster_id).map_err(|e| e.to_string())?;
-        let mut added = Vec::new();
-        for p in &person_cluster_ids {
-            let pid = db::ensure_identity_for_group(&conn, *p).map_err(|e| e.to_string())?;
-            if let Some(pair) =
-                record_cannot_link_if_new(&conn, other, pid).map_err(|e| e.to_string())?
-            {
-                added.push(pair);
-            }
-        }
-        db::confirm_identity_faces(&conn, other).map_err(|e| e.to_string())?;
-        CorrectionUndo { added_cannot_links: added, ..CorrectionUndo::faces_only(prior) }
-    };
-    prune_suggestion_cache(&state, &touched);
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// Resolve the bundled offline basemap (a PMTiles archive shipped as a Tauri
-/// resource — see scripts/fetch-basemap.sh). The Places map reads it by byte
-/// range, so no tile server is ever contacted: pans and zooms stay on-device.
-fn basemap_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    app.path()
-        .resolve("basemap/world.pmtiles", tauri::path::BaseDirectory::Resource)
-        .map_err(|e| e.to_string())
-}
-
-/// Size of the bundled basemap in bytes — also the frontend's "is a basemap
-/// bundled at all?" probe (0 = missing; the tab explains instead of breaking).
-#[tauri::command]
-fn basemap_size(app: tauri::AppHandle) -> Result<u64, String> {
-    Ok(basemap_path(&app)
-        .ok()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0))
-}
-
-/// One byte range of the bundled basemap, returned raw (`tauri::ipc::Response`,
-/// no JSON encode). The PMTiles reader asks for tiny slices — header,
-/// directories, then one tile at a time — so this is called per tile view.
-#[tauri::command]
-fn read_basemap_range(
-    app: tauri::AppHandle,
-    offset: u64,
-    length: u64,
-) -> Result<tauri::ipc::Response, String> {
-    use std::io::{Read, Seek, SeekFrom};
-    // A vector tile is at most a few MB; anything bigger is a confused caller.
-    if length > 32 * 1024 * 1024 {
-        return Err("range too large".into());
-    }
-    let path = basemap_path(&app)?;
-    let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; length as usize];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = f.read(&mut buf[filled..]).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break; // EOF — final range of the file may run short
-        }
-        filled += n;
-    }
-    buf.truncate(filled);
-    Ok(tauri::ipc::Response::new(buf))
-}
-
-/// One located photo on the Places map: position + the timeline's sort stamp
-/// (so the map can be time-filtered later without a second query).
-#[derive(serde::Serialize)]
-struct GeoPoint {
-    id: i64,
-    lat: f64,
-    lon: f64,
-    ts: i64,
-}
-
-/// Every photo with a GPS fix — the Places map's whole dataset in one read.
-/// Compact by design (four numbers a row): 100k points is a ~3MB payload, and
-/// clustering happens client-side where the viewport lives (Principle 6).
-#[tauri::command]
-fn get_geo_points(state: tauri::State<'_, AppState>) -> Result<Vec<GeoPoint>, String> {
-    let conn = state.conn.lock().unwrap();
-    Ok(db::geo_points(&conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|(id, lat, lon, ts)| GeoPoint { id, lat, lon, ts })
-        .collect())
-}
-
-/// The photo behind a face crop, plus the face's normalized box — backs the
-/// "peek at the full picture" affordance on review chips and cards, where a
-/// tight crop alone often isn't enough to tell who someone is (the context —
-/// who else is in the frame, where — is the identifying signal).
-#[derive(serde::Serialize)]
-struct FacePhoto {
-    photo_id: i64,
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-}
-
-#[tauri::command]
-fn get_face_photo(
-    state: tauri::State<'_, AppState>,
-    face_id: i64,
-) -> Result<Option<FacePhoto>, String> {
-    let conn = state.conn.lock().unwrap();
-    Ok(db::face_box(&conn, face_id)
-        .map_err(|e| e.to_string())?
-        .map(|(photo_id, x1, y1, x2, y2)| FacePhoto { photo_id, x1, y1, x2, y2 }))
-}
-
-/// Name (or assign to an existing person, matched by exact name) a handful of
-/// faces — WITHOUT touching the rest of their cluster and WITHOUT a cannot-link.
-/// The lightbox's "just this face" scope: on a junk cluster (pose-blended
-/// profiles), naming one face must not vouch for hundreds of strangers along
-/// with it. The rest of the cluster re-homes competitively on later passes; the
-/// named face becomes one confirmed exemplar (no magnet authority until
-/// MIN_ANCHOR confirmed faces accumulate — see recognition::MIN_ANCHOR).
-#[tauri::command]
-fn name_faces(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    face_ids: Vec<i64>,
-    name: String,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("a name is required".into());
-    }
-    let undo = {
-        let mut conn = lock_checked(&state, expected_generation)?;
-        let prior = db::capture_face_states(&conn, &face_ids).map_err(|e| e.to_string())?;
-        // An existing person with this exact name adopts the faces; otherwise a
-        // fresh identity is minted and named — and that name is this action's
-        // write, so undo clears it (no named ghost for merge-by-name lookups).
-        let (identity, renamed) = if let Some(group) =
-            db::group_for_name(&conn, trimmed).map_err(|e| e.to_string())?
-        {
-            (db::ensure_identity_for_group(&conn, group).map_err(|e| e.to_string())?, None)
-        } else {
-            let id = db::new_identity(&conn).map_err(|e| e.to_string())?;
-            let _ = db::name_group(&conn, -id, trimmed).map_err(|e| e.to_string())?;
-            (id, Some((id, None)))
-        };
-        db::set_faces_person(&mut conn, &face_ids, identity).map_err(|e| e.to_string())?;
-        CorrectionUndo {
-            new_cluster_id: Some(-identity),
-            renamed,
-            ..CorrectionUndo::faces_only(prior)
-        }
-    };
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// "Not this person" for a whole batch of candidate groups at once — the person
-/// page's review band offers "none of these are <name>". Same semantics as
-/// [`not_this_person`] per group (cannot-link + durable competitor), but captured
-/// as ONE undoable action, and the person's own face states are snapshotted once
-/// instead of per group.
-#[tauri::command]
-fn not_this_person_many(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    person_cluster_id: i64,
-    other_cluster_ids: Vec<i64>,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let mut touched = other_cluster_ids.clone();
-    touched.push(person_cluster_id);
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &touched).map_err(|e| e.to_string())?;
-        let person =
-            db::ensure_identity_for_group(&conn, person_cluster_id).map_err(|e| e.to_string())?;
-        let mut added = Vec::new();
-        for o in &other_cluster_ids {
-            let oid = db::ensure_identity_for_group(&conn, *o).map_err(|e| e.to_string())?;
-            if let Some(pair) =
-                record_cannot_link_if_new(&conn, person, oid).map_err(|e| e.to_string())?
-            {
-                added.push(pair);
-            }
-            db::confirm_identity_faces(&conn, oid).map_err(|e| e.to_string())?;
-        }
-        CorrectionUndo { added_cannot_links: added, ..CorrectionUndo::faces_only(prior) }
-    };
-    prune_suggestion_cache(&state, &touched);
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// Resolve a same-photo contradiction (see [`ReviewItem::SamePhotoTwin`]).
-/// `same_person = true`: it's a collage/mirror — record durable per-pair exceptions
-/// for every co-occurring face pair between the two clusters, then confirm + merge
-/// (the exceptions are what let the next re-cluster keep them together).
-/// `same_person = false`: they're two look-alikes (twins) — durable cannot-link.
-#[tauri::command]
-fn resolve_same_photo(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    into: i64,
-    from: i64,
-    same_person: bool,
-    expected_generation: Option<i64>,
-) -> Result<CorrectionUndo, String> {
-    let undo = {
-        let conn = lock_checked(&state, expected_generation)?;
-        let prior = capture_group_states(&conn, &[into, from]).map_err(|e| e.to_string())?;
-        if same_person {
-            // Resolve the blocked face pairs BEFORE any identity minting shifts
-            // the positive group key out from under `cooccurring_face_pairs`.
-            let pairs: Vec<(i64, i64)> = db::cooccurring_face_pairs(&conn, into, from)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|(_, a, b)| (a, b))
-                .collect();
-            let into_identity =
-                db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
-            // Only a *named* other person blocks the assignment. Unnamed
-            // competitors (minted by earlier rejections) are adopted instead —
-            // refusing on them made this card unanswerable forever: every click
-            // failed, the queue refreshed, and the same card came back on top.
-            if db::group_is_other_named_person(&conn, from, Some(into_identity))
-                .map_err(|e| e.to_string())?
-            {
-                return Err("that group already belongs to another named person".into());
-            }
-            let added_ok =
-                db::add_same_photo_ok_returning_new(&conn, &pairs).map_err(|e| e.to_string())?;
-            db::adopt_unnamed_confirmed(&conn, from, into_identity).map_err(|e| e.to_string())?;
-            db::merge_group_into_identity(&conn, into_identity, from)
-                .map_err(|e| e.to_string())?;
-            // Vouch for the united person so the pairing survives self-heal.
-            db::confirm_identity_faces(&conn, into_identity).map_err(|e| e.to_string())?;
-            CorrectionUndo { added_same_photo_ok: added_ok, ..CorrectionUndo::faces_only(prior) }
-        } else {
-            // Two look-alikes: durable cannot-link, both sides durable competitors
-            // (same rationale as reject_merge — unconfirmed bindings evaporate).
-            let ia = db::ensure_identity_for_group(&conn, into).map_err(|e| e.to_string())?;
-            let ib = db::ensure_identity_for_group(&conn, from).map_err(|e| e.to_string())?;
-            let added = record_cannot_link_if_new(&conn, ia, ib).map_err(|e| e.to_string())?;
-            db::confirm_identity_faces(&conn, ia).map_err(|e| e.to_string())?;
-            db::confirm_identity_faces(&conn, ib).map_err(|e| e.to_string())?;
-            CorrectionUndo { added_cannot_link: added, ..CorrectionUndo::faces_only(prior) }
-        }
-    };
-    prune_suggestion_cache(&state, &[into, from]);
-    schedule_refold(app);
-    Ok(undo)
-}
-
-/// Fast "start people over": clear every decision (identities, names, cannot-links)
-/// but keep the detected faces and their embeddings, then re-cluster from scratch,
-/// unsupervised. No re-detection — seconds, not the full sweep. Snapshots the database
-/// to `<db>.pre-reset.bak` first (via VACUUM INTO, a consistent copy) so a regretted
-/// reset is recoverable. Returns the backup path.
-#[tauri::command]
-fn reset_face_decisions(app: tauri::AppHandle) -> Result<String, String> {
-    let state = app.state::<AppState>();
-    let backup = state.db_path.with_extension("pre-reset.bak");
-    {
-        let conn = state.conn.lock().unwrap();
-        // Snapshot first (best-effort restore point), then wipe decisions.
-        let _ = std::fs::remove_file(&backup);
-        conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-            .map_err(|e| format!("backup failed: {e}"))?;
-        db::clear_face_decisions(&conn).map_err(|e| e.to_string())?;
-    }
-    // Rebuild clusters from embeddings, unsupervised, in the background.
-    run_recluster(app);
-    Ok(backup.to_string_lossy().into_owned())
+pub(crate) struct FaceProgress {
+    pub(crate) scanned: i64,
+    pub(crate) eligible: i64,
 }
 
 /// Set once the one-time migration off the old greedy clustering has run.
@@ -1456,7 +337,7 @@ fn refresh_suggestion_cache(app: &AppHandle, conn: &Connection) {
 /// decisions the user already made — closing and reopening Review showed the same
 /// "merge all?" again, reading as "my answer didn't register." Over-pruning is
 /// safe: anything still relevant is regenerated by the next pass.
-fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
+pub(crate) fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
     use std::collections::HashSet;
     let set: HashSet<i64> = clusters.iter().copied().collect();
     let touches = |item: &ReviewItem| -> bool {
@@ -1488,30 +369,6 @@ fn prune_suggestion_cache(state: &AppState, clusters: &[i64]) {
         .retain(|g| !set.contains(&g.into) && !(g.strong_clusters.is_empty() && g.maybe.is_empty()));
 }
 
-fn ensure_generation(state: &AppState, expected: Option<i64>) -> Result<(), String> {
-    match expected {
-        Some(g) if g != state.cluster_gen.load(Ordering::SeqCst) => {
-            Err("stale suggestion: people were reorganized since it was shown".into())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Acquire the UI connection AND verify the generation *under that lock*. The
-/// re-cluster bumps the generation and commits its renumbering while holding
-/// this same lock (see `run_recluster`), so a mutation either ran entirely
-/// before the renumbering or sees the new generation and is refused — checking
-/// before locking left a window where a stale card slipped through and wrote
-/// against freshly-renumbered ids.
-fn lock_checked<'a>(
-    state: &'a AppState,
-    expected: Option<i64>,
-) -> Result<std::sync::MutexGuard<'a, Connection>, String> {
-    let conn = state.conn.lock().unwrap();
-    ensure_generation(state, expected)?;
-    Ok(conn)
-}
-
 /// How long a burst of corrections may extend before the self-heal pass runs.
 /// Sized for the *rhythm of reviewing*, not a single click: after accepting a few
 /// suggestions on one person and returning to the grid, the user needs time to read
@@ -1531,7 +388,7 @@ const REFOLD_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(20);
 /// any still-pending one. This is the cheap identity-layer pass — the full
 /// re-cluster now runs only when the appearance layer itself must change (sweep
 /// drain, reset, migration, the manual command), never as the price of a rename.
-fn schedule_refold(app: AppHandle) {
+pub(crate) fn schedule_refold(app: AppHandle) {
     let state = app.state::<AppState>();
     let epoch = state.recluster_epoch.clone();
     let review_active = state.review_active.clone();
@@ -1551,16 +408,6 @@ fn schedule_refold(app: AppHandle) {
             run_auto_fold(app);
         }
     });
-}
-
-/// Focus-review session lifecycle: while active, due self-heal passes are deferred
-/// so the session's cards stay valid; ending the session runs any deferred pass.
-#[tauri::command]
-fn set_review_active(app: tauri::AppHandle, state: tauri::State<'_, AppState>, active: bool) {
-    state.review_active.store(active, Ordering::SeqCst);
-    if !active && state.recluster_deferred.swap(false, Ordering::SeqCst) {
-        schedule_refold(app);
-    }
 }
 
 /// Run [`auto_fold_confident`] in the background (Principle 1: off the UI thread),
@@ -1615,7 +462,7 @@ fn run_auto_fold(app: AppHandle) {
 /// user curated) are keyed by durable identity ids and pass through untouched — no
 /// name re-anchoring, no must-link welding. A guard prevents overlap; progress
 /// streams via `cluster-progress`.
-fn run_recluster(app: AppHandle) {
+pub(crate) fn run_recluster(app: AppHandle) {
     let state = app.state::<AppState>();
     if state.reclustering.swap(true, Ordering::SeqCst) {
         // Already running — don't drop this request; have the running pass re-run once
@@ -1724,48 +571,6 @@ fn run_recluster(app: AppHandle) {
             run_auto_fold(app_for_rerun);
         }
     });
-}
-
-/// The current clustering generation — fetched with a people list so later
-/// mutations can prove their cluster ids are from the same clustering.
-#[tauri::command]
-fn get_cluster_generation(state: tauri::State<'_, AppState>) -> i64 {
-    state.cluster_gen.load(Ordering::SeqCst)
-}
-
-/// Debug-only: print the cosine distribution of mutual-kNN edges over the whole
-/// face set. This is the *measurement* that sets `TAU_LINK` from a real library
-/// rather than from vibes — a clean separation shows up as a trough between the
-/// within-person mass (high) and the across-person tail (low); put `TAU_LINK` in
-/// the trough. Returns the report as a string (also printed to the log).
-#[tauri::command]
-fn cluster_debug(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let faces = {
-        let conn = state.conn.lock().unwrap();
-        db::all_face_embeddings(&conn).map_err(|e| e.to_string())?
-    };
-    let sims = cluster::mutual_edge_sims(&faces);
-    let mut report = format!(
-        "cluster_debug: {} faces, {} mutual-kNN edges\n",
-        faces.len(),
-        sims.len()
-    );
-    if !sims.is_empty() {
-        // 0.30..1.00 in 0.05-wide buckets — the band where TAU_LINK lives.
-        let mut buckets = [0usize; 14];
-        for &s in &sims {
-            let b = (((s - 0.30) / 0.05).floor() as isize).clamp(0, 13) as usize;
-            buckets[b] += 1;
-        }
-        let max = buckets.iter().copied().max().unwrap_or(1).max(1);
-        for (b, &c) in buckets.iter().enumerate() {
-            let lo = 0.30 + 0.05 * b as f32;
-            let bar = "#".repeat(c * 40 / max);
-            report.push_str(&format!("  {lo:.2}-{:.2} | {bar} {c}\n", lo + 0.05));
-        }
-    }
-    eprintln!("{report}");
-    Ok(report)
 }
 
 /// Locate a bundled model: prefer the packaged resource dir, fall back to the
@@ -2288,54 +1093,54 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_library_stats,
-            get_photos_range,
-            count_photos,
-            get_photo_detail,
-            add_folder,
-            rescan,
-            list_roots,
-            remove_folder,
-            set_visible_range,
-            get_face_progress,
-            get_clusters,
-            name_cluster,
-            merge_clusters,
-            get_identity_growth,
-            get_review_queue,
-            get_cluster_generation,
-            resolve_same_photo,
-            set_review_active,
-            absorb_clusters,
-            reject_merge,
-            not_this_person,
-            not_these_people,
-            not_this_person_many,
-            name_faces,
-            get_face_photo,
-            get_geo_points,
-            basemap_size,
-            read_basemap_range,
-            set_photo_favorite,
-            set_photo_hidden,
-            set_photos_favorite,
-            set_photos_hidden,
-            export_curation,
-            import_curation,
-            get_on_this_day,
-            reset_face_decisions,
-            cluster_debug,
-            get_person_photos,
-            get_person_looks,
-            get_faces_in_photo,
-            face_ids_for_photos,
-            get_cluster_faces,
-            confirm_faces_into_cluster,
-            reassign_faces_to_cluster,
-            reassign_faces_to_new_person,
-            ignore_faces,
-            detach_faces,
-            undo_correction
+            commands::library::get_library_stats,
+            commands::library::get_photos_range,
+            commands::library::count_photos,
+            commands::library::get_photo_detail,
+            commands::library::add_folder,
+            commands::library::rescan,
+            commands::library::list_roots,
+            commands::library::remove_folder,
+            commands::library::set_visible_range,
+            commands::people::get_face_progress,
+            commands::people::get_clusters,
+            commands::people::name_cluster,
+            commands::people::merge_clusters,
+            commands::people::get_identity_growth,
+            commands::people::get_review_queue,
+            commands::people::get_cluster_generation,
+            commands::people::resolve_same_photo,
+            commands::people::set_review_active,
+            commands::people::absorb_clusters,
+            commands::people::reject_merge,
+            commands::people::not_this_person,
+            commands::people::not_these_people,
+            commands::people::not_this_person_many,
+            commands::people::name_faces,
+            commands::people::get_face_photo,
+            commands::geo::get_geo_points,
+            commands::geo::basemap_size,
+            commands::geo::read_basemap_range,
+            commands::curation::set_photo_favorite,
+            commands::curation::set_photo_hidden,
+            commands::curation::set_photos_favorite,
+            commands::curation::set_photos_hidden,
+            commands::curation::export_curation,
+            commands::curation::import_curation,
+            commands::library::get_on_this_day,
+            commands::people::reset_face_decisions,
+            commands::people::cluster_debug,
+            commands::people::get_person_photos,
+            commands::people::get_person_looks,
+            commands::people::get_faces_in_photo,
+            commands::people::face_ids_for_photos,
+            commands::people::get_cluster_faces,
+            commands::people::confirm_faces_into_cluster,
+            commands::people::reassign_faces_to_cluster,
+            commands::people::reassign_faces_to_new_person,
+            commands::people::ignore_faces,
+            commands::people::detach_faces,
+            commands::people::undo_correction
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
