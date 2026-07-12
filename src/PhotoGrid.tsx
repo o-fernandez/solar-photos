@@ -20,6 +20,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import Lightbox from "./Lightbox";
+import UndoToast from "./UndoToast";
 import {
   getPhotosRange,
   onThumbDownloading,
@@ -578,18 +579,16 @@ function PhotoGrid({
       </div>
     )}
     {hideUndo && (
-      <div className="undo-toast">
-        <span>
-          {hideUndo.ids.length === 1
+      <UndoToast
+        label={
+          hideUndo.ids.length === 1
             ? hideUndo.hidden
               ? "Hidden from timeline"
               : "Restored to timeline"
-            : `${hideUndo.ids.length} photos ${hideUndo.hidden ? "hidden" : "restored"}`}
-        </span>
-        <button className="undo-btn" onClick={undoHide}>
-          Undo
-        </button>
-      </div>
+            : `${hideUndo.ids.length} photos ${hideUndo.hidden ? "hidden" : "restored"}`
+        }
+        onUndo={undoHide}
+      />
     )}
     </div>
     {viewerIndex !== null && (

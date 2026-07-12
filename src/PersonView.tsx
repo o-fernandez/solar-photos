@@ -21,8 +21,6 @@ import {
   detachFaces,
   faceCropUrl,
   faceIdsForPhotos,
-  getClusterGeneration,
-  getClusters,
   getPersonLooks,
   getPersonPhotos,
   ignoreFaces,
@@ -30,7 +28,6 @@ import {
   nameCluster,
   notThisPerson,
   notThisPersonMany,
-  onClusterProgress,
   onThumbReady,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
@@ -49,6 +46,8 @@ import {
   type PersonLook,
   type PhotoRow,
 } from "./api";
+import UndoToast from "./UndoToast";
+import { usePeopleDirectory } from "./usePeopleDirectory";
 
 const GAP = 4; // px between cells (matches the timeline grid)
 const TARGET_CELL = 200; // px — desired cell edge; actual size flexes to fill width
@@ -117,8 +116,6 @@ export default function PersonView({
   // Whether the "move to which person?" picker is open, and its typeahead text.
   const [picking, setPicking] = useState(false);
   const [pickQuery, setPickQuery] = useState("");
-  // The people to reassign into (named/large groups), loaded once.
-  const [people, setPeople] = useState<Cluster[]>([]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Thumbnail readiness, seeded from row status and kept live via onThumbReady.
@@ -362,38 +359,14 @@ export default function PersonView({
       });
   };
 
-  // The people you can reassign a chunk *into* — every other person, biggest first —
-  // plus the clustering generation their ids belong to. Both refresh when a
-  // background re-cluster finishes (it renumbers cluster ids), so a move started
-  // after that binds against current ids; a move racing the boundary is refused by
-  // the backend's generation check instead of landing on the wrong person.
-  const genRef = useRef<number>(0);
-  useEffect(() => {
-    const refreshIds = () => {
-      getClusters().then(setPeople).catch(() => {});
-      getClusterGeneration()
-        .then((g) => {
-          genRef.current = g;
-        })
-        .catch(() => {});
-    };
-    refreshIds();
-    let unlisten: (() => void) | undefined;
-    onClusterProgress((p) => {
-      if (!p.running) {
-        // A background re-cluster finished — it renumbered cluster ids and may have
-        // moved faces in or out of this person. Refresh the id/generation AND the
-        // shown photos + looks, so the page never sits on a stale grouping (which
-        // left already-moved looks lingering until the next reload).
-        refreshIds();
-        reloadPhotos();
-        loadLooks();
-      }
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => unlisten?.();
-  }, [reloadPhotos, loadLooks]);
+  // The people you can reassign a chunk *into* — plus the clustering generation
+  // their ids belong to — kept fresh across background re-clusters by the hook.
+  // When one settles, this page also refreshes its photos + looks so it never
+  // sits on a stale grouping (which left already-moved looks lingering).
+  const { people, genRef, refresh: refreshPeople } = usePeopleDirectory(() => {
+    reloadPhotos();
+    loadLooks();
+  });
 
   const toggleSelect = (photoId: number) => {
     setSelected((s) => {
@@ -464,8 +437,7 @@ export default function PersonView({
         // Restore the cells, refresh ids + looks so the *next* attempt binds against
         // current ids, and say so.
         setRows((rs) => removed.reduce((acc, r) => insertSorted(acc, r), rs));
-        getClusterGeneration().then((g) => { genRef.current = g; }).catch(() => {});
-        getClusters().then(setPeople).catch(() => {});
+        refreshPeople();
         reloadPhotos();
         loadLooks();
         const msg = String(e ?? "");
@@ -476,7 +448,7 @@ export default function PersonView({
         );
       }
     },
-    [groupId, loadLooks, reloadPhotos, flashNotice],
+    [groupId, loadLooks, reloadPhotos, refreshPeople, flashNotice],
   );
 
   const doUndo = () => {
@@ -965,20 +937,8 @@ export default function PersonView({
         </div>
       )}
 
-      {undo && (
-        <div className="undo-toast">
-          <span>{undo.label}</span>
-          <button className="undo-btn" onClick={doUndo}>
-            Undo
-          </button>
-        </div>
-      )}
-
-      {notice && !undo && (
-        <div className="undo-toast">
-          <span>{notice}</span>
-        </div>
-      )}
+      {undo && <UndoToast label={undo.label} onUndo={doUndo} />}
+      {notice && !undo && <UndoToast label={notice} />}
 
       {viewerIndex !== null && (
         <Lightbox

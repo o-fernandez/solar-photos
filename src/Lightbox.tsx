@@ -12,8 +12,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   confirmFacesIntoCluster,
-  getClusterGeneration,
-  getClusters,
   getFacesInPhoto,
   getPhotoDetail,
   ignoreFaces,
@@ -21,7 +19,6 @@ import {
   setPhotoHidden,
   nameCluster,
   nameFaces,
-  onClusterProgress,
   photoUrl,
   reassignFacesToCluster,
   reassignFacesToNewPerson,
@@ -33,6 +30,8 @@ import {
   type PhotoFace,
 } from "./api";
 import PersonPicker from "./PersonPicker";
+import UndoToast from "./UndoToast";
+import { usePeopleDirectory } from "./usePeopleDirectory";
 
 interface Props {
   index: number;
@@ -89,6 +88,10 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   const panRef = useRef({ x: 0, y: 0 });
 
   const [faces, setFaces] = useState<PhotoFace[]>([]);
+  // The viewer can stay open across a background re-cluster (which renumbers
+  // cluster ids) — the hook keeps the people list + generation fresh, and every
+  // cluster-targeting mutation passes the generation so a stale id is refused.
+  const { people, genRef } = usePeopleDirectory();
   const [rect, setRect] = useState<ContentRect | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   // Read by the (stable) zoom/pan handlers without re-binding per render.
@@ -97,7 +100,6 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   const stageSizeRef = useRef(stageSize);
   stageSizeRef.current = stageSize;
   const [openFace, setOpenFace] = useState<number | null>(null);
-  const [people, setPeople] = useState<Cluster[]>([]);
   // A toast for the last correction. `onUndo` is null for actions we don't reverse
   // (cluster merges, matching the People grid — re-split via the grid if needed).
   const [undo, setUndo] = useState<{ label: string; onUndo: (() => void) | null } | null>(null);
@@ -222,30 +224,6 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     },
     [setView],
   );
-
-  // The people list AND the clustering generation its ids belong to. The viewer can
-  // stay open across a background re-cluster (which renumbers cluster ids), so both
-  // refresh when one finishes; every cluster-targeting mutation passes the generation
-  // so a stale id is refused instead of naming/merging whatever cluster now holds it.
-  const genRef = useRef(0);
-  useEffect(() => {
-    const refreshPeople = () => {
-      getClusters().then(setPeople).catch(() => {});
-      getClusterGeneration()
-        .then((g) => {
-          genRef.current = g;
-        })
-        .catch(() => {});
-    };
-    refreshPeople();
-    let unlisten: (() => void) | undefined;
-    onClusterProgress((p) => {
-      if (!p.running) refreshPeople();
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => unlisten?.();
-  }, []);
 
   // Resolve the current photo's id + detail + faces, and prefetch neighbors.
   useEffect(() => {
@@ -626,16 +604,7 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
           })}
       </div>
 
-      {undo && (
-        <div className="undo-toast">
-          <span>{undo.label}</span>
-          {undo.onUndo && (
-            <button className="undo-btn" onClick={doUndo}>
-              Undo
-            </button>
-          )}
-        </div>
-      )}
+      {undo && <UndoToast label={undo.label} onUndo={undo.onUndo ? doUndo : undefined} />}
 
       {detail && shownId === id && (
         <div className="viewer-caption" onClick={(e) => e.stopPropagation()}>
