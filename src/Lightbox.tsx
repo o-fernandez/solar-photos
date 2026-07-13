@@ -643,11 +643,13 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
             setShowInfo(true);
           }}
         >
-          <span className="viewer-counter">
-            {(current + 1).toLocaleString()} of {total.toLocaleString()} ·{" "}
+          <span className="viewer-captext">
+            <span className="viewer-counter">
+              {(current + 1).toLocaleString()} of {total.toLocaleString()} ·{" "}
+            </span>
+            {when}
+            <span className="viewer-filename"> · {detail.filename}</span>
           </span>
-          {when}
-          <span className="viewer-filename"> · {detail.filename}</span>
           <button
             className="viewer-reveal"
             title="Show this file in Finder"

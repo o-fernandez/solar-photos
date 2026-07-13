@@ -1792,12 +1792,20 @@ body,
   pointer-events: none;
 }
 /* Floating filmstrip: the photos in the current view, newest first. */
-.geo-strip-wrap {
+/* One bottom column owns the geometry of every map overlay (histogram, then
+   the filmstrip) — stacked with a gap, so they can never overlap. */
+.geo-bottom {
   position: absolute;
   left: 12px;
   right: 12px;
   bottom: 10px;
   z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.geo-strip-wrap {
   pointer-events: none;
 }
 .geo-strip-count {
@@ -2061,15 +2069,38 @@ body,
 .viewer-next {
   right: 8px;
 }
+/* The collapsed caption: a pill in the same family as the info card it grows
+   into (press I) — not bare text hanging on the photo. */
 .viewer-caption {
   position: absolute;
-  bottom: 18px;
-  left: 0;
-  right: 0;
-  text-align: center;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(640px, calc(100% - 48px));
+  background: rgba(24, 24, 27, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  padding: 7px 16px;
   color: #e7e7e4;
   font-size: 13px;
   pointer-events: none;
+  z-index: 5;
+}
+.viewer-caption.clickable:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+}
+.viewer-captext {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.viewer-caption .viewer-reveal {
+  margin-left: 0;
+  flex: none;
 }
 .viewer-counter,
 .viewer-filename {
@@ -2931,11 +2962,7 @@ body,
 /* --- Places year histogram: photos per year along the bottom; drag across
    the bars to pick a range, tap one for a single year, ✕ to clear. --- */
 .geo-histo {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 96px;
-  z-index: 5;
+  pointer-events: auto;
   background: #ffffffe8;
   border: 1px solid #e3e3e3;
   border-radius: 12px;

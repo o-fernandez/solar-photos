@@ -311,6 +311,9 @@ export default function Places() {
         </div>
       )}
 
+      {/* Bottom overlays stack in one column — histogram above filmstrip —
+          so they size independently and can never overlap. */}
+      <div className="geo-bottom">
       {status === "ready" && years.length >= 2 && (
         <div className="geo-histo">
           <div className="gh-bars" ref={barsRef} onPointerDown={onBarsPointerDown}>
@@ -367,6 +370,7 @@ export default function Places() {
           </div>
         </div>
       )}
+      </div>
 
       {viewerIndex !== null && (
         <Lightbox
