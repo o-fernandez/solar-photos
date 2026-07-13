@@ -22,6 +22,7 @@ import {
   resetFaceDecisions,
   type Cluster,
 } from "./api";
+import { fold } from "./fold";
 import "./App.css";
 
 // How often (ms) to re-check clusters for a freshly-qualified new person while
@@ -315,9 +316,10 @@ function App() {
         return;
       }
       countPhotos("visible", q).then(setSearchCount).catch(() => setSearchCount(0));
-      const ql = q.toLowerCase();
+      // Accent-folded, like the backend: "mia" surfaces Mía's chip.
+      const ql = fold(q);
       setSearchPeople(
-        allPeopleRef.current.filter((c) => c.name!.toLowerCase().includes(ql)).slice(0, 6),
+        allPeopleRef.current.filter((c) => fold(c.name!).includes(ql)).slice(0, 6),
       );
     }, 250);
     return () => window.clearTimeout(t);
@@ -466,7 +468,7 @@ function App() {
                 className="people-search tb-search"
                 type="search"
                 autoFocus
-                placeholder="Search — name, folder, month, year"
+                placeholder="Search — person, folder, month, year"
                 value={searchInput}
                 onChange={(e) => setSearchInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -750,8 +752,9 @@ function App() {
               <div className="empty">
                 <p>Nothing matches “{search}”.</p>
                 <p className="muted">
-                  Search looks at file and folder names, years (“2019”) and month names
-                  (“june”) — and matching people appear above, one tap from their page.
+                  Search looks at the people in your photos, file and folder names, years
+                  (“2019”) and month names (“june”) — accents optional. Matching people
+                  also appear above, one tap from their page.
                 </p>
               </div>
             )}

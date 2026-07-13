@@ -31,6 +31,7 @@ import {
 } from "./api";
 import PersonPicker from "./PersonPicker";
 import UndoToast from "./UndoToast";
+import { fold } from "./fold";
 import { usePeopleDirectory } from "./usePeopleDirectory";
 
 interface Props {
@@ -677,10 +678,11 @@ function FaceMenu({
   const [mode, setMode] = useState<"root" | "name" | "move">(unnamed ? "name" : "root");
   const [draft, setDraft] = useState("");
 
-  // The exact-match probe: when the typed text IS an existing person, the
-  // "+ Name “X”" row is redundant (that person's own row commits the same thing).
-  const q = draft.trim().toLowerCase();
-  const exact = q ? people.find((c) => c.name && c.name.toLowerCase() === q) : undefined;
+  // The exact-match probe: when the typed text IS an existing person (accents
+  // aside), the "+ Name “X”" row is redundant (that person's own row commits
+  // the same thing).
+  const q = fold(draft.trim());
+  const exact = q ? people.find((c) => c.name && fold(c.name) === q) : undefined;
 
   return (
     <div className="face-menu" style={placement} onClick={(e) => e.stopPropagation()}>

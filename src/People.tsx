@@ -30,6 +30,7 @@ import {
   type IdentityGrowth,
   type ReviewQueue,
 } from "./api";
+import { fold } from "./fold";
 
 // While the library is still being scanned, the incremental assign path spawns a
 // swarm of 1–3-photo fragments that mostly vanish after consolidation — pure noise
@@ -189,11 +190,11 @@ function People({
   // ordered biggest-first (backend already sorts by count, so this stays stable).
   // A search query overrides all of it: just the named people who match.
   const { visible, tail } = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = fold(query.trim());
     if (q) {
       return {
         visible: clusters
-          .filter((c) => c.name && c.name.toLowerCase().includes(q))
+          .filter((c) => c.name && fold(c.name).includes(q))
           .sort((a, b) => b.count - a.count),
         tail: [] as Cluster[],
       };
@@ -239,10 +240,10 @@ function People({
   // The existing person whose name is *exactly* what you typed (case-insensitive) —
   // the signal that naming should merge rather than create a duplicate tile.
   const exactNameMatch = (self: Cluster, name: string): Cluster | undefined => {
-    const q = name.trim().toLowerCase();
+    const q = fold(name.trim());
     if (!q) return undefined;
     return clusters.find(
-      (c) => c.cluster_id !== self.cluster_id && c.name != null && c.name.toLowerCase() === q,
+      (c) => c.cluster_id !== self.cluster_id && c.name != null && fold(c.name) === q,
     );
   };
 

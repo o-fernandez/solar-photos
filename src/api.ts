@@ -43,8 +43,9 @@ export function getLibraryStats(): Promise<LibraryStats> {
 /** Fetch a contiguous window of photo rows. `byDate` = newest-first timeline
  *  order; otherwise discovery order (used while a scan is still running).
  *  `filter` selects the curation slice (default the visible timeline);
- *  `search` narrows it to a free-text query (file/folder names, years,
- *  month names — every token must match). */
+ *  `search` narrows it to a free-text query (file/folder names, pictured
+ *  people's names, years, month names — every token must match something,
+ *  accents optional). */
 export function getPhotosRange(
   offset: number,
   limit: number,

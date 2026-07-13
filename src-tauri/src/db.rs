@@ -34,11 +34,44 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    register_fold(&conn)?;
     Ok(conn)
+}
+
+/// Lowercase + strip diacritics, so "mia" matches "Mía" and "angel" matches
+/// "Ángel" — nobody should have to remember which accents a name was typed
+/// with. NFD splits each accented letter into its base + combining marks;
+/// dropping the marks keeps the base letter.
+pub fn fold_text(s: &str) -> String {
+    use unicode_normalization::char::is_combining_mark;
+    use unicode_normalization::UnicodeNormalization;
+    s.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Expose [`fold_text`] to SQL as `fold(x)`, for the search predicates. NULL in,
+/// NULL out (an unnamed identity must never match). Registered on every
+/// connection `open` hands out, and again in `init` so in-memory test
+/// connections get it too (re-registering just replaces the definition).
+fn register_fold(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let v: Option<String> = ctx.get(0)?;
+            Ok(v.map(|s| fold_text(&s)))
+        },
+    )?;
+    Ok(())
 }
 
 /// Create the schema if it does not exist yet.
 pub fn init(conn: &Connection) -> Result<()> {
+    register_fold(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS photos (
             id           INTEGER PRIMARY KEY,
@@ -1297,11 +1330,14 @@ impl PhotoFilter {
 
 // ---------------------------------------------------------------------------
 // Timeline search. A free-text query is split on whitespace and every token
-// must match — a 4-digit year matches the photo's (capture-date) year, an
-// English month name (3+ letters, "jun" or "june") matches its month, and any
-// other token is a case-insensitive substring of the file's PATH, so folder
-// names ("wedding", "iceland") match alongside filenames. All local, all over
-// data already indexed — search never reads a file.
+// must match something about the photo (AND across tokens, OR within one):
+//   * a 4-digit year matches the (capture-date) year, exclusively — years in
+//     filenames are ubiquitous, so a year token means the date;
+//   * every other token matches the file's PATH (folder names count), or the
+//     name of a person pictured in the photo, or — when it's an English month
+//     name of 3+ letters — the capture month.
+// Matching is accent-insensitive via `fold` ("mia" finds Mía's photos). All
+// local, all over data already indexed — search never reads a file.
 // ---------------------------------------------------------------------------
 
 /// Month number for an English month name or its 3+-letter prefix.
@@ -1327,7 +1363,7 @@ fn search_where(query: &str) -> (String, Vec<String>) {
     let mut sql = String::new();
     let mut params: Vec<String> = Vec::new();
     for tok in query.split_whitespace() {
-        let t = tok.to_lowercase();
+        let t = fold_text(tok);
         if let Ok(y) = t.parse::<i64>() {
             if (1900..=2100).contains(&y) {
                 sql.push_str(" AND strftime('%Y', COALESCE(taken_ts, mtime), 'unixepoch') = ?");
@@ -1335,13 +1371,23 @@ fn search_where(query: &str) -> (String, Vec<String>) {
                 continue;
             }
         }
+        // Path or pictured-person's name (both accent-folded on each side), or
+        // the capture month when the token reads as one.
+        let like = format!("%{}%", like_escape(&t));
+        let mut ors = vec![
+            "fold(path) LIKE ? ESCAPE '\\'".to_string(),
+            "EXISTS (SELECT 1 FROM faces f JOIN identities i ON i.id = f.identity_id \
+             WHERE f.photo_id = photos.id AND f.ignored = 0 \
+               AND i.name IS NOT NULL AND fold(i.name) LIKE ? ESCAPE '\\')"
+                .to_string(),
+        ];
+        params.push(like.clone());
+        params.push(like);
         if let Some(m) = month_number(&t) {
-            sql.push_str(" AND strftime('%m', COALESCE(taken_ts, mtime), 'unixepoch') = ?");
+            ors.push("strftime('%m', COALESCE(taken_ts, mtime), 'unixepoch') = ?".into());
             params.push(format!("{m:02}"));
-            continue;
         }
-        sql.push_str(" AND path LIKE ? ESCAPE '\\'");
-        params.push(format!("%{}%", like_escape(&t)));
+        sql.push_str(&format!(" AND ({})", ors.join(" OR ")));
     }
     (sql, params)
 }
@@ -1700,18 +1746,23 @@ mod tests {
         photos_range(conn, 0, 10, false, f, None).unwrap().into_iter().map(|r| r.id).collect()
     }
 
-    /// Search: every token must match — years/months against the capture date,
-    /// anything else as a path substring (so folder names count) — and LIKE
-    /// wildcards inside a token are matched literally.
+    /// Search: every token must match — years against the capture date; other
+    /// tokens against the path (folder names count), a pictured person's name,
+    /// or the capture month — all accent-insensitively, with LIKE wildcards
+    /// inside a token matched literally.
     #[test]
-    fn search_matches_path_year_and_month() {
+    fn search_matches_path_year_month_and_person() {
         let conn = test_conn();
         // 2019-06-01 and 2020-06-01 (UTC), plus an undated oddly-named file.
         conn.execute_batch(
             "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status, taken_ts) VALUES
-               (1, '/lib/Iceland trip/IMG_1.jpg', 0, 0, '', 1, 1559347200),
-               (2, '/lib/Beach/IMG_2.jpg',        0, 0, '', 1, 1590969600),
-               (3, '/lib/Beach/IMG_100%_off.jpg', 0, 0, '', 1, NULL);",
+               (1, '/lib/Iceland trip/IMG_1.jpg',  0, 0, '', 1, 1559347200),
+               (2, '/lib/Beach/IMG_2.jpg',         0, 0, '', 1, 1590969600),
+               (3, '/lib/Beach/IMG_100%_off.jpg',  0, 0, '', 1, NULL),
+               (4, '/lib/Ángel fiesta/IMG_4.jpg',  0, 0, '', 1, NULL);
+             INSERT INTO identities (id, name) VALUES (1, 'Mía');
+             INSERT INTO faces (id, photo_id, x1, y1, x2, y2, score, embedding, cluster_id, identity_id)
+               VALUES (1, 2, 0, 0, 1, 1, 0.9, x'00', 10, 1);",
         )
         .unwrap();
         let find = |q: &str| {
@@ -1727,7 +1778,20 @@ mod tests {
         assert_eq!(find("jun 2020"), vec![2], "tokens combine (AND)");
         assert_eq!(find("beach 2019"), Vec::<i64>::new(), "no photo satisfies both");
         assert_eq!(find("100%_off"), vec![3], "LIKE wildcards are literal");
+        assert_eq!(find("mia"), vec![2], "a person's name finds their photos, sans accents");
+        assert_eq!(find("Mía"), vec![2], "…and with them");
+        assert_eq!(find("mia 2020"), vec![2], "person + year combine");
+        assert_eq!(find("angel"), vec![4], "accented folder names fold too");
         assert_eq!(photos_count(&conn, PhotoFilter::Visible, Some("june")).unwrap(), 2);
+    }
+
+    /// The fold behind accent-insensitive matching: lowercase, marks stripped.
+    #[test]
+    fn fold_strips_accents() {
+        assert_eq!(fold_text("Mía"), "mia");
+        assert_eq!(fold_text("ÁNGEL"), "angel");
+        assert_eq!(fold_text("Niño"), "nino");
+        assert_eq!(fold_text("plain"), "plain");
     }
 
     fn insert_face(conn: &Connection, id: i64, cluster: i64, identity: Option<i64>, confirmed: bool) {

@@ -47,6 +47,7 @@ import {
   type PhotoRow,
 } from "./api";
 import UndoToast from "./UndoToast";
+import { fold } from "./fold";
 import { usePeopleDirectory } from "./usePeopleDirectory";
 
 const GAP = 4; // px between cells (matches the timeline grid)
@@ -261,10 +262,10 @@ export default function PersonView({
   // naming should merge, not rename. Mirrors the People grid so renaming here
   // behaves the same. (The contains-matches live inside PersonPicker.)
   const exactNameMatch = (q: string): Cluster | undefined => {
-    const s = q.trim().toLowerCase();
+    const s = fold(q.trim());
     if (!s) return undefined;
     return people.find(
-      (c) => c.cluster_id !== groupId && c.name != null && c.name.toLowerCase() === s,
+      (c) => c.cluster_id !== groupId && c.name != null && fold(c.name) === s,
     );
   };
   // Fold this whole person into another (picked, or typed as an exact match), then

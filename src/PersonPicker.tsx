@@ -22,6 +22,7 @@
 
 import { useMemo } from "react";
 import { faceCropUrl, type Cluster } from "./api";
+import { fold } from "./fold";
 import { usePickerNav } from "./pickerNav";
 
 const VARIANTS = {
@@ -96,11 +97,12 @@ export default function PersonPicker({
   const v = VARIANTS[variant];
 
   const matches = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    // Accent-folded on both sides: "mia" surfaces Mía.
+    const q = fold(query.trim());
     if (!q && !matchAll) return [];
     return people
       .filter((c) => c.cluster_id !== excludeId && c.name)
-      .filter((c) => (q ? c.name!.toLowerCase().includes(q) : true))
+      .filter((c) => (q ? fold(c.name!).includes(q) : true))
       .slice(0, limit);
   }, [people, query, excludeId, matchAll, limit]);
 
