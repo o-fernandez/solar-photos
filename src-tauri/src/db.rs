@@ -141,6 +141,10 @@ pub fn init(conn: &Connection) -> Result<()> {
         "DROP TABLE IF EXISTS cluster_names;
          DROP INDEX IF EXISTS idx_photos_path;",
     )?;
+    // SHA-256 of the original's bytes, for exact-duplicate detection. NULL =
+    // not hashed yet (the backfill's worklist); '' = unreadable, never retried.
+    let _ = conn.execute("ALTER TABLE photos ADD COLUMN content_hash TEXT", []);
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(content_hash);")?;
     // Durable person records. Unlike cluster ids — which are reassigned from
     // scratch on every re-cluster — an identity id is permanent, so it carries
     // the user's decisions (this is so-and-so; these groups are the same person)
@@ -1151,8 +1155,10 @@ pub fn rearm_photos_for_redetect(conn: &Connection, photo_ids: &[i64]) -> Result
     }
     delete_faces_for_photos(conn, photo_ids)?;
     let ph = placeholders(photo_ids.len());
+    // The content changed, so the stored hash is stale too — NULL re-arms the
+    // duplicate sweep alongside the face one.
     conn.execute(
-        &format!("UPDATE photos SET faces_scanned = 0 WHERE id IN ({ph})"),
+        &format!("UPDATE photos SET faces_scanned = 0, content_hash = NULL WHERE id IN ({ph})"),
         rusqlite::params_from_iter(photo_ids.iter()),
     )?;
     // Only re-queue photos that already have a local thumbnail; leave cloud-only
@@ -1609,6 +1615,102 @@ pub fn geo_points(conn: &Connection) -> Result<Vec<(i64, f64, f64, i64)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+// ---------------------------------------------------------------------------
+// Exact duplicates. Grouped by content_hash over VISIBLE photos only — hiding
+// every copy but one is how a group is resolved, so a resolved group simply
+// stops appearing. The hash sweep (see `spawn_content_hasher`) fills the
+// column in the background; NULL rows just aren't grouped yet.
+// ---------------------------------------------------------------------------
+
+/// Local photos not yet hashed — the duplicate sweep's worklist. Cloud-only
+/// placeholders are excluded: hashing one would force its download.
+pub fn unhashed_local_batch(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM photos
+         WHERE content_hash IS NULL AND thumb_status NOT IN (?1, ?2)
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![STATUS_CLOUD, STATUS_DOWNLOADING, limit],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Record a photo's content hash ('' = unreadable, never retried).
+pub fn set_content_hash(conn: &Connection, id: i64, hash: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET content_hash = ?1 WHERE id = ?2",
+        rusqlite::params![hash, id],
+    )?;
+    Ok(())
+}
+
+/// (hashed, eligible) locals — the duplicate sweep's progress readout.
+pub fn hash_progress(conn: &Connection) -> Result<(i64, i64)> {
+    let eligible: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM photos WHERE thumb_status NOT IN (?1, ?2)",
+        rusqlite::params![STATUS_CLOUD, STATUS_DOWNLOADING],
+        |r| r.get(0),
+    )?;
+    let hashed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM photos WHERE content_hash IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok((hashed, eligible))
+}
+
+/// One copy within a duplicate group.
+#[derive(serde::Serialize)]
+pub struct DuplicateCopy {
+    pub id: i64,
+    pub path: String,
+    pub ts: i64,
+    pub favorite: bool,
+}
+
+/// A set of byte-identical visible photos, and the disk the extras occupy.
+#[derive(serde::Serialize)]
+pub struct DuplicateGroup {
+    pub wasted_bytes: i64,
+    pub copies: Vec<DuplicateCopy>,
+}
+
+/// The visible exact-duplicate groups, biggest waste first, capped at `limit`.
+pub fn duplicate_groups(conn: &Connection, limit: i64) -> Result<Vec<DuplicateGroup>> {
+    let hashes: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT content_hash, size * (COUNT(*) - 1) AS wasted FROM photos
+             WHERE content_hash IS NOT NULL AND content_hash != '' AND hidden = 0
+             GROUP BY content_hash HAVING COUNT(*) > 1
+             ORDER BY wasted DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut copies_stmt = conn.prepare(
+        "SELECT id, path, COALESCE(taken_ts, mtime), favorite FROM photos
+         WHERE content_hash = ?1 AND hidden = 0 ORDER BY id",
+    )?;
+    let mut groups = Vec::with_capacity(hashes.len());
+    for (hash, wasted_bytes) in hashes {
+        let rows = copies_stmt.query_map([&hash], |r| {
+            Ok(DuplicateCopy {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                ts: r.get(2)?,
+                favorite: r.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        groups.push(DuplicateGroup {
+            wasted_bytes,
+            copies: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        });
+    }
+    Ok(groups)
+}
+
 /// Look up status + path for a set of ids. Used by on-demand cloud handling to
 /// decide which of the currently-visible photos are cloud-only and need fetching.
 pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>> {
@@ -1783,6 +1885,37 @@ mod tests {
         assert_eq!(find("mia 2020"), vec![2], "person + year combine");
         assert_eq!(find("angel"), vec![4], "accented folder names fold too");
         assert_eq!(photos_count(&conn, PhotoFilter::Visible, Some("june")).unwrap(), 2);
+    }
+
+    /// Duplicates: identical hashes group (biggest waste first), hidden copies
+    /// resolve a group out of existence, and unreadable ('') / unhashed (NULL)
+    /// rows never group.
+    #[test]
+    fn duplicate_groups_visible_only() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status, content_hash, hidden) VALUES
+               (1, '/a/x.jpg', 0, 100, '', 1, 'aaa', 0),
+               (2, '/b/x.jpg', 0, 100, '', 1, 'aaa', 0),
+               (3, '/c/x.jpg', 0, 100, '', 1, 'aaa', 0),
+               (4, '/a/y.jpg', 0, 900, '', 1, 'bbb', 0),
+               (5, '/b/y.jpg', 0, 900, '', 1, 'bbb', 0),
+               (6, '/a/z.jpg', 0, 100, '', 1, 'ccc', 0),
+               (7, '/b/z.jpg', 0, 100, '', 1, 'ccc', 1),
+               (8, '/a/u.jpg', 0, 100, '', 1, '',    0),
+               (9, '/b/u.jpg', 0, 100, '', 1, '',    0),
+               (10,'/a/w.jpg', 0, 100, '', 1, NULL,  0);",
+        )
+        .unwrap();
+        let groups = duplicate_groups(&conn, 50).unwrap();
+        assert_eq!(groups.len(), 2, "ccc is resolved by hiding; '' and NULL never group");
+        assert_eq!(groups[0].wasted_bytes, 900, "biggest waste first (bbb: one 900-byte extra)");
+        assert_eq!(groups[0].copies.len(), 2);
+        assert_eq!(groups[1].wasted_bytes, 200, "aaa: two 100-byte extras");
+        assert_eq!(groups[1].copies.len(), 3);
+        // The sweep's worklist ignores the already-hashed and the cloud-only.
+        let unhashed = unhashed_local_batch(&conn, 10).unwrap();
+        assert_eq!(unhashed, vec![(10, "/a/w.jpg".to_string())]);
     }
 
     /// The fold behind accent-insensitive matching: lowercase, marks stripped.

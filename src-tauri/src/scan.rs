@@ -34,7 +34,7 @@ const SUPPORTED: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 /// How many files we register per transaction / progress tick.
 const BATCH: usize = 256;
 
-fn is_supported(path: &Path) -> bool {
+pub(crate) fn is_supported(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => SUPPORTED.contains(&ext.to_ascii_lowercase().as_str()),
         None => false,

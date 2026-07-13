@@ -28,6 +28,7 @@ image = "0.25"                                            # decode/encode jpeg/p
 sha2 = "0.10"                                             # cache-key hashing
 anyhow = "1"                                              # ergonomic error handling in workers
 kamadak-exif = "0.5"                                      # read EXIF capture date (the timeline spine)
+notify = "8"                                              # watch library roots — changes reconcile without a manual rescan
 ort = { version = "=2.0.0-rc.10", features = ["coreml", "ndarray"] }  # ONNX Runtime: face detect + embed
 ndarray = "0.16"                                          # tensor construction for ONNX I/O
 

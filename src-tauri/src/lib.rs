@@ -193,6 +193,137 @@ fn spawn_cloud_backfill(db_path: PathBuf, cloud_queue: Arc<ThumbQueue>) {
     });
 }
 
+/// Hash every LOCAL original once — the raw material for exact-duplicate
+/// detection. Idle-time and resumable: `content_hash IS NULL` is the worklist,
+/// so a restart continues where it left off, and new files (or newly-downloaded
+/// cloud originals) get hashed on a later lap. Cloud-only placeholders are never
+/// touched — reading a dataless file would force its download. An unreadable
+/// file records the empty string so it's never retried (and never groups).
+fn spawn_content_hasher(db_path: PathBuf) {
+    const BATCH: i64 = 100;
+    const IDLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    std::thread::spawn(move || {
+        background_qos();
+        let Ok(conn) = db::open(&db_path) else { return };
+        loop {
+            let batch = db::unhashed_local_batch(&conn, BATCH).unwrap_or_default();
+            if batch.is_empty() {
+                std::thread::sleep(IDLE_PAUSE);
+                continue;
+            }
+            for (id, path) in batch {
+                let hash = hash_file(Path::new(&path)).unwrap_or_default();
+                let _ = db::set_content_hash(&conn, id, &hash);
+                // A gentle pace: this reads whole originals and has gigabytes to
+                // get through — nothing about it is urgent (PRINCIPLES #3).
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    });
+}
+
+/// SHA-256 of a file's bytes, streamed (originals can be 50 MB HEICs).
+fn hash_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// How long the filesystem must stay quiet after a burst of change events
+/// before the watcher reconciles. Copying a folder of 500 photos fires
+/// thousands of events; coalescing them means one rescan at the end, not one
+/// per file — the same "wait for the pause" shape as the refold debounce.
+const WATCH_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Watch every library root for filesystem changes (FSEvents on macOS) and
+/// reconcile automatically — new photos appear, deleted ones prune, edited
+/// ones re-thumbnail, all without the user asking for a rescan. "A repeat
+/// launch shows the truth" (Principle 4) extends to the running app.
+///
+/// One long-lived thread owns the watcher: it re-syncs its watch list with the
+/// current roots once a minute (folders added or removed from the library are
+/// picked up on the next sync), and turns any relevant event burst into a
+/// single debounced [`rescan_all`] — which is metadata-only, overlap-guarded,
+/// and refuses to prune when a root is unreachable, so a false wake is cheap
+/// and a real one is exactly what the manual rescan button does.
+fn spawn_fs_watcher(app: AppHandle, db_path: PathBuf) {
+    use notify::Watcher;
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+
+    std::thread::spawn(move || {
+        background_qos();
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("fs-watch: cannot create watcher: {e}");
+                return;
+            }
+        };
+        let mut watched: HashSet<String> = HashSet::new();
+        loop {
+            // Keep the watch list in sync with the library's roots.
+            if let Ok(roots) = db::open(&db_path).and_then(|c| db::list_roots(&c)) {
+                let roots: HashSet<String> = roots.into_iter().collect();
+                for r in roots.difference(&watched) {
+                    let _ = watcher.watch(Path::new(r), notify::RecursiveMode::Recursive);
+                }
+                for r in watched.difference(&roots) {
+                    let _ = watcher.unwatch(Path::new(r));
+                }
+                watched = roots;
+            }
+            // Wait for a relevant event (the timeout doubles as the root re-sync tick).
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(Ok(event)) if event_touches_photos(&event) => {
+                    // Coalesce the burst: drain until the disk goes quiet.
+                    loop {
+                        match rx.recv_timeout(WATCH_QUIET) {
+                            Ok(_) => continue,
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    rescan_all(app.clone());
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+}
+
+/// Whether a filesystem event could change what the library should contain: a
+/// supported image was touched, or something structural (create/remove/rename —
+/// possibly a whole folder) happened. Dot-hidden paths are ignored, matching the
+/// scan's own skip rule, so sync-tool churn in `.caches` never wakes a rescan.
+fn event_touches_photos(event: &notify::Event) -> bool {
+    use notify::event::ModifyKind;
+    use notify::EventKind;
+    let structural = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    );
+    event.paths.iter().any(|p| {
+        let hidden = p
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+        if hidden {
+            return false;
+        }
+        // A photo changed, or a structural event on something without a photo
+        // extension (most importantly: a directory moving in or out).
+        scan::is_supported(p) || (structural && p.extension().is_none())
+    })
+}
+
 /// Walk every root, mark what still exists, then prune what doesn't (deleted
 /// files, or files under a removed root) — including their cached thumbnails.
 /// This is the "second launch shows the truth" reconciliation (Principle 4). It
@@ -1090,6 +1221,17 @@ pub fn run() {
             // the background, so a repeat launch shows the truth (Principle 4)
             // without the user having to ask. Cached content is already on screen.
             rescan_all(app.handle().clone());
+
+            // …and keep it true while running: watch the roots and reconcile on
+            // change, so a photo copied in (or deleted) just appears (or prunes).
+            spawn_fs_watcher(
+                app.handle().clone(),
+                app.state::<AppState>().db_path.clone(),
+            );
+
+            // Hash local originals in the background (idle-time, resumable) so
+            // exact duplicates can be found and reviewed.
+            spawn_content_hasher(app.state::<AppState>().db_path.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1125,6 +1267,7 @@ pub fn run() {
             commands::curation::set_photo_hidden,
             commands::curation::set_photos_favorite,
             commands::curation::set_photos_hidden,
+            commands::curation::get_duplicate_report,
             commands::curation::export_curation,
             commands::curation::import_curation,
             commands::library::get_on_this_day,

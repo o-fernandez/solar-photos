@@ -18,6 +18,26 @@ pub(crate) fn set_photo_hidden(state: tauri::State<'_, AppState>, id: i64, hidde
     db::set_hidden(&conn, id, hidden).map_err(|e| e.to_string())
 }
 
+/// The exact-duplicate report: how far the background hash sweep has gotten,
+/// plus the visible duplicate groups (biggest waste first). Resolving a group
+/// is pure curation — hide the copies you don't want; files are never touched.
+#[derive(serde::Serialize)]
+pub(crate) struct DuplicateReport {
+    scanned: i64,
+    eligible: i64,
+    groups: Vec<db::DuplicateGroup>,
+}
+
+#[tauri::command]
+pub(crate) fn get_duplicate_report(
+    state: tauri::State<'_, AppState>,
+) -> Result<DuplicateReport, String> {
+    let conn = state.conn.lock().unwrap();
+    let (scanned, eligible) = db::hash_progress(&conn).map_err(|e| e.to_string())?;
+    let groups = db::duplicate_groups(&conn, 500).map_err(|e| e.to_string())?;
+    Ok(DuplicateReport { scanned, eligible, groups })
+}
+
 /// Toggle the favorite star on a whole selection at once.
 #[tauri::command]
 pub(crate) fn set_photos_favorite(
