@@ -2888,3 +2888,199 @@ body,
 .search-clear {
   margin-left: auto;
 }
+
+/* --- Viewer info card (I): the caption, grown into camera/file/location rows.
+   Floats where the caption was — the photo never moves. --- */
+.viewer-caption.clickable { pointer-events: auto; cursor: pointer; }
+.viewer-info {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 14px;
+  width: min(620px, calc(100% - 48px));
+  background: rgba(24, 24, 27, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  padding: 8px 16px;
+  color: #e8e8ea;
+  font-size: 13px;
+  z-index: 6;
+}
+.vi-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 6px 0;
+}
+.vi-row + .vi-row { border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.vi-head { cursor: pointer; font-weight: 600; color: #fff; }
+.vi-counter { color: #9a9aa2; font-weight: 400; }
+.vi-lbl, .vi-file {
+  color: #b6b6bd;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vi-file { color: #e8e8ea; }
+.vi-side { display: inline-flex; align-items: center; gap: 10px; color: #9a9aa2; flex: none; }
+.viewer-info .viewer-reveal { position: static; margin: 0; }
+.vi-note { color: #9a9aa2; justify-content: center; }
+
+/* --- Places year histogram: photos per year along the bottom; drag across
+   the bars to pick a range, tap one for a single year, ✕ to clear. --- */
+.geo-histo {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 96px;
+  z-index: 5;
+  background: #ffffffe8;
+  border: 1px solid #e3e3e3;
+  border-radius: 12px;
+  padding: 8px 14px 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+.gh-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 40px;
+  cursor: crosshair;
+  touch-action: none;
+}
+.gh-bars i {
+  flex: 1;
+  min-width: 3px;
+  background: #ddd6c8;
+  border-radius: 2px 2px 0 0;
+  pointer-events: none;
+}
+.gh-bars i.sel { background: #f5a623; }
+.gh-lbl {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: #888;
+  margin-top: 4px;
+}
+.gh-lbl b { color: #1a1a1a; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
+.gh-clear {
+  border: none;
+  background: #eee;
+  border-radius: 999px;
+  width: 16px;
+  height: 16px;
+  line-height: 1;
+  font-size: 10px;
+  color: #666;
+  cursor: pointer;
+}
+.gh-clear:hover { background: #f5a623; color: #fff; }
+
+/* --- Home's duplicates shelf: the payoff, framed. --- */
+.home-dupes {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid #e8e2d4;
+  background: linear-gradient(120deg, #fdf6e8, #ffffff);
+  border-radius: 12px;
+  padding: 14px 16px;
+  cursor: pointer;
+}
+.home-dupes:hover { border-color: #f5a623; }
+.hd-stack { position: relative; width: 52px; height: 52px; flex: none; }
+.hd-stack img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+.hd-stack img:first-child { transform: rotate(-6deg); }
+.hd-stack img:last-child { transform: rotate(4deg) translateX(5px); }
+.hd-text { font-size: 13px; color: #666; }
+.hd-text b { display: block; color: #1a1a1a; font-size: 15px; margin-bottom: 2px; }
+
+/* --- Duplicates review: one group per screen, keeper pre-picked. --- */
+.dup-sweep {
+  margin: 12px 16px 0;
+  padding: 8px 12px;
+  border: 1px solid #e8e2d4;
+  background: #fdf6e8;
+  border-radius: 9px;
+  font-size: 12.5px;
+  color: #7a6a4a;
+}
+.dup-stage {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 16px 90px;
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+}
+.dup-q { font-size: 16px; font-weight: 600; margin: 0 0 16px; text-align: center; }
+.dup-twins {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.dup-twin {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  border: 2px solid #ececec;
+  border-radius: 12px;
+  background: #fafafa;
+  padding: 8px;
+  cursor: pointer;
+}
+.dup-twin:hover { border-color: #d9c9a5; }
+.dup-twin.keep { border-color: #f5a623; background: #fffaf0; }
+.dup-twin img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #eee;
+}
+.dt-name { font-size: 13px; font-weight: 600; color: #1a1a1a; word-break: break-all; }
+.dt-dir { font-size: 11.5px; color: #888; word-break: break-all; }
+.dt-tag {
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 2px 7px;
+  background: #f5a623;
+  color: #fff;
+}
+.dt-tag.ghost { background: #ececec; color: #888; font-weight: 500; }
+.dup-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 20px;
+}
+.dup-actions .sb-btn { background: #232323; }
+.dup-actions .sb-btn.ghost { background: transparent; color: #777; border: 1px solid #ddd; }
+.dup-actions .rf-key {
+  display: inline-block;
+  border: 1px solid #ffffff55;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 10.5px;
+  margin-left: 4px;
+}
+.dup-actions .sb-btn.ghost .rf-key { border-color: #ccc; color: #999; }

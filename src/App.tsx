@@ -3,6 +3,7 @@ import PhotoGrid from "./PhotoGrid";
 import People from "./People";
 import Places from "./Places";
 import Home from "./Home";
+import Duplicates from "./Duplicates";
 import {
   addFolder,
   countPhotos,
@@ -53,7 +54,7 @@ function App() {
   const [faceScanned, setFaceScanned] = useState(0);
   const [faceEligible, setFaceEligible] = useState(0);
   const [view, setView] = useState<
-    "home" | "timeline" | "favorites" | "people" | "places" | "hidden"
+    "home" | "timeline" | "favorites" | "people" | "places" | "hidden" | "duplicates"
   >("home");
   // A person to open straight to their page (from a Home "Your people" tile).
   const [openPerson, setOpenPerson] = useState<Cluster | null>(null);
@@ -271,7 +272,8 @@ function App() {
   }, []);
   const handleOpenConsumed = useCallback(() => setOpenPerson(null), []);
   const handleNavigate = useCallback(
-    (v: "home" | "timeline" | "favorites" | "people" | "places" | "hidden") => setView(v),
+    (v: "home" | "timeline" | "favorites" | "people" | "places" | "hidden" | "duplicates") =>
+      setView(v),
     [],
   );
 
@@ -665,6 +667,8 @@ function App() {
           />
         ) : view === "places" ? (
           <Places />
+        ) : view === "duplicates" ? (
+          <Duplicates onBack={() => setView("home")} onCurationChanged={handleCurationChanged} />
         ) : view === "favorites" ? (
           favorites > 0 ? (
             <PhotoGrid

@@ -77,6 +77,107 @@ fn gps_coord(exif: &exif::Exif, tag: exif::Tag, ref_tag: exif::Tag, neg: u8) -> 
     v.is_finite().then_some(v)
 }
 
+/// The viewer's on-demand EXIF detail, read when the info card opens — never at
+/// scan time (most photos' cards are never opened, and this is a full parse).
+/// Camera values arrive pre-formatted for display; a missing tag is just a
+/// missing row on the card.
+#[derive(Default, serde::Serialize)]
+pub struct ExifDetail {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub f_number: Option<String>,
+    pub exposure: Option<String>,
+    pub iso: Option<String>,
+    pub focal: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub gps: Option<(f64, f64)>,
+}
+
+/// Read the info card's fields from a LOCAL file. Callers must not hand this a
+/// cloud placeholder — reading its bytes would force the download.
+pub fn read_exif_detail(path: &Path) -> ExifDetail {
+    let mut d = ExifDetail::default();
+    if let Ok(file) = std::fs::File::open(path) {
+        let mut buf = std::io::BufReader::new(file);
+        if let Ok(exif) = exif::Reader::new().read_from_container(&mut buf) {
+            let make = ascii_of(&exif, exif::Tag::Make);
+            let model = ascii_of(&exif, exif::Tag::Model);
+            // Phone models usually embed the make ("Pixel 7 Pro" doesn't, but
+            // "Canon EOS R6" does) — don't print "Canon Canon EOS R6".
+            d.camera = match (make, model) {
+                (Some(mk), Some(md)) => Some(if md.to_lowercase().contains(&mk.to_lowercase()) {
+                    md
+                } else {
+                    format!("{mk} {md}")
+                }),
+                (mk, md) => md.or(mk),
+            };
+            d.lens = ascii_of(&exif, exif::Tag::LensModel);
+            d.f_number = rational_of(&exif, exif::Tag::FNumber).map(|v| format!("ƒ/{}", short(v)));
+            d.exposure = rational_of(&exif, exif::Tag::ExposureTime).map(|t| {
+                if t > 0.0 && t < 1.0 {
+                    format!("1/{}s", (1.0 / t).round() as i64)
+                } else {
+                    format!("{}s", short(t))
+                }
+            });
+            d.iso = uint_of(&exif, exif::Tag::PhotographicSensitivity).map(|n| format!("ISO {n}"));
+            d.focal = rational_of(&exif, exif::Tag::FocalLength).map(|v| format!("{}mm", short(v)));
+            d.width = uint_of(&exif, exif::Tag::PixelXDimension);
+            d.height = uint_of(&exif, exif::Tag::PixelYDimension);
+            d.gps = gps_of(&exif);
+        }
+    }
+    // No EXIF dimensions (PNG/WebP, stripped files): a header-only read is
+    // cheap for the formats the image crate knows; HEIC just stays unknown.
+    if d.width.is_none() {
+        if let Ok(r) = image::ImageReader::open(path) {
+            if let Ok(r) = r.with_guessed_format() {
+                if let Ok((w, h)) = r.into_dimensions() {
+                    d.width = Some(w);
+                    d.height = Some(h);
+                }
+            }
+        }
+    }
+    d
+}
+
+/// A number for display: whole values without the decimal ("ƒ/2", "2s"),
+/// fractional ones with one place ("ƒ/1.8").
+fn short(v: f64) -> String {
+    if (v - v.round()).abs() < 0.05 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+fn ascii_of(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    if let exif::Value::Ascii(ref vals) = field.value {
+        let s = std::str::from_utf8(vals.first()?).ok()?;
+        let s = s.trim().trim_matches('\0').trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn rational_of(exif: &exif::Exif, tag: exif::Tag) -> Option<f64> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    match &field.value {
+        exif::Value::Rational(v) => v.first().map(|r| r.to_f64()),
+        _ => None,
+    }
+}
+
+fn uint_of(exif: &exif::Exif, tag: exif::Tag) -> Option<u32> {
+    exif.get_field(tag, exif::In::PRIMARY)?.value.get_uint(0)
+}
+
 /// Parse "YYYY:MM:DD HH:MM:SS" (also tolerates '-' separators). Treated as UTC —
 /// EXIF carries no timezone, so time-of-day display may shift by the viewer's
 /// offset, but the calendar date (what the timeline sorts on) is what matters.

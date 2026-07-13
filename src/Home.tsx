@@ -12,6 +12,7 @@ import Lightbox from "./Lightbox";
 import {
   faceCropUrl,
   getClusters,
+  getDuplicateReport,
   getGeoPoints,
   getOnThisDay,
   getPhotosRange,
@@ -21,11 +22,12 @@ import {
   type PhotoRow,
 } from "./api";
 import { basemapFlavor, basemapStyle, ensureBasemapProtocol } from "./basemap";
+import { fmtBytes } from "./format";
 
 const SHELF = 24; // photos fetched per row shelf
 const PEOPLE = 12; // face tiles on the people shelf
 
-type View = "timeline" | "favorites" | "people" | "places" | "home" | "hidden";
+type View = "timeline" | "favorites" | "people" | "places" | "home" | "hidden" | "duplicates";
 
 function monthDayYear(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, {
@@ -54,6 +56,8 @@ export default function Home({
   const [favorites, setFavorites] = useState<PhotoRow[]>([]);
   const [recent, setRecent] = useState<PhotoRow[]>([]);
   const [geoCount, setGeoCount] = useState(0);
+  // The duplicates shelf: how many groups wait, what they waste, one cover.
+  const [dupes, setDupes] = useState<{ groups: number; wasted: number; coverId: number | null } | null>(null);
 
   // A Lightbox scoped to whichever shelf was clicked.
   const [viewerPhotos, setViewerPhotos] = useState<PhotoRow[]>([]);
@@ -77,6 +81,15 @@ export default function Home({
     getPhotosRange(0, SHELF, true, "favorites").then(setFavorites).catch(() => {});
     getPhotosRange(0, SHELF, true, "visible").then(setRecent).catch(() => {});
     getGeoPoints().then((p) => setGeoCount(p.length)).catch(() => {});
+    getDuplicateReport()
+      .then((r) =>
+        setDupes({
+          groups: r.groups.length,
+          wasted: r.groups.reduce((n, g) => n + g.wasted_bytes, 0),
+          coverId: r.groups[0]?.copies[0]?.id ?? null,
+        }),
+      )
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -149,6 +162,29 @@ export default function Home({
       {geoCount > 0 && (
         <Shelf title="Your places" action="Open map" onAction={() => onNavigate("places")}>
           <PlacesPreview count={geoCount} onOpen={() => onNavigate("places")} />
+        </Shelf>
+      )}
+
+      {dupes != null && dupes.groups > 0 && (
+        <Shelf title="Duplicates" action="Review" onAction={() => onNavigate("duplicates")}>
+          <button className="home-dupes" onClick={() => onNavigate("duplicates")}>
+            <span className="hd-stack" aria-hidden="true">
+              {dupes.coverId != null && (
+                <>
+                  <img src={thumbUrl(dupes.coverId)} alt="" draggable={false} />
+                  <img src={thumbUrl(dupes.coverId)} alt="" draggable={false} />
+                </>
+              )}
+            </span>
+            <span className="hd-text">
+              <b>
+                {dupes.groups.toLocaleString()} exact{" "}
+                {dupes.groups === 1 ? "duplicate" : "duplicates"}
+              </b>
+              {fmtBytes(dupes.wasted)} of repeats across your folders — hide the extras in a
+              quick pass
+            </span>
+          </button>
         </Shelf>
       )}
 

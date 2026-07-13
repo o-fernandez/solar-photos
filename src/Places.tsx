@@ -53,17 +53,52 @@ export default function Places() {
   // First map error, surfaced in the UI — a silent gray globe is undebuggable.
   const [mapError, setMapError] = useState<string | null>(null);
 
+  // The year histogram + selected range (inclusive years; null = everything).
+  // The whole dataset is client-side, so filtering just rebuilds the cluster
+  // index over the subset — done when a drag ENDS, never per pointer move.
+  const [years, setYears] = useState<{ y: number; n: number }[]>([]);
+  const [range, setRange] = useState<[number, number] | null>(null);
+  const [shownCount, setShownCount] = useState(0);
+  const shownRef = useRef<GeoPoint[]>([]);
+  const barsRef = useRef<HTMLDivElement>(null);
+
   const resolveId = useCallback(
     (i: number): Promise<number | null> => Promise.resolve(inViewRef.current[i]?.id ?? null),
     [],
   );
 
+  /// Pack a point set into a fresh cluster index (null when empty).
+  const buildIndex = useCallback((pts: GeoPoint[]) => {
+    if (pts.length === 0) {
+      indexRef.current = null;
+      return;
+    }
+    const index = new Supercluster<ClusterProps>({ radius: 64, maxZoom: 17, minPoints: 2 });
+    index.load(
+      pts.map((p) => ({
+        type: "Feature" as const,
+        geometry: { type: "Point" as const, coordinates: [p.lon, p.lat] },
+        properties: { id: p.id, ts: p.ts },
+      })),
+    );
+    indexRef.current = index;
+  }, []);
+
   // Recompute markers + filmstrip for the current viewport. Reads refs only, so
   // the single moveend listener never goes stale.
   const refreshView = useCallback(() => {
     const map = mapRef.current;
+    if (!map) return;
+    markersRef.current.forEach((m) => m.remove());
+    markersRef.current = [];
     const index = indexRef.current;
-    if (!map || !index) return;
+    if (!index) {
+      // An empty range: no pins, an empty strip — not stale leftovers.
+      inViewRef.current = [];
+      setInViewCount(0);
+      setStrip([]);
+      return;
+    }
     const b = map.getBounds();
     const bbox: [number, number, number, number] = [
       b.getWest(),
@@ -74,7 +109,6 @@ export default function Places() {
     const zoom = Math.round(map.getZoom());
     const clusters = index.getClusters(bbox, zoom);
 
-    markersRef.current.forEach((m) => m.remove());
     markersRef.current = clusters.slice(0, MAX_MARKERS).map((c) => {
       const [lon, lat] = (c.geometry as GeoJSON.Point).coordinates;
       const props = c.properties as ClusterProps;
@@ -110,13 +144,65 @@ export default function Places() {
       return new maplibregl.Marker({ element: el }).setLngLat([lon, lat]).addTo(map);
     });
 
-    const inView = pointsRef.current
+    const inView = shownRef.current
       .filter((p) => b.contains([p.lon, p.lat]))
       .sort((a, b2) => b2.ts - a.ts);
     inViewRef.current = inView;
     setInViewCount(inView.length);
     setStrip(inView.slice(0, MAX_STRIP));
   }, []);
+
+  // Commit a year range: filter the full point set, rebuild the index, redraw.
+  const applyRange = useCallback(
+    (r: [number, number] | null) => {
+      setRange(r);
+      const pts =
+        r == null
+          ? pointsRef.current
+          : pointsRef.current.filter((p) => {
+              const y = new Date(p.ts * 1000).getFullYear();
+              return y >= r[0] && y <= r[1];
+            });
+      shownRef.current = pts;
+      setShownCount(pts.length);
+      buildIndex(pts);
+      refreshView();
+    },
+    [buildIndex, refreshView],
+  );
+
+  // Drag across the bars to select a range (a click is a one-year range). The
+  // highlight follows the pointer live; the index rebuild waits for release.
+  const yearAt = useCallback(
+    (clientX: number): number => {
+      const el = barsRef.current;
+      if (!el || years.length === 0) return 0;
+      const r = el.getBoundingClientRect();
+      const f = Math.min(0.999, Math.max(0, (clientX - r.left) / r.width));
+      return years[Math.floor(f * years.length)].y;
+    },
+    [years],
+  );
+  const onBarsPointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const start = yearAt(e.clientX);
+    setRange([start, start]);
+    const span = (x: number): [number, number] => [Math.min(start, x), Math.max(start, x)];
+    const move = (ev: PointerEvent) => setRange(span(yearAt(ev.clientX)));
+    const up = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      const r = span(yearAt(ev.clientX));
+      // Selecting everything is the same as selecting nothing.
+      if (years.length > 0 && r[0] === years[0].y && r[1] === years[years.length - 1].y) {
+        applyRange(null);
+      } else {
+        applyRange(r);
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -135,16 +221,21 @@ export default function Places() {
         return;
       }
 
-      if (points.length > 0) {
-        const index = new Supercluster<ClusterProps>({ radius: 64, maxZoom: 17, minPoints: 2 });
-        index.load(
-          points.map((p) => ({
-            type: "Feature" as const,
-            geometry: { type: "Point" as const, coordinates: [p.lon, p.lat] },
-            properties: { id: p.id, ts: p.ts },
-          })),
-        );
-        indexRef.current = index;
+      shownRef.current = points;
+      setShownCount(points.length);
+      buildIndex(points);
+      // Photos per year → the histogram (only worth drawing across 2+ years).
+      const counts = new Map<number, number>();
+      for (const p of points) {
+        const y = new Date(p.ts * 1000).getFullYear();
+        counts.set(y, (counts.get(y) ?? 0) + 1);
+      }
+      if (counts.size >= 2) {
+        const lo = Math.min(...counts.keys());
+        const hi = Math.max(...counts.keys());
+        const ys: { y: number; n: number }[] = [];
+        for (let y = lo; y <= hi; y++) ys.push({ y, n: counts.get(y) ?? 0 });
+        setYears(ys);
       }
 
       ensureBasemapProtocol();
@@ -178,7 +269,7 @@ export default function Places() {
       map?.remove();
       mapRef.current = null;
     };
-  }, [refreshView]);
+  }, [refreshView, buildIndex]);
 
   return (
     <div className="places">
@@ -217,6 +308,43 @@ export default function Places() {
             Locations come from your photos' own metadata as they're indexed — and for photos
             kept in the cloud, after they download. Check back as the library fills in.
           </p>
+        </div>
+      )}
+
+      {status === "ready" && years.length >= 2 && (
+        <div className="geo-histo">
+          <div className="gh-bars" ref={barsRef} onPointerDown={onBarsPointerDown}>
+            {years.map(({ y, n }) => {
+              const max = Math.max(1, ...years.map((x) => x.n));
+              const sel = range == null || (y >= range[0] && y <= range[1]);
+              return (
+                <i
+                  key={y}
+                  className={sel ? "sel" : ""}
+                  style={{ height: `${Math.max(8, (n / max) * 100)}%` }}
+                  title={`${y} · ${n.toLocaleString()}`}
+                />
+              );
+            })}
+          </div>
+          <div className="gh-lbl">
+            <span>{years[0].y}</span>
+            <b>
+              {range == null
+                ? "All years"
+                : range[0] === range[1]
+                  ? String(range[0])
+                  : `${range[0]} – ${range[1]}`}
+              {" · "}
+              {shownCount.toLocaleString()} {shownCount === 1 ? "photo" : "photos"}
+              {range != null && (
+                <button className="gh-clear" title="Show all years" onClick={() => applyRange(null)}>
+                  ✕
+                </button>
+              )}
+            </b>
+            <span>{years[years.length - 1].y}</span>
+          </div>
         </div>
       )}
 

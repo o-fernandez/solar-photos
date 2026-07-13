@@ -5,7 +5,38 @@
 use tauri::Emitter;
 
 use crate::db::{self, Job};
-use crate::{delete_cache_files, delete_face_crop_files, now_gen, rescan_all, scan, AppState, ScanProgress};
+use crate::{delete_cache_files, delete_face_crop_files, meta, now_gen, rescan_all, scan, AppState, ScanProgress};
+
+/// The viewer info card's payload: file size + everything EXIF offers, read on
+/// demand. `cloud` = the original is a placeholder we refuse to read (its bytes
+/// would download), so only the DB-known basics are present — the card says so.
+#[derive(serde::Serialize)]
+pub(crate) struct PhotoExif {
+    bytes: i64,
+    cloud: bool,
+    #[serde(flatten)]
+    detail: meta::ExifDetail,
+}
+
+#[tauri::command]
+pub(crate) fn get_photo_exif(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<Option<PhotoExif>, String> {
+    let info = {
+        let conn = state.conn.lock().unwrap();
+        db::photo_file_info(&conn, id).map_err(|e| e.to_string())?
+    };
+    Ok(info.map(|(path, bytes, status)| {
+        let cloud = status == db::STATUS_CLOUD || status == db::STATUS_DOWNLOADING;
+        let detail = if cloud {
+            meta::ExifDetail::default()
+        } else {
+            meta::read_exif_detail(std::path::Path::new(&path))
+        };
+        PhotoExif { bytes, cloud, detail }
+    }))
+}
 
 /// Library counts for the header readout. On a repeat launch this returns the
 /// already-indexed totals immediately, so the grid can render without a rescan.

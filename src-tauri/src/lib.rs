@@ -1239,6 +1239,7 @@ pub fn run() {
             commands::library::get_photos_range,
             commands::library::count_photos,
             commands::library::get_photo_detail,
+            commands::library::get_photo_exif,
             commands::library::add_folder,
             commands::library::rescan,
             commands::library::list_roots,

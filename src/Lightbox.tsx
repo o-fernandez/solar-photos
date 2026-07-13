@@ -14,6 +14,7 @@ import {
   confirmFacesIntoCluster,
   getFacesInPhoto,
   getPhotoDetail,
+  getPhotoExif,
   ignoreFaces,
   setPhotoFavorite,
   setPhotoHidden,
@@ -27,11 +28,13 @@ import {
   type Cluster,
   type CorrectionUndo,
   type PhotoDetail,
+  type PhotoExif,
   type PhotoFace,
 } from "./api";
 import PersonPicker from "./PersonPicker";
 import UndoToast from "./UndoToast";
 import { fold } from "./fold";
+import { fmtBytes } from "./format";
 import { usePeopleDirectory } from "./usePeopleDirectory";
 
 interface Props {
@@ -77,6 +80,11 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
   const [shownId, setShownId] = useState<number | null>(null);
   const [detail, setDetail] = useState<PhotoDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  // The info card (press I, or click the caption): the caption bar grows
+  // upward into camera/file/location rows. Stays open while arrowing — the
+  // EXIF refetches per photo. Read on demand only; never at scan time.
+  const [showInfo, setShowInfo] = useState(false);
+  const [exifInfo, setExifInfo] = useState<PhotoExif | null>(null);
   // Face boxes can be hidden (F, or the button) to look at the photo clean.
   const [showFaces, setShowFaces] = useState(true);
   // Zoom/pan: pinch (ctrl+wheel) or double-click zooms toward the cursor; while
@@ -138,26 +146,45 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
     [total, setView],
   );
 
-  // Keyboard: ←/→ navigate, F toggles face boxes, Esc closes (or just closes an
-  // open face menu first). Ignored while typing in a face-menu field — the fields
-  // handle their own keys, and an arrow press there must not change the photo.
+  // Keyboard: ←/→ navigate, F toggles face boxes, I toggles the info card, Esc
+  // walks back (face menu → info card → close). Ignored while typing in a
+  // face-menu field — the fields handle their own keys, and an arrow press
+  // there must not change the photo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       if (e.key === "Escape") {
         if (openFace !== null) setOpenFace(null);
+        else if (showInfo) setShowInfo(false);
         else onClose();
       } else if (e.key === "ArrowRight") go(1);
       else if (e.key === "ArrowLeft") go(-1);
       else if (e.key.toLowerCase() === "f") {
         setOpenFace(null);
         setShowFaces((s) => !s);
-      } else if (e.key === "0") setView(1, { x: 0, y: 0 });
+      } else if (e.key.toLowerCase() === "i") setShowInfo((s) => !s);
+      else if (e.key === "0") setView(1, { x: 0, y: 0 });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [go, onClose, openFace, setView]);
+  }, [go, onClose, openFace, showInfo, setView]);
+
+  // Fetch the open photo's EXIF whenever the card is up (and re-fetch as the
+  // user arrows through with it open).
+  useEffect(() => {
+    if (!showInfo || id == null) return;
+    let alive = true;
+    setExifInfo(null);
+    getPhotoExif(id)
+      .then((x) => {
+        if (alive) setExifInfo(x);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [showInfo, id]);
 
   // Pinch (ctrl/cmd+wheel) zooms toward the cursor; plain scroll pans while
   // zoomed. Native listener — React's synthetic wheel is passive, and zooming
@@ -607,8 +634,15 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
 
       {undo && <UndoToast label={undo.label} onUndo={undo.onUndo ? doUndo : undefined} />}
 
-      {detail && shownId === id && (
-        <div className="viewer-caption" onClick={(e) => e.stopPropagation()}>
+      {detail && shownId === id && !showInfo && (
+        <div
+          className="viewer-caption clickable"
+          title="Details (I)"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowInfo(true);
+          }}
+        >
           <span className="viewer-counter">
             {(current + 1).toLocaleString()} of {total.toLocaleString()} ·{" "}
           </span>
@@ -617,10 +651,77 @@ export default function Lightbox({ index, total, resolveId, onClose, onCorrectio
           <button
             className="viewer-reveal"
             title="Show this file in Finder"
-            onClick={() => revealInFinder(detail.path).catch(() => {})}
+            onClick={(e) => {
+              e.stopPropagation();
+              revealInFinder(detail.path).catch(() => {});
+            }}
           >
             Show in Finder
           </button>
+        </div>
+      )}
+
+      {/* The caption, grown into the info card (Direction A: the photo never
+          moves; the card floats where the caption was). */}
+      {detail && shownId === id && showInfo && (
+        <div className="viewer-info" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="vi-row vi-head"
+            title="Collapse (I)"
+            onClick={() => setShowInfo(false)}
+          >
+            <span>{when}</span>
+            <span className="vi-counter">
+              {(current + 1).toLocaleString()} of {total.toLocaleString()}
+            </span>
+          </div>
+          <div className="vi-row">
+            <span className="vi-file" title={detail.path}>
+              {detail.filename}
+            </span>
+            <span className="vi-side">
+              {exifInfo ? fmtBytes(exifInfo.bytes) : ""}
+              <button
+                className="viewer-reveal"
+                onClick={() => revealInFinder(detail.path).catch(() => {})}
+              >
+                Show in Finder
+              </button>
+            </span>
+          </div>
+          {exifInfo == null ? (
+            <div className="vi-row vi-note">Reading details…</div>
+          ) : exifInfo.cloud ? (
+            <div className="vi-row vi-note">
+              Kept in the cloud — camera details load once this photo downloads
+            </div>
+          ) : (
+            <>
+              <div className="vi-row">
+                <span className="vi-lbl">
+                  {exifInfo.camera ?? "Unknown camera"}
+                  {exifInfo.lens ? ` · ${exifInfo.lens}` : ""}
+                </span>
+                <span>
+                  {[exifInfo.f_number, exifInfo.exposure, exifInfo.iso, exifInfo.focal]
+                    .filter(Boolean)
+                    .join(" · ") || "—"}
+                </span>
+              </div>
+              <div className="vi-row">
+                <span className="vi-lbl">
+                  {exifInfo.width && exifInfo.height
+                    ? `${exifInfo.width.toLocaleString()} × ${exifInfo.height.toLocaleString()}`
+                    : "Dimensions unknown"}
+                </span>
+                <span>
+                  {exifInfo.gps
+                    ? `${exifInfo.gps[0].toFixed(4)}, ${exifInfo.gps[1].toFixed(4)}`
+                    : "no location recorded"}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

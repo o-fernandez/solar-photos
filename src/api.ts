@@ -194,6 +194,53 @@ export function getPhotoDetail(id: number): Promise<PhotoDetail | null> {
   return invoke("get_photo_detail", { id });
 }
 
+/** The viewer info card's payload — file size plus EXIF read on demand from
+ *  the local file. `cloud` = the original is an undownloaded placeholder we
+ *  refuse to read (its bytes would download), so only the basics are present. */
+export interface PhotoExif {
+  bytes: number;
+  cloud: boolean;
+  camera: string | null;
+  lens: string | null;
+  f_number: string | null;
+  exposure: string | null;
+  iso: string | null;
+  focal: string | null;
+  width: number | null;
+  height: number | null;
+  gps: [number, number] | null;
+}
+
+export function getPhotoExif(id: number): Promise<PhotoExif | null> {
+  return invoke("get_photo_exif", { id });
+}
+
+/** One copy within an exact-duplicate group. */
+export interface DuplicateCopy {
+  id: number;
+  path: string;
+  ts: number;
+  favorite: boolean;
+}
+
+/** Byte-identical visible photos, and the disk the extra copies occupy. */
+export interface DuplicateGroup {
+  wasted_bytes: number;
+  copies: DuplicateCopy[];
+}
+
+/** Hash-sweep progress + the visible duplicate groups, biggest waste first.
+ *  Resolving a group is pure curation — hide the copies you don't want. */
+export interface DuplicateReport {
+  scanned: number;
+  eligible: number;
+  groups: DuplicateGroup[];
+}
+
+export function getDuplicateReport(): Promise<DuplicateReport> {
+  return invoke("get_duplicate_report");
+}
+
 /** Reveal a photo's file in Finder. */
 export function revealInFinder(path: string): Promise<void> {
   return revealItemInDir(path);

@@ -1727,6 +1727,20 @@ pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>>
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// (path, file size, thumb status) for one photo — what the on-demand EXIF
+/// command needs to decide whether the file is safe to read (local) or must be
+/// left alone (a cloud placeholder, whose bytes a read would download).
+pub fn photo_file_info(conn: &Connection, id: i64) -> Result<Option<(String, i64, i64)>> {
+    let row = conn
+        .query_row(
+            "SELECT path, size, thumb_status FROM photos WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    Ok(row)
+}
+
 /// The original file path for one photo id (used by the preview protocol).
 pub fn path_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
     let path = conn
