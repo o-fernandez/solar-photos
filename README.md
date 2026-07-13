@@ -21,9 +21,10 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
 
 > **Status:** v1 — well past the "daily use" floor. Add your folders, open on a
 > **Home** that greets you with this day in years past, your people, and your
-> places; fly through a newest-first timeline of 100,000+ photos; **find and name
-> the people in them**; **see them on a globe** — and trust that a relaunch shows
-> the truth.
+> places; fly through a newest-first timeline of 100,000+ photos; **search it**
+> by person, folder, month or year; **find and name the people in it**; **see it
+> on a globe**; **sweep out the exact duplicates** — and trust that the library
+> reflects your disk, live.
 
 ## What it does
 
@@ -37,6 +38,11 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
 - **A timeline of your whole life in photos** — newest-first by EXIF capture
   date (file mtime fallback), with a right-edge **scrubber** that shows the
   current month as you fly through it.
+- **Search that already knows your library.** ⌘F (or `/`) finds photos by the
+  **people in them**, by file and folder names ("iceland", "boda"), by year, by
+  month — every word must match, accents optional ("mia" finds Mía). One SQL
+  query over what's already indexed: nothing read from disk, nothing sent
+  anywhere.
 - **60fps scrolling at 100k+ photos.** The grid is virtualized and streams in
   progressively without ever disturbing your scroll position.
 - **The people in your photos — found on your machine.** Solar detects faces and
@@ -49,27 +55,40 @@ hands, owned by you. *El sol es Taíno.* See **[NAME.md](NAME.md)**.
   pulls together. New people slide in with a gentle hello as they're found.
 - **Favorite and hide — a curation layer that never touches your files.** Heart
   your best; hide the clutter (screenshots, receipts) so it drops out of the
-  timeline, People, and Places without ever being deleted. Both are flags in the
-  app, not edits to your originals — and you can export them to a JSON file you
-  keep, so your curation outlives any cache.
+  timeline, People, and Places without ever being deleted. Work one photo at a
+  time or **select hundreds** (shift-click ranges) and favorite or hide them in
+  one move, with one Undo. Both are flags in the app, not edits to your
+  originals — and you can export them to a JSON file you keep, so your curation
+  outlives any cache.
+- **Exact duplicates, found and swept.** Solar quietly fingerprints your local
+  originals in idle time; when byte-identical copies exist, Home says so ("214
+  exact duplicates · 1.9 GB of repeats") and a review walks them group by group
+  — the keeper pre-picked, the re-downloads and backup strays hidden with one
+  tap. Files are never deleted; a hidden copy is one click from coming back.
 - **Your photos on a globe — that never phones home.** The **Places** tab plots
   every located photo on an interactive world map (a spinning globe that flattens
-  as you zoom), clustered into thumbnail pins you can dive into. The map itself is
-  **bundled in the app and read from disk** — no tile server, ever — so browsing
-  where you've been is as private as everything else here. Locations come from
-  your photos' own EXIF; nothing is looked up online.
+  as you zoom), clustered into thumbnail pins you can dive into — with a
+  **year histogram** along the bottom: see the shape of your travels in time,
+  drag across the bars, and the globe follows. The map itself is **bundled in
+  the app and read from disk** — no tile server, ever — so browsing where
+  you've been is as private as everything else here. Locations come from your
+  photos' own EXIF; nothing is looked up online.
 - **Instant repeat launches.** Thumbnails are generated off the UI thread in a
   Rust backend and cached to disk, so the second launch shows your library
   immediately — no "loading your photos" wall.
 - **A full-screen viewer.** Click any photo for an upright preview; ←/→ to move
-  (neighbors prefetched), Esc to return to your exact place.
+  (neighbors prefetched), Esc to return to your exact place. Press **I** and the
+  caption grows into an info card — camera, exposure, dimensions, location —
+  read from the file only when you ask.
 - **Cloud-aware, never cloud-dependent.** Cloud-only originals (Proton Drive,
   iCloud "dataless" files) are indexed instantly as placeholders and downloaded
-  **on demand** as you scroll to them — never a bulk download — then cached.
-- **A library you can trust.** Folders are remembered; every launch quietly
-  reconciles with disk (plus a manual rescan in **Settings**), adding new files
-  and pruning deleted ones — and never deleting anything if a drive is
-  unreachable.
+  **on demand** as you scroll to them — what's on screen always first — while a
+  gentle background backfill works through the rest, so the library eventually
+  browses fully offline. Every download is cached forever.
+- **A library you can trust — live.** Folders are remembered and **watched**:
+  copy photos in and they appear, delete some and they prune, no rescan asked
+  for (one still exists in **Settings**). Every launch reconciles with disk too
+  — and nothing is ever pruned if a drive is unreachable.
 
 ![The newest-first timeline grid](docs/media/timeline_demo.png)
 
