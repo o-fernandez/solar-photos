@@ -19,7 +19,11 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-latest
+    # Pinned (not macos-latest): the macOS 26 beta image's Xcode 26.5 toolchain
+    # fails to link libsqlite3-sys — its clang emits a dependency on
+    # clang_rt.osx with a runtime-lib search path that doesn't exist on the
+    # image. macos-15 carries a stable Xcode.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +42,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # v2: discard caches built on the old macos-latest/Xcode-26.5 image.
+          prefix-key: v2-macos15
       - run: ./scripts/fetch-models.sh
       - run: mkdir -p src-tauri/basemap && touch src-tauri/basemap/world.pmtiles
       - run: cargo test --manifest-path src-tauri/Cargo.toml
