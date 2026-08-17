@@ -229,7 +229,11 @@ where
                             id
                         ])?;
                         if !item.cloud {
-                            new_jobs.push(Job { id, path: item.path.clone() });
+                            new_jobs.push(Job {
+                                id,
+                                path: item.path.clone(),
+                                cache_key: key,
+                            });
                         }
                     }
                     None => {
@@ -248,7 +252,11 @@ where
                         let id = tx.last_insert_rowid();
                         total += 1;
                         if !item.cloud {
-                            new_jobs.push(Job { id, path: item.path.clone() });
+                            new_jobs.push(Job {
+                                id,
+                                path: item.path.clone(),
+                                cache_key: key,
+                            });
                         }
                     }
                 }

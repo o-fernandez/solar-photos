@@ -225,10 +225,14 @@ pub fn claim_faces_batch(conn: &mut Connection, limit: i64) -> Result<Vec<Job>> 
     let tx = conn.transaction()?;
     let jobs: Vec<Job> = {
         let mut stmt = tx.prepare(
-            "SELECT id, path FROM photos WHERE thumb_status = ?1 AND faces_scanned = 0 ORDER BY id LIMIT ?2",
+            "SELECT id, path, cache_key FROM photos WHERE thumb_status = ?1 AND faces_scanned = 0 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![STATUS_READY, limit], |r| {
-            Ok(Job { id: r.get(0)?, path: r.get(1)? })
+            Ok(Job {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                cache_key: r.get(2)?,
+            })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -255,23 +259,29 @@ pub fn reset_claimed_faces(conn: &Connection) -> Result<usize> {
 /// the photo scanned (one transaction).
 pub fn save_faces(
     conn: &mut Connection,
-    photo_id: i64,
+    job: &Job,
     faces: &[DetectedFace],
     cluster_ids: &[i64],
-) -> Result<()> {
-    let tx = conn.transaction()?;
+) -> Result<bool> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !job_is_current(&tx, job)? {
+        return Ok(false);
+    }
     {
         let mut ins = tx.prepare(
             "INSERT INTO faces (photo_id, x1, y1, x2, y2, score, embedding, cluster_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         )?;
         for (f, cid) in faces.iter().zip(cluster_ids) {
             let bytes: Vec<u8> = f.embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
-            ins.execute(rusqlite::params![photo_id, f.x1, f.y1, f.x2, f.y2, f.score, bytes, cid])?;
+            ins.execute(rusqlite::params![job.id, f.x1, f.y1, f.x2, f.y2, f.score, bytes, cid])?;
         }
-        tx.execute("UPDATE photos SET faces_scanned = 1 WHERE id = ?1", [photo_id])?;
+        tx.execute(
+            "UPDATE photos SET faces_scanned = 1 WHERE id = ?1 AND path = ?2 AND cache_key = ?3",
+            rusqlite::params![job.id, job.path, job.cache_key],
+        )?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Decode a stored little-endian f32 embedding blob back into a vector.
@@ -1204,18 +1214,37 @@ pub fn list_roots(conn: &Connection) -> Result<Vec<String>> {
 
 /// Forget a root and return the ids of the photos it contained (so the caller
 /// can delete their cached files). The photo rows are deleted here.
-pub fn remove_root(conn: &Connection, path: &str) -> Result<Vec<i64>> {
-    conn.execute("DELETE FROM roots WHERE path = ?1", [path])?;
-    let pattern = format!("{path}/%");
-    let ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM photos WHERE path = ?1 OR path LIKE ?2")?;
-        let rows = stmt.query_map(rusqlite::params![path, pattern], |r| r.get(0))?;
+pub fn remove_root(conn: &mut Connection, path: &str) -> Result<Vec<i64>> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM roots WHERE path = ?1", [path])?;
+
+    // Paths are filesystem paths, not LIKE patterns: '%' and '_' are valid folder
+    // characters, and overlapping roots are valid too. Remove only photos below
+    // this root that are not still owned by another remembered root.
+    let remaining_roots: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT path FROM roots")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    conn.execute(
-        "DELETE FROM photos WHERE path = ?1 OR path LIKE ?2",
-        rusqlite::params![path, pattern],
-    )?;
+    let root = Path::new(path);
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id, path FROM photos")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(id, photo)| {
+                let photo = Path::new(&photo);
+                let under_removed = photo.starts_with(root);
+                let under_remaining = remaining_roots.iter().any(|r| photo.starts_with(Path::new(r)));
+                (under_removed && !under_remaining).then_some(id)
+            })
+            .collect()
+    };
+    for chunk in ids.chunks(900) {
+        let sql = format!("DELETE FROM photos WHERE id IN ({})", placeholders(chunk.len()));
+        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+    tx.commit()?;
     Ok(ids)
 }
 
@@ -1239,6 +1268,27 @@ pub fn take_unseen(conn: &Connection, gen: i64) -> Result<Vec<i64>> {
 pub struct Job {
     pub id: i64,
     pub path: String,
+    /// File-version token captured when the job was queued. A photo id can be
+    /// reused after deletion; workers must verify all three fields before they
+    /// publish caches or results.
+    pub cache_key: String,
+}
+
+/// Whether a queued background job still names the same file-version row.
+pub fn job_is_current(conn: &Connection, job: &Job) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM photos WHERE id = ?1 AND path = ?2 AND cache_key = ?3)",
+        rusqlite::params![job.id, job.path, job.cache_key],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
+/// Set a thumbnail outcome only if the id still belongs to this exact job.
+pub fn set_status_for_job(conn: &Connection, job: &Job, status: i64) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE photos SET thumb_status = ?1 WHERE id = ?2 AND path = ?3 AND cache_key = ?4",
+        rusqlite::params![status, job.id, job.path, job.cache_key],
+    )? != 0)
 }
 
 /// Local photos that still need a thumbnail (status = pending). Used at startup
@@ -1246,11 +1296,12 @@ pub struct Job {
 /// excluded — they wait for the user to look at them.
 pub fn pending_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt =
-        conn.prepare("SELECT id, path FROM photos WHERE thumb_status = ?1 ORDER BY id")?;
+        conn.prepare("SELECT id, path, cache_key FROM photos WHERE thumb_status = ?1 ORDER BY id")?;
     let rows = stmt.query_map([STATUS_PENDING], |r| {
         Ok(Job {
             id: r.get(0)?,
             path: r.get(1)?,
+            cache_key: r.get(2)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1261,10 +1312,14 @@ pub fn pending_jobs(conn: &Connection) -> Result<Vec<Job>> {
 /// items already processed in this pass.
 pub fn cloud_jobs_after(conn: &Connection, after_id: i64, limit: i64) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path FROM photos WHERE thumb_status = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+        "SELECT id, path, cache_key FROM photos WHERE thumb_status = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
     )?;
     let rows = stmt.query_map(rusqlite::params![STATUS_CLOUD, after_id, limit], |r| {
-        Ok(Job { id: r.get(0)?, path: r.get(1)? })
+        Ok(Job {
+            id: r.get(0)?,
+            path: r.get(1)?,
+            cache_key: r.get(2)?,
+        })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -1564,16 +1619,6 @@ pub fn set_taken_ts_batch(conn: &mut Connection, pairs: &[(i64, i64)]) -> Result
     Ok(())
 }
 
-/// Record a photo's capture date once we've read it from a now-local file.
-/// Only fills it when still empty, so we never clobber a date set at scan time.
-pub fn set_taken_ts_if_empty(conn: &Connection, id: i64, ts: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE photos SET taken_ts = ?1 WHERE id = ?2 AND taken_ts IS NULL",
-        rusqlite::params![ts, id],
-    )?;
-    Ok(())
-}
-
 /// Record the result of a GPS look-up: the coordinates when a fix was present,
 /// and always the "we checked" flag so a photo is never re-read for GPS.
 pub fn set_geo_scanned(conn: &Connection, id: i64, gps: Option<(f64, f64)>) -> Result<()> {
@@ -1713,17 +1758,17 @@ pub fn duplicate_groups(conn: &Connection, limit: i64) -> Result<Vec<DuplicateGr
 
 /// Look up status + path for a set of ids. Used by on-demand cloud handling to
 /// decide which of the currently-visible photos are cloud-only and need fetching.
-pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String)>> {
+pub fn lookup(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, i64, String, String)>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT id, thumb_status, path FROM photos WHERE id IN ({})",
+        "SELECT id, thumb_status, path, cache_key FROM photos WHERE id IN ({})",
         placeholders(ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(ids.iter());
-    let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1749,6 +1794,23 @@ pub fn path_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
     Ok(path)
 }
 
+/// A file-versioned job for one photo id, used by on-demand preview generation.
+pub fn job_for_id(conn: &Connection, id: i64) -> Result<Option<Job>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, path, cache_key FROM photos WHERE id = ?1",
+            [id],
+            |r| {
+                Ok(Job {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    cache_key: r.get(2)?,
+                })
+            },
+        )
+        .ok())
+}
+
 /// Detail shown in the viewer chrome: (full path, timestamp). The timestamp is
 /// the capture date once we have it, else the file's modified-time.
 pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64, bool, bool)>> {
@@ -1767,15 +1829,6 @@ pub fn detail(conn: &Connection, id: i64) -> Result<Option<(String, i64, bool, b
         )
         .ok();
     Ok(row)
-}
-
-/// Mark a thumbnail's outcome (ready / failed / downloading / cloud).
-pub fn set_status(conn: &Connection, id: i64, status: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE photos SET thumb_status = ?1 WHERE id = ?2",
-        rusqlite::params![status, id],
-    )?;
-    Ok(())
 }
 
 /// Move a set of ids to a status in one statement (used when we start fetching
@@ -1860,6 +1913,56 @@ mod tests {
 
     fn ids_of(conn: &Connection, f: PhotoFilter) -> Vec<i64> {
         photos_range(conn, 0, 10, false, f, None).unwrap().into_iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn remove_root_is_component_aware_and_preserves_nested_roots() {
+        let mut conn = test_conn();
+        add_root(&conn, "/photos/a_b").unwrap();
+        add_root(&conn, "/photos/a_b/keep").unwrap();
+        add_root(&conn, "/photos/acb").unwrap();
+        insert_photo(&conn, 1, "/photos/a_b/loose.jpg");
+        insert_photo(&conn, 2, "/photos/a_b/keep/owned.jpg");
+        insert_photo(&conn, 3, "/photos/acb/sibling.jpg");
+
+        let removed = remove_root(&mut conn, "/photos/a_b").unwrap();
+        assert_eq!(removed, vec![1]);
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM photos ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(paths, vec!["/photos/a_b/keep/owned.jpg", "/photos/acb/sibling.jpg"]);
+    }
+
+    #[test]
+    fn stale_job_cannot_update_a_reused_photo_id() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status) VALUES (1, '/old.jpg', 0, 0, 'old-key', 0)",
+            [],
+        )
+        .unwrap();
+        let stale = Job {
+            id: 1,
+            path: "/old.jpg".into(),
+            cache_key: "old-key".into(),
+        };
+        conn.execute("DELETE FROM photos WHERE id = 1", []).unwrap();
+        conn.execute(
+            "INSERT INTO photos (id, path, mtime, size, cache_key, thumb_status) VALUES (1, '/new.jpg', 0, 0, 'new-key', 0)",
+            [],
+        )
+        .unwrap();
+
+        assert!(!job_is_current(&conn, &stale).unwrap());
+        assert!(!set_status_for_job(&conn, &stale, STATUS_READY).unwrap());
+        let status: i64 = conn
+            .query_row("SELECT thumb_status FROM photos WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, STATUS_PENDING);
     }
 
     /// Search: every token must match — years against the capture date; other

@@ -5,7 +5,7 @@
 use tauri::Emitter;
 
 use crate::db::{self, Job};
-use crate::{delete_cache_files, delete_face_crop_files, meta, now_gen, rescan_all, scan, AppState, ScanProgress};
+use crate::{delete_cache_files, delete_face_crop_files, meta, rescan_all, AppState, ScanProgress};
 
 /// The viewer info card's payload: file size + everything EXIF offers, read on
 /// demand. `cloud` = the original is a placeholder we refuse to read (its bytes
@@ -101,33 +101,27 @@ pub(crate) fn get_on_this_day(state: tauri::State<'_, AppState>) -> Result<Vec<d
 }
 
 /// Add a folder to the library: remember it as a root and scan it. Returns
-/// immediately — the walk runs on a background thread, registering photos in
-/// batches and emitting `scan-progress` events so the grid grows live. This is
-/// what keeps the UI from freezing on a huge (or cloud-backed) folder (P1).
+/// immediately — the shared rescan coordinator walks it in the background. Using
+/// that one coordinator is important: an independent scan generation could race
+/// the full rescan's mark-and-sweep and have its newly inserted rows pruned.
 #[tauri::command]
-pub(crate) fn add_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
+pub(crate) fn add_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     {
         let conn = state.conn.lock().unwrap();
-        let _ = db::add_root(&conn, &path);
+        db::add_root(&conn, &path).map_err(|e| e.to_string())?;
     }
-    let db_path = state.db_path.clone();
-    let queue = state.local_queue.clone();
-    let preview_dir = state.preview_dir.clone();
-    let faces_dir = state.faces_dir.clone();
-    std::thread::spawn(move || {
-        let gen = now_gen();
-        let progress = |found: i64, done: bool| {
-            let _ = app.emit("scan-progress", ScanProgress { found, done });
-        };
-        if let Err(e) = scan::run_scan(&db_path, &path, gen, queue, &preview_dir, &faces_dir, progress) {
-            eprintln!("scan failed: {e}");
-            let _ = app.emit("scan-progress", ScanProgress { found: 0, done: true });
-        }
-    });
+    state.library_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    rescan_all(app);
+    Ok(())
 }
 
 /// Reconcile the whole library with disk (add new, prune deleted) in the
-/// background. Safe to call anytime; overlapping calls are ignored.
+/// background. Safe to call anytime; overlapping requests coalesce into one
+/// follow-up pass with a fresh root snapshot.
 #[tauri::command]
 pub(crate) fn rescan(app: tauri::AppHandle) {
     rescan_all(app);
@@ -143,22 +137,33 @@ pub(crate) fn list_roots(state: tauri::State<'_, AppState>) -> Result<Vec<String
 /// Remove a folder from the library: drop its photos and their cached files,
 /// then tell the frontend the new total so it can refresh.
 #[tauri::command]
-pub(crate) fn remove_folder(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) {
+pub(crate) fn remove_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     let removed = {
-        let conn = state.conn.lock().unwrap();
-        let ids = db::remove_root(&conn, &path).unwrap_or_default();
+        let mut conn = state.conn.lock().unwrap();
+        let ids = db::remove_root(&mut conn, &path).map_err(|e| e.to_string())?;
         // Crops first — they're found via the face rows about to go.
-        let face_ids = db::face_ids_of_photos(&conn, &ids).unwrap_or_default();
+        let face_ids = db::face_ids_of_photos(&conn, &ids).map_err(|e| e.to_string())?;
         delete_face_crop_files(&state.faces_dir, &face_ids);
-        let _ = db::delete_faces_for_photos(&conn, &ids);
+        db::delete_faces_for_photos(&conn, &ids).map_err(|e| e.to_string())?;
         ids
     };
+    state.local_queue.cancel(&removed);
+    state.cloud_queue.cancel(&removed);
     delete_cache_files(&state.cache_dir, &state.preview_dir, &removed);
+    state.library_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let total = {
         let conn = state.conn.lock().unwrap();
-        db::stats(&conn).map(|s| s.0).unwrap_or(0)
+        db::stats(&conn).map_err(|e| e.to_string())?.0
     };
     let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
+    // If another scan still had the removed root in its snapshot, request a
+    // follow-up pass; the coordinator coalesces it and prunes any reinsertion.
+    rescan_all(app);
+    Ok(())
 }
 
 /// Detail for the viewer chrome: filename + a timestamp (capture date when we
@@ -207,9 +212,9 @@ pub(crate) fn set_visible_range(app: tauri::AppHandle, state: tauri::State<'_, A
     };
     let mut cloud_jobs: Vec<Job> = Vec::new();
     let mut newly_downloading: Vec<i64> = Vec::new();
-    for (id, status, path) in rows {
+    for (id, status, path, cache_key) in rows {
         if status == db::STATUS_CLOUD || status == db::STATUS_DOWNLOADING {
-            cloud_jobs.push(Job { id, path });
+            cloud_jobs.push(Job { id, path, cache_key });
             if status == db::STATUS_CLOUD {
                 newly_downloading.push(id);
             }

@@ -22,6 +22,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use image::{DynamicImage, ImageDecoder, ImageReader};
@@ -113,6 +114,21 @@ impl ThumbQueue {
         self.available.notify_all();
     }
 
+    /// Drop queued work for photos removed from the library. In-flight work
+    /// cannot be interrupted safely, but its file-version token is checked before
+    /// publishing, so it becomes a harmless discarded decode.
+    pub fn cancel(&self, ids: &[i64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let ids: HashSet<i64> = ids.iter().copied().collect();
+        let mut inner = self.inner.lock().unwrap();
+        inner.jobs.retain(|id, _| !ids.contains(id));
+        inner.normal.retain(|id| !ids.contains(id));
+        inner.priority.retain(|id| !ids.contains(id));
+        inner.priority_set.retain(|id| !ids.contains(id));
+    }
+
     /// Block until a job is available (priority first), or return `None` on
     /// shutdown. Taking a job removes it from `jobs`, so any stale copy left in
     /// the other lane is skipped when popped.
@@ -178,7 +194,7 @@ pub fn spawn_workers<F>(
             // the foreground (PRINCIPLES #3).
             crate::background_qos();
             // A worker's DB connection is only used to record outcomes.
-            let conn = match db::open(&db_path) {
+            let mut conn = match db::open(&db_path) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("worker: cannot open db: {e}");
@@ -186,29 +202,43 @@ pub fn spawn_workers<F>(
                 }
             };
             while let Some(job) = queue.take() {
-                let status = match generate(&cache_dir, &preview_dir, &job) {
-                    Ok(()) => STATUS_READY,
+                let generated = generate(&preview_dir, &job);
+                let exif = if extract_date && generated.is_ok() {
+                    Some(crate::meta::read_exif_meta(Path::new(&job.path)))
+                } else {
+                    None
+                };
+                let outcome = match generated {
+                    Ok(generated) => match publish_if_current(
+                        &mut conn,
+                        &cache_dir,
+                        &preview_dir,
+                        &job,
+                        generated,
+                        exif.as_ref(),
+                    ) {
+                        Ok(true) => Some(true),
+                        Ok(false) => None,
+                        Err(e) => {
+                            eprintln!("thumbnail publish failed for {}: {e}", job.path);
+                            db::set_status_for_job(&conn, &job, fail_status)
+                                .unwrap_or(false)
+                                .then_some(false)
+                        }
+                    },
                     Err(e) => {
                         eprintln!("thumbnail failed for {}: {e}", job.path);
-                        fail_status
+                        db::set_status_for_job(&conn, &job, fail_status)
+                            .unwrap_or(false)
+                            .then_some(false)
                     }
                 };
-                let _ = db::set_status(&conn, job.id, status);
-                // For cloud files (now downloaded), read the capture date + GPS
-                // the scan couldn't reach without forcing a download. The date is
-                // applied on next sort; the fix feeds the Places map.
-                if extract_date && status == STATUS_READY {
-                    let m = crate::meta::read_exif_meta(Path::new(&job.path));
-                    if let Some(ts) = m.taken_ts {
-                        let _ = db::set_taken_ts_if_empty(&conn, job.id, ts);
-                    }
-                    let _ = db::set_geo_scanned(&conn, job.id, m.gps);
-                }
                 queue.complete(job.id);
+                let Some(ok) = outcome else { continue }; // removed/replaced while decoding
                 // Notify either way so the cell stops waiting, but say whether a
                 // thumbnail actually exists now: a failed cloud download reverts
                 // to CLOUD and must NOT be shown as a (missing) image.
-                notify(job.id, status == STATUS_READY);
+                notify(job.id, ok);
             }
         });
     }
@@ -241,32 +271,91 @@ fn to_preview(img: &DynamicImage) -> DynamicImage {
 /// cached preview instead of re-materializing the original. The extra work added
 /// to this pass is only a downscale + JPEG encode of pixels already in memory,
 /// which is cheap next to the decode it saves downstream.
-fn generate(cache_dir: &Path, preview_dir: &Path, job: &Job) -> Result<()> {
+struct Generated {
+    thumb: Vec<u8>,
+    preview: Option<Vec<u8>>,
+}
+
+fn generate(preview_dir: &Path, job: &Job) -> Result<Generated> {
     let img = decode_oriented(Path::new(&job.path))?;
     // `thumbnail` is an optimized downscaler that preserves aspect ratio and
     // fits the image within THUMB_EDGE × THUMB_EDGE.
     let thumb = img.thumbnail(THUMB_EDGE, THUMB_EDGE).to_rgb8();
-    let buf = encode_jpeg(&thumb, THUMB_QUALITY)?;
-
-    let out = thumb_path(cache_dir, job.id);
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&out, &buf)?;
+    let thumb = encode_jpeg(&thumb, THUMB_QUALITY)?;
 
     // Cache the preview from the same decoded image. Best-effort: a preview write
     // failure must never fail the thumbnail (the grid is what the user sees now).
     // Skip if one already exists so re-processing a photo doesn't re-encode it.
-    let pv = preview_path(preview_dir, job.id);
-    if !pv.exists() {
+    let preview = if !preview_path(preview_dir, job.id).exists() {
         let t = std::time::Instant::now();
-        if let Ok(pbuf) = encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY) {
-            if let Some(parent) = pv.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&pv, &pbuf);
-        }
+        let preview = encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY).ok();
         crate::prof::record(crate::prof::Stage::Preview, t.elapsed());
+        preview
+    } else {
+        None
+    };
+    Ok(Generated { thumb, preview })
+}
+
+/// Publish generated bytes while holding SQLite's writer lock. A concurrent root
+/// removal/reinsert therefore lands entirely before or after this check; a stale
+/// job can never overwrite the cache/status of a row that reused its id.
+fn publish_if_current(
+    conn: &mut rusqlite::Connection,
+    cache_dir: &Path,
+    preview_dir: &Path,
+    job: &Job,
+    generated: Generated,
+    exif: Option<&crate::meta::ExifMeta>,
+) -> Result<bool> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !db::job_is_current(&tx, job)? {
+        return Ok(false);
+    }
+
+    write_atomic(&thumb_path(cache_dir, job.id), &generated.thumb)?;
+    if let Some(preview) = generated.preview {
+        // Best effort, matching the previous behavior: a preview failure should
+        // not discard a perfectly good grid thumbnail.
+        let _ = write_atomic(&preview_path(preview_dir, job.id), &preview);
+    }
+    db::set_status_for_job(&tx, job, STATUS_READY)?;
+    if let Some(meta) = exif {
+        if let Some(ts) = meta.taken_ts {
+            tx.execute(
+                "UPDATE photos SET taken_ts = ?1 WHERE id = ?2 AND path = ?3 AND cache_key = ?4 AND taken_ts IS NULL",
+                rusqlite::params![ts, job.id, job.path, job.cache_key],
+            )?;
+        }
+        match meta.gps {
+            Some((lat, lon)) => tx.execute(
+                "UPDATE photos SET lat = ?1, lon = ?2, geo_scanned = 1 WHERE id = ?3 AND path = ?4 AND cache_key = ?5",
+                rusqlite::params![lat, lon, job.id, job.path, job.cache_key],
+            )?,
+            None => tx.execute(
+                "UPDATE photos SET geo_scanned = 1 WHERE id = ?1 AND path = ?2 AND cache_key = ?3",
+                rusqlite::params![job.id, job.path, job.cache_key],
+            )?,
+        };
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write a complete cache file and atomically rename it into view, so protocol
+/// readers never observe a partially written JPEG.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -275,14 +364,27 @@ fn generate(cache_dir: &Path, preview_dir: &Path, job: &Job) -> Result<()> {
 /// (orientation already applied), downscale to fit PREVIEW_EDGE, encode JPEG,
 /// cache to disk, and return the bytes. Called on demand when the viewer opens a
 /// photo (and to prefetch its neighbors). Cached forever after first view.
-pub fn generate_preview(out: &Path, original_path: &str) -> Result<Vec<u8>> {
+pub fn generate_preview_bytes(original_path: &str) -> Result<Vec<u8>> {
     let img = decode_oriented(Path::new(original_path))?;
-    let buf = encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY)?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
+    encode_jpeg(&to_preview(&img).to_rgb8(), PREVIEW_QUALITY)
+}
+
+/// Publish an on-demand preview only while the id still belongs to the file that
+/// was decoded. The expensive decode happens before this function; the writer
+/// transaction covers just validation + atomic cache publication.
+pub fn publish_preview_if_current(
+    conn: &mut rusqlite::Connection,
+    out: &Path,
+    job: &Job,
+    bytes: &[u8],
+) -> Result<bool> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !db::job_is_current(&tx, job)? {
+        return Ok(false);
     }
-    std::fs::write(out, &buf)?;
-    Ok(buf)
+    write_atomic(out, bytes)?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Where a photo's cached preview lives (sibling scheme to `thumb_path`).

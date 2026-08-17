@@ -306,10 +306,19 @@ function PlacesPreview({ count, onOpen }: { count: number; onOpen: () => void })
             },
           });
           // Frame everywhere you've been.
-          const lons = points.map((p) => p.lon);
-          const lats = points.map((p) => p.lat);
+          // Do not spread the full library into Math.min/Math.max: WebKit's
+          // function-argument limit is lower than Solar's 100k-photo target.
+          const bounds = points.reduce(
+            (b, p) => ({
+              west: Math.min(b.west, p.lon),
+              south: Math.min(b.south, p.lat),
+              east: Math.max(b.east, p.lon),
+              north: Math.max(b.north, p.lat),
+            }),
+            { west: Infinity, south: Infinity, east: -Infinity, north: -Infinity },
+          );
           map.fitBounds(
-            [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]],
+            [[bounds.west, bounds.south], [bounds.east, bounds.north]],
             { padding: 30, duration: 0, maxZoom: 6 },
           );
         })

@@ -65,6 +65,12 @@ pub(crate) struct AppState {
     pub(crate) cloud_queue: Arc<ThumbQueue>,
     /// Guards against two full rescans running at once (e.g. launch + manual).
     pub(crate) rescanning: Arc<AtomicBool>,
+    /// Monotonic request counter: a rescan request arriving while one is active
+    /// guarantees one coalesced follow-up pass instead of being dropped.
+    pub(crate) rescan_requested: Arc<AtomicU64>,
+    /// Bumped whenever the remembered roots change. A mark-and-sweep pass may
+    /// prune only if this is unchanged from its root snapshot.
+    pub(crate) library_epoch: Arc<AtomicU64>,
     /// Guards against two re-clusters running at once (migration + manual + sweep).
     pub(crate) reclustering: Arc<AtomicBool>,
     /// Set when a re-cluster is requested while one is already running, so the request
@@ -104,12 +110,26 @@ pub(crate) struct SuggestionCache {
     pub(crate) queue: Vec<ReviewItem>,
 }
 
-/// A monotonic-ish generation stamp for mark-and-sweep pruning.
+static LAST_SCAN_GEN: AtomicI64 = AtomicI64::new(0);
+
+/// A process-monotonic generation stamp for mark-and-sweep pruning. Two tiny
+/// coalesced passes can begin within the same millisecond, so wall time alone is
+/// not unique enough for the `seen <> generation` predicate.
 pub(crate) fn now_gen() -> i64 {
-    SystemTime::now()
+    let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    loop {
+        let prior = LAST_SCAN_GEN.load(Ordering::Relaxed);
+        let next = wall.max(prior.saturating_add(1));
+        if LAST_SCAN_GEN
+            .compare_exchange(prior, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 /// Drop the calling thread — and every thread it later spawns, including ONNX
@@ -329,17 +349,52 @@ fn event_touches_photos(event: &notify::Event) -> bool {
 /// This is the "second launch shows the truth" reconciliation (Principle 4). It
 /// runs in the background and never blocks the UI; a guard prevents overlap.
 pub(crate) fn rescan_all(app: AppHandle) {
-    let state = app.state::<AppState>();
-    if state.rescanning.swap(true, Ordering::SeqCst) {
-        return; // a rescan is already in progress
+    {
+        let state = app.state::<AppState>();
+        state.rescan_requested.fetch_add(1, Ordering::SeqCst);
     }
-    let db_path = state.db_path.clone();
-    let cache_dir = state.cache_dir.clone();
-    let preview_dir = state.preview_dir.clone();
-    let faces_dir = state.faces_dir.clone();
-    let queue = state.local_queue.clone();
-    let rescanning = state.rescanning.clone();
-    drop(state);
+    start_rescan(app);
+}
+
+/// Start the newest requested pass if none is active. Requests that arrive while
+/// it runs only advance `rescan_requested`; completion observes that and starts
+/// exactly one follow-up with a fresh root snapshot.
+fn start_rescan(app: AppHandle) {
+    let (
+        request_epoch,
+        library_epoch_at_start,
+        db_path,
+        cache_dir,
+        preview_dir,
+        faces_dir,
+        local_queue,
+        cloud_queue,
+        rescanning,
+        rescan_requested,
+        library_epoch,
+    ) = {
+        let state = app.state::<AppState>();
+        if state
+            .rescanning
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        (
+            state.rescan_requested.load(Ordering::SeqCst),
+            state.library_epoch.load(Ordering::SeqCst),
+            state.db_path.clone(),
+            state.cache_dir.clone(),
+            state.preview_dir.clone(),
+            state.faces_dir.clone(),
+            state.local_queue.clone(),
+            state.cloud_queue.clone(),
+            state.rescanning.clone(),
+            state.rescan_requested.clone(),
+            state.library_epoch.clone(),
+        )
+    };
 
     std::thread::spawn(move || {
         let gen = now_gen();
@@ -347,6 +402,9 @@ pub(crate) fn rescan_all(app: AppHandle) {
             Ok(r) => r,
             Err(_) => {
                 rescanning.store(false, Ordering::SeqCst);
+                if rescan_requested.load(Ordering::SeqCst) != request_epoch {
+                    start_rescan(app);
+                }
                 return;
             }
         };
@@ -360,7 +418,7 @@ pub(crate) fn rescan_all(app: AppHandle) {
                 continue;
             }
             let app = app.clone();
-            if scan::run_scan(&db_path, root, gen, queue.clone(), &preview_dir, &faces_dir, move |found, _| {
+            if scan::run_scan(&db_path, root, gen, local_queue.clone(), &preview_dir, &faces_dir, move |found, _| {
                 let _ = app.emit("scan-progress", ScanProgress { found, done: false });
             })
             .is_err()
@@ -370,8 +428,10 @@ pub(crate) fn rescan_all(app: AppHandle) {
         }
         // Prune only when we trust the pass was complete.
         if let Ok(conn) = db::open(&db_path) {
-            if all_roots_ok {
+            if all_roots_ok && library_epoch.load(Ordering::SeqCst) == library_epoch_at_start {
                 let removed = db::take_unseen(&conn, gen).unwrap_or_default();
+                local_queue.cancel(&removed);
+                cloud_queue.cancel(&removed);
                 // Crops first — they're found via the face rows about to go.
                 let face_ids = db::face_ids_of_photos(&conn, &removed).unwrap_or_default();
                 delete_face_crop_files(&faces_dir, &face_ids);
@@ -379,9 +439,22 @@ pub(crate) fn rescan_all(app: AppHandle) {
                 delete_cache_files(&cache_dir, &preview_dir, &removed);
             }
             let total = db::stats(&conn).map(|s| s.0).unwrap_or(0);
-            let _ = app.emit("scan-progress", ScanProgress { found: total, done: true });
+            let superseded = rescan_requested.load(Ordering::SeqCst) != request_epoch
+                || library_epoch.load(Ordering::SeqCst) != library_epoch_at_start;
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgress {
+                    found: total,
+                    done: !superseded,
+                },
+            );
         }
         rescanning.store(false, Ordering::SeqCst);
+        if rescan_requested.load(Ordering::SeqCst) != request_epoch
+            || library_epoch.load(Ordering::SeqCst) != library_epoch_at_start
+        {
+            start_rescan(app);
+        }
     });
 }
 
@@ -753,7 +826,7 @@ fn spawn_face_workers(
 
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let job_rx = Arc::new(Mutex::new(job_rx));
-    let (res_tx, res_rx) = mpsc::channel::<(i64, Vec<db::DetectedFace>)>();
+    let (res_tx, res_rx) = mpsc::channel::<(Job, Vec<db::DetectedFace>)>();
 
     // Worker pool: parallel decode + detect + embed. Each owns its own models.
     for _ in 0..FACE_WORKERS {
@@ -789,7 +862,7 @@ fn spawn_face_workers(
                     .ok()
                     .map(|img| models.process(&img).unwrap_or_default())
                     .unwrap_or_default();
-                if res_tx.send((job.id, found)).is_err() {
+                if res_tx.send((job, found)).is_err() {
                     break; // coordinator gone
                 }
             }
@@ -833,11 +906,26 @@ fn spawn_face_workers(
             // Drain a finished photo: assign clusters (online, incremental) and
             // persist. Time out so we periodically re-check pause / refill / idle.
             match res_rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok((id, found)) => {
+                Ok((job, found)) => {
+                    let id = job.id;
+                    if !db::job_is_current(&conn, &job).unwrap_or(false) {
+                        outstanding -= 1;
+                        continue;
+                    }
                     let cluster_ids: Vec<i64> =
                         found.iter().map(|f| index.assign(&f.embedding, id)).collect();
-                    pending_consolidation += found.len() as u64;
-                    let _ = db::save_faces(&mut conn, id, &found, &cluster_ids);
+                    match db::save_faces(&mut conn, &job, &found, &cluster_ids) {
+                        Ok(true) => pending_consolidation += found.len() as u64,
+                        Ok(false) => {
+                            // The row changed after the first check; discard the
+                            // incremental assignments we just made by rebuilding
+                            // from committed truth.
+                            index = cluster::ClusterIndex::load(
+                                db::clustered_embeddings(&conn).unwrap_or_default(),
+                            );
+                        }
+                        Err(e) => eprintln!("faces: save failed for {}: {e}", job.path),
+                    }
                     outstanding -= 1;
                     if let Ok((scanned, eligible)) = db::face_progress(&conn) {
                         let _ = app.emit("faces-progress", FaceProgress { scanned, eligible });
@@ -955,18 +1043,25 @@ fn serve_thumb(app: &AppHandle, full: &str) -> tauri::http::Response<Vec<u8>> {
     if let Ok(bytes) = std::fs::read(&out) {
         return ok(bytes);
     }
-    let original = {
+    let job = {
         let conn = state.conn.lock().unwrap();
-        db::path_for_id(&conn, id).ok().flatten()
+        db::job_for_id(&conn, id).ok().flatten()
     };
-    let original = match original {
-        Some(p) => p,
+    let job = match job {
+        Some(job) => job,
         None => return not_found(),
     };
-    match thumbs::generate_preview(&out, &original) {
-        Ok(bytes) => ok(bytes),
+    match thumbs::generate_preview_bytes(&job.path) {
+        Ok(bytes) => {
+            let current = {
+                let mut conn = state.conn.lock().unwrap();
+                thumbs::publish_preview_if_current(&mut conn, &out, &job, &bytes)
+                    .unwrap_or(false)
+            };
+            if current { ok(bytes) } else { not_found() }
+        }
         Err(e) => {
-            eprintln!("preview failed for {original}: {e}");
+            eprintln!("preview failed for {}: {e}", job.path);
             not_found()
         }
     }
@@ -1186,6 +1281,8 @@ pub fn run() {
                 local_queue,
                 cloud_queue,
                 rescanning: Arc::new(AtomicBool::new(false)),
+                rescan_requested: Arc::new(AtomicU64::new(0)),
+                library_epoch: Arc::new(AtomicU64::new(0)),
                 reclustering: Arc::new(AtomicBool::new(false)),
                 recluster_pending: Arc::new(AtomicBool::new(false)),
                 fold_pending: Arc::new(AtomicBool::new(false)),

@@ -81,6 +81,19 @@ function PhotoGrid({
 
   // The viewer: which library index is open (null = closed).
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+  const [mutationNotice, setMutationNotice] = useState<string | null>(null);
+  const mutationNoticeTimer = useRef<number | undefined>(undefined);
+  const flashMutationNotice = useCallback((message: string) => {
+    setMutationNotice(message);
+    if (mutationNoticeTimer.current) window.clearTimeout(mutationNoticeTimer.current);
+    mutationNoticeTimer.current = window.setTimeout(() => setMutationNotice(null), 6000);
+  }, []);
+  useEffect(
+    () => () => {
+      if (mutationNoticeTimer.current) window.clearTimeout(mutationNoticeTimer.current);
+    },
+    [],
+  );
 
   // Multi-select for bulk curation: the selected photo ids, plus the last
   // toggled index so shift-click extends a range. Ids are stable across
@@ -168,16 +181,47 @@ function PhotoGrid({
 
   // Star toggle: fills instantly (favRef override), persists, and — in the
   // Favorites view, where un-starring removes the photo — refetches in place.
+  const favMutationSeq = useRef<Map<number, number>>(new Map());
+  const favWriteQueues = useRef<Map<number, Promise<void>>>(new Map());
   const toggleFavorite = useCallback(
     (photo: PhotoRow) => {
       const next = !(favRef.current.get(photo.id) ?? photo.favorite ?? false);
+      const seq = (favMutationSeq.current.get(photo.id) ?? 0) + 1;
+      favMutationSeq.current.set(photo.id, seq);
       favRef.current.set(photo.id, next);
       invalidate();
-      setPhotoFavorite(photo.id, next).catch(() => {});
-      if (filter === "favorites" && !next) softRefetch();
-      onCurationChanged?.();
+      // Preserve click order even if Tauri schedules two rapid invokes on
+      // different threads; the database must end at the last visible choice.
+      const write = (favWriteQueues.current.get(photo.id) ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => setPhotoFavorite(photo.id, next));
+      favWriteQueues.current.set(photo.id, write);
+      write
+        .then(() => {
+          if (favMutationSeq.current.get(photo.id) === seq) {
+            if (filter === "favorites" && !next) softRefetch();
+            onCurationChanged?.();
+          }
+        })
+        .catch(() => {
+          // A newer click owns the visible state; never roll it back because an
+          // older request happened to fail later.
+          if (favMutationSeq.current.get(photo.id) === seq) {
+            // Drop the override and re-read authoritative membership/value; this
+            // is correct even if an earlier queued write also failed.
+            favRef.current.delete(photo.id);
+            softRefetch();
+            onCurationChanged?.();
+            flashMutationNotice("Couldn't update that favorite.");
+          }
+        })
+        .finally(() => {
+          if (favWriteQueues.current.get(photo.id) === write) {
+            favWriteQueues.current.delete(photo.id);
+          }
+        });
     },
-    [filter, invalidate, softRefetch, onCurationChanged],
+    [filter, invalidate, softRefetch, onCurationChanged, flashMutationNotice],
   );
 
   // Hide (timeline/favorites) or restore (hidden view), for one photo or a
@@ -189,28 +233,31 @@ function PhotoGrid({
     (ids: number[], hidden: boolean) => {
       if (ids.length === 0) return;
       setPhotosHidden(ids, hidden)
-        .then(() => onCurationChanged?.())
-        .catch(() => {});
-      softRefetch();
-      if (undoTimer.current) window.clearTimeout(undoTimer.current);
-      setHideUndo({ ids, hidden });
-      undoTimer.current = window.setTimeout(() => setHideUndo(null), 6000);
+        .then(() => {
+          softRefetch();
+          onCurationChanged?.();
+          if (undoTimer.current) window.clearTimeout(undoTimer.current);
+          setHideUndo({ ids, hidden });
+          undoTimer.current = window.setTimeout(() => setHideUndo(null), 6000);
+        })
+        .catch(() => flashMutationNotice(`Couldn't ${hidden ? "hide" : "restore"} that selection.`));
     },
-    [softRefetch, onCurationChanged],
+    [softRefetch, onCurationChanged, flashMutationNotice],
   );
   // The last hide/restore (single or bulk), revertable for a few seconds.
   const [hideUndo, setHideUndo] = useState<{ ids: number[]; hidden: boolean } | null>(null);
   const undoHide = useCallback(() => {
-    setHideUndo((u) => {
-      if (u) {
-        setPhotosHidden(u.ids, !u.hidden)
-          .then(() => onCurationChanged?.())
-          .catch(() => {});
-        softRefetch();
-      }
-      return null;
-    });
-  }, [softRefetch, onCurationChanged]);
+    if (hideUndo) {
+      const u = hideUndo;
+      setHideUndo(null);
+      setPhotosHidden(u.ids, !u.hidden)
+        .then(() => {
+          onCurationChanged?.();
+          softRefetch();
+        })
+        .catch(() => flashMutationNotice("Couldn't undo that change."));
+    }
+  }, [hideUndo, softRefetch, onCurationChanged, flashMutationNotice]);
 
   // Bulk curation over the selection. Favorites fill instantly through the same
   // favRef overrides a single star uses; hide goes through applyHide so the
@@ -220,9 +267,16 @@ function PhotoGrid({
     ids.forEach((id) => favRef.current.set(id, on));
     invalidate();
     setPhotosFavorite(ids, on)
-      .then(() => onCurationChanged?.())
-      .catch(() => {});
-    if (filter === "favorites" && !on) softRefetch();
+      .then(() => {
+        if (filter === "favorites" && !on) softRefetch();
+        onCurationChanged?.();
+      })
+      .catch(() => {
+        ids.forEach((id) => favRef.current.delete(id));
+        softRefetch();
+        onCurationChanged?.();
+        flashMutationNotice("Couldn't update those favorites.");
+      });
     clearSelection();
   };
   const bulkHide = () => {
@@ -578,7 +632,7 @@ function PhotoGrid({
         </button>
       </div>
     )}
-    {hideUndo && (
+    {hideUndo && !mutationNotice && (
       <UndoToast
         label={
           hideUndo.ids.length === 1
@@ -590,6 +644,7 @@ function PhotoGrid({
         onUndo={undoHide}
       />
     )}
+    {mutationNotice && <UndoToast label={mutationNotice} />}
     </div>
     {viewerIndex !== null && (
       <Lightbox
